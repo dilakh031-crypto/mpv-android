@@ -23,6 +23,13 @@ object MPVLib {
 
     external fun command(cmd: Array<out String>)
 
+    // Async command helpers (used for high-rate scrubbing seeks).
+    // Note: Each async command generates an MPV_EVENT_COMMAND_REPLY.
+    external fun commandAsync(cmd: Array<out String>, userdata: Long): Int
+
+    // Abort any outstanding async requests that use the same userdata id.
+    external fun abortAsyncCommand(userdata: Long): Int
+
     external fun setOptionString(name: String, value: String): Int
 
     external fun grabThumbnail(dimension: Int): Bitmap?
