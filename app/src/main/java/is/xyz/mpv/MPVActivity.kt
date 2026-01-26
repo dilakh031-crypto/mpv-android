@@ -64,6 +64,9 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
     private val fadeHandler = Handler(Looper.getMainLooper())
     // for use with stopServiceRunnable
     private val stopServiceHandler = Handler(Looper.getMainLooper())
+    // for deferring single-tap control toggling (so double-tap play/pause doesn't flash controls)
+    private val tapToggleHandler = Handler(Looper.getMainLooper())
+    private var pendingTapToggle: Runnable? = null
 
     /**
      * DO NOT USE THIS
@@ -458,6 +461,7 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
 
         activityIsForeground = false
         eventUiHandler.removeCallbacksAndMessages(null)
+        cancelPendingTapToggle()
         if (isFinishing) {
             savePosition()
             // tell mpv to shut down so that any other property changes or such are ignored,
@@ -465,6 +469,11 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
             MPVLib.command(arrayOf("stop"))
         } else if (!shouldBackground) {
             player.paused = true
+            // Persist watch-later state even if the process is later killed (Home -> kill).
+            savePosition()
+        } else {
+            // Background playback mode: still persist state once when leaving UI.
+            savePosition()
         }
         writeSettings()
         super.onPause()
@@ -526,6 +535,18 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
     override fun onStop() {
         super.onStop()
         activityIsStopped = true
+
+        // Extra safety: persist state when the UI is gone, even if the process is killed.
+        // Skip configuration changes (rotation) to avoid needless writes.
+        if (!isFinishing && !isChangingConfigurations)
+            try { savePosition() } catch (_: Throwable) {}
+    }
+
+    override fun onTrimMemory(level: Int) {
+        super.onTrimMemory(level)
+        // Last chance before the system reclaims memory / kills background processes.
+        if (level >= TRIM_MEMORY_UI_HIDDEN && !isFinishing)
+            try { savePosition() } catch (_: Throwable) {}
     }
 
     override fun onResume() {
@@ -816,6 +837,12 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
             return super.dispatchTouchEvent(ev)
         }
 
+        // Any new touch down cancels a pending single-tap toggle (so double-tap won't flash controls).
+        if (ev.actionMasked == MotionEvent.ACTION_DOWN) {
+            cancelPendingTapToggle()
+            mightWantToToggleControls = true
+        }
+
         if (super.dispatchTouchEvent(ev)) {
             // reset delay if the event has been handled
             // ideally we'd want to know if the event was delivered to controls, but we can't
@@ -824,12 +851,32 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
             if (ev.action == MotionEvent.ACTION_UP)
                 return true
         }
-        if (ev.action == MotionEvent.ACTION_DOWN)
-            mightWantToToggleControls = true
-        if (ev.action == MotionEvent.ACTION_UP && mightWantToToggleControls) {
-            toggleControls()
+
+        if (ev.actionMasked == MotionEvent.ACTION_UP && mightWantToToggleControls) {
+            // Defer toggling so a second tap (double-tap play/pause) can cancel it.
+            scheduleSingleTapToggle()
+            mightWantToToggleControls = false
+        }
+        if (ev.actionMasked == MotionEvent.ACTION_CANCEL) {
+            cancelPendingTapToggle()
+            mightWantToToggleControls = false
         }
         return true
+    }
+
+    private fun cancelPendingTapToggle() {
+        pendingTapToggle?.let { tapToggleHandler.removeCallbacks(it) }
+        pendingTapToggle = null
+    }
+
+    private fun scheduleSingleTapToggle() {
+        cancelPendingTapToggle()
+        val r = Runnable {
+            pendingTapToggle = null
+            toggleControls()
+        }
+        pendingTapToggle = r
+        tapToggleHandler.postDelayed(r, TAP_TOGGLE_DELAY_MS)
     }
 
     /**
@@ -2031,6 +2078,7 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
             /* Drag gestures */
             PropertyChange.Init -> {
                 mightWantToToggleControls = false
+                cancelPendingTapToggle()
 
                 initialSeek = (psc.position / 1000f)
                 initialBright = Utils.getScreenBrightness(this) ?: 0.5f
@@ -2115,7 +2163,12 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
                 gestureTextView.text = getString(R.string.ui_seek_distance, Utils.prettyTime(newPos), diffText)
                 fadeGestureText()
             }
-            PropertyChange.PlayPause -> player.cyclePause()
+            PropertyChange.PlayPause -> {
+                // Double-tap play/pause should not trigger control UI.
+                cancelPendingTapToggle()
+                mightWantToToggleControls = false
+                player.cyclePause()
+            }
             PropertyChange.Custom -> {
                 val keycode = 0x10002 + diff.toInt()
                 MPVLib.command(arrayOf("keypress", "0x%x".format(keycode)))
@@ -2129,6 +2182,8 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
         private const val CONTROLS_DISPLAY_TIMEOUT = 1500L
         // how long controls fade to disappear (ms)
         private const val CONTROLS_FADE_DURATION = 500L
+        // Delay single-tap UI toggling so double-tap play/pause won't show the controls.
+        private const val TAP_TOGGLE_DELAY_MS = 300L
         // resolution (px) of the thumbnail displayed with playback notification
         private const val THUMB_SIZE = 384
         // smallest aspect ratio that is considered non-square
