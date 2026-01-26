@@ -25,8 +25,6 @@ extern "C" {
     jni_func(void, destroy);
 
     jni_func(void, command, jobjectArray jarray);
-    jni_func(jint, commandAsync, jobjectArray jarray, jlong userdata);
-    jni_func(jint, abortAsyncCommand, jlong userdata);
 };
 
 JavaVM *g_vm;
@@ -107,30 +105,4 @@ jni_func(void, command, jobjectArray jarray) {
 
     for (int i = 0; i < len; ++i)
         env->ReleaseStringUTFChars((jstring)env->GetObjectArrayElement(jarray, i), arguments[i]);
-}
-
-jni_func(jint, commandAsync, jobjectArray jarray, jlong userdata) {
-    CHECK_MPV_INIT();
-
-    const char *arguments[128] = {0};
-    int len = env->GetArrayLength(jarray);
-    if (len >= ARRAYLEN(arguments))
-        die("too many command arguments");
-
-    for (int i = 0; i < len; ++i)
-        arguments[i] = env->GetStringUTFChars((jstring)env->GetObjectArrayElement(jarray, i), NULL);
-
-    int r = mpv_command_async(g_mpv, (uint64_t)userdata, arguments);
-
-    for (int i = 0; i < len; ++i)
-        env->ReleaseStringUTFChars((jstring)env->GetObjectArrayElement(jarray, i), arguments[i]);
-
-    return (jint)r;
-}
-
-jni_func(jint, abortAsyncCommand, jlong userdata) {
-    CHECK_MPV_INIT();
-    // mpv_abort_async_command() returns void.
-    mpv_abort_async_command(g_mpv, (uint64_t)userdata);
-    return 0;
 }
