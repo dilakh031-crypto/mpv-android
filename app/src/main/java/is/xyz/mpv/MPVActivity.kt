@@ -2028,45 +2028,8 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
     private var maxVolume = 0
     /** 0 = initial, 1 = paused, 2 = was already paused */
     private var pausedForSeek = 0
-
-    // Seeking with sparse keyframes can appear to "jump".
-    // We force 1-second granularity and perform an exact seek, but coalesce requests
-    // so scrubbing stays responsive and doesn't overload the decoder.
-    private var seekGesturePendingSec: Int? = null
-    private var seekGestureLastAppliedSec: Int = Int.MIN_VALUE
-    private var seekGestureApplyScheduled = false
-    private val seekGestureHandler = Handler(Looper.getMainLooper())
-    private val seekGestureApplyRunnable = Runnable { applyPendingSeekGesture(force = false) }
-
-    private fun scheduleExactSeekToSecond(second: Int) {
-        seekGesturePendingSec = second
-        if (!seekGestureApplyScheduled) {
-            seekGestureApplyScheduled = true
-            // Coalesce to at most ~25 updates/sec while dragging.
-            seekGestureHandler.postDelayed(seekGestureApplyRunnable, SEEK_GESTURE_APPLY_INTERVAL_MS)
-        }
-    }
-
-    private fun flushExactSeekToPendingSecond() {
-        seekGestureHandler.removeCallbacks(seekGestureApplyRunnable)
-        seekGestureApplyScheduled = false
-        applyPendingSeekGesture(force = true)
-    }
-
-    private fun applyPendingSeekGesture(force: Boolean) {
-        val sec = seekGesturePendingSec ?: run {
-            seekGestureApplyScheduled = false
-            return
-        }
-        if (!force && sec == seekGestureLastAppliedSec) {
-            seekGestureApplyScheduled = false
-            return
-        }
-        seekGestureLastAppliedSec = sec
-        // Setting time-pos triggers an exact seek (hr-seek), giving 1s precision even on sparse keyframes.
-        player.timePos = sec.toDouble()
-        seekGestureApplyScheduled = false
-    }
+    /** Last whole-second seek target during a drag seek gesture. */
+    private var lastSeekTargetSec = Int.MIN_VALUE
 
     private fun fadeGestureText() {
         fadeHandler.removeCallbacks(fadeRunnable3)
@@ -2094,10 +2057,7 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
                 if (!isPlayingAudio)
                     maxVolume = 0 // disallow volume gesture if no audio
                 pausedForSeek = 0
-                seekGesturePendingSec = null
-                seekGestureLastAppliedSec = Int.MIN_VALUE
-                seekGestureHandler.removeCallbacks(seekGestureApplyRunnable)
-                seekGestureApplyScheduled = false
+                lastSeekTargetSec = Int.MIN_VALUE
 
                 fadeHandler.removeCallbacks(fadeRunnable3)
                 gestureTextView.visibility = View.VISIBLE
@@ -2116,15 +2076,21 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
                         player.paused = true
                 }
 
+                // Force scrubbing to whole seconds, and force accurate (non-keyframe) seeks.
+                // This avoids "waiting" for the next keyframe on highly-compressed videos.
                 val newPosExact = (initialSeek + diff).coerceIn(0f, duration)
-                // Force 1-second granularity.
-                val newPos = newPosExact.roundToInt()
-                val newDiff = newPos - initialSeek.roundToInt()
-                scheduleExactSeekToSecond(newPos)
+                val targetSec = newPosExact.roundToInt().coerceIn(0, duration.roundToInt())
+                val newDiff = (targetSec - initialSeek).roundToInt()
+
+                // Only issue the seek when the target second actually changes.
+                if (targetSec != lastSeekTargetSec) {
+                    lastSeekTargetSec = targetSec
+                    player.timePos = targetSec.toDouble() // exact seek to the requested second
+                }
                 // Note: don't call updatePlaybackPos() here because mpv will seek a timestamp
                 // actually present in the file, and not the exact one we specified.
 
-                val posText = Utils.prettyTime(newPos)
+                val posText = Utils.prettyTime(targetSec)
                 val diffText = Utils.prettyTime(newDiff, true)
                 gestureTextView.text = getString(R.string.ui_seek_distance, posText, diffText)
             }
@@ -2146,8 +2112,6 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
                 gestureTextView.text = getString(R.string.ui_brightness, (newBright * 100).roundToInt())
             }
             PropertyChange.Finalize -> {
-                // Ensure final position lands exactly on the last requested second.
-                flushExactSeekToPendingSecond()
                 if (pausedForSeek == 1)
                     player.paused = false
                 gestureTextView.visibility = View.GONE
@@ -2193,7 +2157,5 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
         private const val STREAM_TYPE = AudioManager.STREAM_MUSIC
         // precision used by seekbar (1/s)
         private const val SEEK_BAR_PRECISION = 2
-        // coalesce exact seeks during scrubbing (ms)
-        private const val SEEK_GESTURE_APPLY_INTERVAL_MS = 40L
     }
 }
