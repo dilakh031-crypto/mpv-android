@@ -23,7 +23,8 @@ jobs:
       - uses: actions/cache@v4
         with:
           path: gh-cache/
-          key: "${{ env.CACHE_IDENTIFIER }}"
+          # Bump key so CI rebuilds the prefix once with RTL-capable libass (FriBidi + HarfBuzz).
+          key: "${{ env.CACHE_IDENTIFIER }}-assrtl1"
           enableCrossOsArchive: true
 
       - name: Install deps
@@ -44,15 +45,14 @@ jobs:
         run: |
           buildscripts/include/ci.sh build
 
-      - name: List build outputs
+      - name: List outputs
         run: |
-          echo "== app/build/outputs =="
           ls -R app/build/outputs || true
 
       - uses: actions/upload-artifact@v4
         with:
           name: mpv-android
-          # Upload any produced APK/AAB (works even if Gradle omits ABI in the filename).
+          # Upload any produced APK/AAB regardless of flavor/ABI naming.
           path: |
             app/build/outputs/apk/**/*.apk
             app/build/outputs/bundle/**/*.aab
