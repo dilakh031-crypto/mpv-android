@@ -100,6 +100,18 @@ internal class TouchGestures(private val observer: TouchGesturesObserver) {
         // do not trigger on X% of screen top/bottom
         // this is so that user can open android status bar
         private const val DEADZONE = 5
+
+        // Seeking should feel like 1s steps on slow drag (Samsung-like).
+        // We achieve this by sending seek updates more frequently than volume/brightness.
+        private const val SEEK_THROTTLE_DIV = 24
+    }
+
+    fun cancel() {
+        // If a control gesture was active, finalize it.
+        if (state != State.Up && state != State.Down)
+            sendPropertyChange(PropertyChange.Finalize, 0f)
+        state = State.Up
+        lastTapTime = 0L
     }
 
     private fun processTap(p: PointF): Boolean {
@@ -136,8 +148,10 @@ internal class TouchGestures(private val observer: TouchGesturesObserver) {
 
     private fun processMovement(p: PointF): Boolean {
         // throttle events: only send updates when there's some movement compared to last update
-        // 3 here is arbitrary
-        if (PointF(lastPos.x - p.x, lastPos.y - p.y).length() < trigger / 3)
+        // 3 here is arbitrary.
+        // For seeking we want finer updates so the step size becomes ~1s on slow drag.
+        val throttle = if (state == State.ControlSeek) trigger / SEEK_THROTTLE_DIV else trigger / 3
+        if (PointF(lastPos.x - p.x, lastPos.y - p.y).length() < throttle)
             return false
         lastPos.set(p)
 
@@ -173,21 +187,6 @@ internal class TouchGestures(private val observer: TouchGesturesObserver) {
 
     private fun sendPropertyChange(p: PropertyChange, diff: Float) {
         observer.onPropertyChange(p, diff)
-    }
-
-    /**
-     * Cancel the current gesture.
-     *
-     * This is useful when another gesture handler (e.g. multi-touch) takes over,
-     * so we don't get stuck in a Control state without receiving ACTION_UP.
-     */
-    fun cancel() {
-        // If we were in a control gesture, ensure the UI gets finalized.
-        if (state != State.Up && state != State.Down)
-            sendPropertyChange(PropertyChange.Finalize, 0f)
-        state = State.Up
-        lastTapTime = 0
-        lastDownTime = 0
     }
 
     fun syncSettings(prefs: SharedPreferences, resources: Resources) {
@@ -226,10 +225,6 @@ internal class TouchGestures(private val observer: TouchGesturesObserver) {
         var gestureHandled = false
         val point = PointF(e.x, e.y)
         when (e.actionMasked) {
-            MotionEvent.ACTION_CANCEL -> {
-                cancel()
-                return false
-            }
             MotionEvent.ACTION_UP -> {
                 gestureHandled = processMovement(point) or processTap(point)
                 if (state != State.Down)
@@ -249,6 +244,10 @@ internal class TouchGestures(private val observer: TouchGesturesObserver) {
             }
             MotionEvent.ACTION_MOVE -> {
                 gestureHandled = processMovement(point)
+            }
+            MotionEvent.ACTION_CANCEL, MotionEvent.ACTION_POINTER_DOWN -> {
+                cancel()
+                gestureHandled = false
             }
         }
         return gestureHandled
