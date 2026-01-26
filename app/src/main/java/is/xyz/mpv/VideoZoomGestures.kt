@@ -7,8 +7,6 @@ import android.view.ScaleGestureDetector
 import android.view.View
 import android.view.ViewConfiguration
 import kotlin.math.hypot
-import kotlin.math.max
-import kotlin.math.min
 
 /**
  * High-FPS pinch-to-zoom + pan for mpv output.
@@ -88,11 +86,19 @@ internal class VideoZoomGestures(
                 if (newScale == oldScale)
                     return true
 
-                // Keep pinch focus stable (pivot (0,0) simplifies the math)
+                // Keep pinch focus stable.
+                //
+                // Our transform is: screen = scale * content + translation (pivot at 0,0).
+                // To zoom around focus F (in screen coords) we must update translation as:
+                //   t' = k * t + (1 - k) * F, where k = newScale / oldScale.
+                //
+                // The old implementation used (oldScale - newScale) * F, which becomes
+                // increasingly wrong when already zoomed/panned, causing noticeable drift.
                 val fx = detector.focusX
                 val fy = detector.focusY
-                tx += fx * (oldScale - newScale)
-                ty += fy * (oldScale - newScale)
+                val k = newScale / oldScale
+                tx = (k * tx) + ((1f - k) * fx)
+                ty = (k * ty) + ((1f - k) * fy)
                 scale = newScale
 
                 scheduleApply()
