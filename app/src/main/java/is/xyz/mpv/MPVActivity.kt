@@ -215,13 +215,22 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
             playbackSeekbar.setOnSeekBarChangeListener(seekBarChangeListener)
         }
 
+        // NOTE: touch events must come from an untransformed overlay view (gestureLayer).
+        // If we attach them directly to the transformed SurfaceView, Android will
+        // inverse-transform MotionEvents which can create feedback/jitter.
         binding.gestureLayer.setOnTouchListener { _, e ->
-            if (lockedUI) {
-                false
-            } else {
-                val blockDefault = zoomGestures.shouldBlockOtherGestures(e)
-                val handledByZoom = zoomGestures.onTouchEvent(e)
-                if (blockDefault) handledByZoom else gestures.onTouchEvent(e)
+            if (lockedUI)
+                return@setOnTouchListener false
+
+            if (e.actionMasked == MotionEvent.ACTION_POINTER_DOWN)
+                gestures.cancel()
+
+            val blockDefault = zoomGestures.shouldBlockOtherGestures(e)
+            val handledByZoom = zoomGestures.onTouchEvent(e)
+
+            when {
+                blockDefault -> handledByZoom
+                else -> gestures.onTouchEvent(e)
             }
         }
 
@@ -267,7 +276,7 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
         hideControls()
 
         gestures = TouchGestures(this)
-        zoomGestures = VideoZoomGestures(binding.player) { enabled -> setPanscanEnabled(enabled) }
+        zoomGestures = VideoZoomGestures(binding.player)
 
         // Initialize listeners for the player view
         initListeners()
@@ -358,7 +367,6 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
 
         // take the background service with us
         stopServiceRunnable.run()
-
 
         player.removeObserver(this)
         player.destroy()
@@ -972,17 +980,13 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
             val wm = windowManager.currentWindowMetrics
-            val w = wm.bounds.width().toFloat()
-            val h = wm.bounds.height().toFloat()
-            gestures.setMetrics(w, h)
-            zoomGestures.setMetrics(w, h)
+            gestures.setMetrics(wm.bounds.width().toFloat(), wm.bounds.height().toFloat())
+            zoomGestures.setMetrics(wm.bounds.width().toFloat(), wm.bounds.height().toFloat())
         } else @Suppress("DEPRECATION") {
             val dm = DisplayMetrics()
             windowManager.defaultDisplay.getRealMetrics(dm)
-            val w = dm.widthPixels.toFloat()
-            val h = dm.heightPixels.toFloat()
-            gestures.setMetrics(w, h)
-            zoomGestures.setMetrics(w, h)
+            gestures.setMetrics(dm.widthPixels.toFloat(), dm.heightPixels.toFloat())
+            zoomGestures.setMetrics(dm.widthPixels.toFloat(), dm.heightPixels.toFloat())
         }
 
         // Adjust control margins
@@ -1891,6 +1895,7 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
             "video-params/aspect", "video-params/rotate" -> {
                 updateOrientation()
                 updatePiPParams()
+                zoomGestures.setVideoAspect(player.getVideoAspect())
             }
         }
     }
@@ -1980,6 +1985,17 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
             finishWithResult(if (playbackHasStarted) RESULT_OK else RESULT_CANCELED)
 
         if (eventId == MpvEvent.MPV_EVENT_START_FILE) {
+            // Reset any view-level zoom/pan when a new file starts.
+            zoomGestures.reset()
+            try {
+                MPVLib.setPropertyDouble("video-zoom", 0.0)
+                MPVLib.setPropertyDouble("video-pan-x", 0.0)
+                MPVLib.setPropertyDouble("video-pan-y", 0.0)
+                MPVLib.setPropertyDouble("panscan", 0.0)
+            } catch (_: Throwable) {
+                // ignore
+            }
+
             for (c in onloadCommands)
                 MPVLib.command(c)
             if (this.statsLuaMode > 0 && !playbackHasStarted) {
@@ -1987,21 +2003,6 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
             }
 
             playbackHasStarted = true
-
-            // Reset any zoom/pan transforms when a new file starts.
-            try {
-                zoomGestures.reset()
-                MPVLib.setPropertyDouble("video-zoom", 0.0)
-                MPVLib.setPropertyDouble("video-pan-x", 0.0)
-                MPVLib.setPropertyDouble("video-pan-y", 0.0)
-                setPanscanEnabled(false)
-            } catch (_: Throwable) {}
-        }
-
-        // Used to detect when an async seek has completed, so we can dispatch the next
-        // pending target (while dragging) or resume playback after the final seek.
-        if (eventId == MpvEvent.MPV_EVENT_PLAYBACK_RESTART) {
-            try { onExactSeekPlaybackRestart() } catch (_: Throwable) {}
         }
 
         if (!activityIsForeground) return
@@ -2010,68 +2011,12 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
 
     // Gesture handler
 
-    private fun setPanscanEnabled(enabled: Boolean) {
-        // Remove black bars while zooming/panning by temporarily enabling panscan.
-        // Keep it disabled otherwise so normal aspect handling remains unchanged.
-        try {
-            MPVLib.setPropertyDouble("panscan", if (enabled) 1.0 else 0.0)
-        } catch (_: Throwable) {}
-    }
-
     private var initialSeek = 0f
     private var initialBright = 0f
     private var initialVolume = 0
     private var maxVolume = 0
     /** 0 = initial, 1 = paused, 2 = was already paused */
     private var pausedForSeek = 0
-
-    // Exact scrubbing seek pump
-    // We keep *at most one* exact seek request in-flight, and only dispatch the next
-    // pending target after mpv reports playback restart (seek finished). This prevents
-    // building up a seek backlog, which is the main reason the video appears "frozen"
-    // until the finger stops moving.
-    private val seekPumpLock = Any()
-    private var seekDragActive = false
-    private var seekPendingSec = Int.MIN_VALUE
-    private var seekDispatchedSec = Int.MIN_VALUE
-    private var seekInFlight = false
-    private var seekResumeAfterFinalize = false
-    private var seekAsyncSeq = 1L
-    private var seekLastUserdata = 0L
-
-    private fun dispatchExactSeekLocked(targetSec: Int) {
-        seekDispatchedSec = targetSec
-        seekInFlight = true
-        val userdata = seekAsyncSeq++
-        seekLastUserdata = userdata
-        // absolute+exact forces precise seeking, not keyframe-only.
-        MPVLib.commandAsync(arrayOf("seek", targetSec.toString(), "absolute+exact"), userdata)
-    }
-
-    private fun pumpExactSeekLocked() {
-        if (seekInFlight) return
-        if (seekPendingSec == Int.MIN_VALUE) return
-        if (seekPendingSec == seekDispatchedSec) return
-        dispatchExactSeekLocked(seekPendingSec)
-    }
-
-    private fun onExactSeekPlaybackRestart() {
-        synchronized(seekPumpLock) {
-            if (!seekInFlight) return
-            seekInFlight = false
-
-            if (seekDragActive) {
-                // Keep scrubbing while finger is down.
-                pumpExactSeekLocked()
-            } else if (seekResumeAfterFinalize) {
-                // Resume playback only after the final seek has completed.
-                seekResumeAfterFinalize = false
-                if (pausedForSeek == 1)
-                    player.paused = false
-                pausedForSeek = 0
-            }
-        }
-    }
 
     private fun fadeGestureText() {
         fadeHandler.removeCallbacks(fadeRunnable3)
@@ -2099,14 +2044,6 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
                 if (!isPlayingAudio)
                     maxVolume = 0 // disallow volume gesture if no audio
                 pausedForSeek = 0
-                synchronized(seekPumpLock) {
-                    seekDragActive = false
-                    seekPendingSec = Int.MIN_VALUE
-                    seekDispatchedSec = Int.MIN_VALUE
-                    seekInFlight = false
-                    seekResumeAfterFinalize = false
-                    seekLastUserdata = 0L
-                }
 
                 fadeHandler.removeCallbacks(fadeRunnable3)
                 gestureTextView.visibility = View.VISIBLE
@@ -2117,35 +2054,31 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
                 val duration = (psc.duration / 1000f)
                 if (duration == 0f || initialSeek < 0)
                     return
-                // Pause while the finger is down (resume happens on Finalize).
+                // Pause while seeking (finger still on screen) and only resume on release.
+                // If playback was already paused, keep it paused.
                 if (pausedForSeek == 0) {
                     pausedForSeek = if (psc.pause) 2 else 1
                     if (pausedForSeek == 1)
                         player.paused = true
-
-                    // Ensure precise seeking mode is enabled (helps avoid keyframe-only jumps).
-                    // hr-seek-framedrop is enabled by default, and can make precise seeking faster.
-                    // (We set them here once per gesture to be explicit.)
-                    MPVLib.command(arrayOf("set", "hr-seek", "yes"))
-                    MPVLib.command(arrayOf("set", "hr-seek-framedrop", "yes"))
                 }
 
-                // Force 1-second stepping and *exact* seeks (not keyframes-only).
-                val newPosExact = (initialSeek + diff).coerceIn(0f, duration)
-                val durationSec = duration.toInt().coerceAtLeast(0)
-                val targetSec = newPosExact.roundToInt().coerceIn(0, durationSec)
-                val newDiff = (targetSec.toFloat() - initialSeek).roundToInt()
+                // Quantize to 1 second steps (Samsung-like feel on slow drags).
+                val startPos = initialSeek.roundToInt()
+                val deltaSec = diff.roundToInt()
+                val newPos = (startPos + deltaSec).coerceIn(0, duration.roundToInt())
+                val newDiff = newPos - startPos
+                val newPosExact = newPos.toDouble()
 
-                synchronized(seekPumpLock) {
-                    seekDragActive = true
-                    seekPendingSec = targetSec
-                    // Dispatch immediately if nothing is in-flight.
-                    pumpExactSeekLocked()
+                if (smoothSeekGesture) {
+                    player.timePos = newPosExact // (exact seek)
+                } else {
+                    // seek faster than assigning to timePos but less precise
+                    MPVLib.command(arrayOf("seek", newPosExact.toString(), "absolute+keyframes"))
                 }
                 // Note: don't call updatePlaybackPos() here because mpv will seek a timestamp
                 // actually present in the file, and not the exact one we specified.
 
-                val posText = Utils.prettyTime(targetSec)
+                val posText = Utils.prettyTime(newPos)
                 val diffText = Utils.prettyTime(newDiff, true)
                 gestureTextView.text = getString(R.string.ui_seek_distance, posText, diffText)
             }
@@ -2167,31 +2100,8 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
                 gestureTextView.text = getString(R.string.ui_brightness, (newBright * 100).roundToInt())
             }
             PropertyChange.Finalize -> {
-                val shouldResume = pausedForSeek == 1
-
-                val hasPendingSeek: Boolean
-                synchronized(seekPumpLock) {
-                    seekDragActive = false
-                    hasPendingSeek = seekPendingSec != Int.MIN_VALUE
-
-                    if (hasPendingSeek) {
-                        // If a seek is still running to an old target, abort it and jump to the final
-                        // finger position immediately.
-                        if (seekInFlight && seekPendingSec != seekDispatchedSec) {
-                            try { MPVLib.abortAsyncCommand(seekLastUserdata) } catch (_: Throwable) {}
-                            seekInFlight = false
-                        }
-                        // Keep the player paused until the final seek is finished.
-                        seekResumeAfterFinalize = shouldResume
-                        pumpExactSeekLocked()
-                    } else {
-                        seekResumeAfterFinalize = false
-                    }
-                }
-
-                if (shouldResume && !hasPendingSeek)
+                if (pausedForSeek == 1)
                     player.paused = false
-
                 gestureTextView.visibility = View.GONE
             }
 
