@@ -175,6 +175,21 @@ internal class TouchGestures(private val observer: TouchGesturesObserver) {
         observer.onPropertyChange(p, diff)
     }
 
+    /**
+     * Cancel the current gesture.
+     *
+     * This is useful when another gesture handler (e.g. multi-touch) takes over,
+     * so we don't get stuck in a Control state without receiving ACTION_UP.
+     */
+    fun cancel() {
+        // If we were in a control gesture, ensure the UI gets finalized.
+        if (state != State.Up && state != State.Down)
+            sendPropertyChange(PropertyChange.Finalize, 0f)
+        state = State.Up
+        lastTapTime = 0
+        lastDownTime = 0
+    }
+
     fun syncSettings(prefs: SharedPreferences, resources: Resources) {
         val get: (String, Int) -> String = { key, defaultRes ->
             val v = prefs.getString(key, "")
@@ -210,7 +225,11 @@ internal class TouchGestures(private val observer: TouchGesturesObserver) {
         }
         var gestureHandled = false
         val point = PointF(e.x, e.y)
-        when (e.action) {
+        when (e.actionMasked) {
+            MotionEvent.ACTION_CANCEL -> {
+                cancel()
+                return false
+            }
             MotionEvent.ACTION_UP -> {
                 gestureHandled = processMovement(point) or processTap(point)
                 if (state != State.Down)
