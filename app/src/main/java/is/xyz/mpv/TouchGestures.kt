@@ -164,16 +164,28 @@ internal class TouchGestures(private val observer: TouchGesturesObserver) {
             State.Up -> {}
             State.Down -> {
                 // we might get into one of Control states if user moves enough
-                if (abs(dx) > trigger) {
+                // For seeking we want a shorter activation distance (Samsung-like), so the
+                // first visible step can be 1s instead of jumping multiple seconds.
+                val seekTrigger = trigger / 4
+
+                if (abs(dx) > (if (gestureHoriz == State.ControlSeek) seekTrigger else trigger)) {
                     state = gestureHoriz
                     stateDirection = 0
-                } else if (abs(dy) > trigger) {
+                } else if (abs(dy) > (if ((if (initialPos.x > width / 2) gestureVertRight else gestureVertLeft) == State.ControlSeek) seekTrigger else trigger)) {
                     state = if (initialPos.x > width / 2) gestureVertRight else gestureVertLeft
                     stateDirection = 1
                 }
                 // send Init so that it has a chance to cache values before we start modifying them
-                if (state != State.Down)
+                if (state != State.Down) {
                     sendPropertyChange(PropertyChange.Init, 0f)
+
+                    // Avoid a "jump" on activation: once we commit to seek, treat the current
+                    // point as the new origin so the first delta starts near 0.
+                    if (state == State.ControlSeek) {
+                        initialPos.set(p)
+                        lastPos.set(p)
+                    }
+                }
             }
             State.ControlSeek ->
                 sendPropertyChange(PropertyChange.Seek, CONTROL_SEEK_MAX * dr)
