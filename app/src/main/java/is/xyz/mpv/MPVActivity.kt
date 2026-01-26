@@ -215,7 +215,8 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
             playbackSeekbar.setOnSeekBarChangeListener(seekBarChangeListener)
         }
 
-        player.setOnTouchListener { _, e ->
+        // NOTE: touch events must come from an untransformed view. See player.xml.
+        binding.gestureLayer.setOnTouchListener { _, e ->
             if (lockedUI)
                 return@setOnTouchListener false
 
@@ -259,6 +260,16 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
     private var playbackHasStarted = false
     private var onloadCommands = mutableListOf<Array<String>>()
 
+    private fun setPanscanEnabled(enabled: Boolean) {
+        // Used by VideoZoomGestures to crop away pillar/letterboxing while zooming.
+        // (mpv "panscan" is defined as cropping to avoid black bands.)
+        try {
+            MPVLib.setPropertyDouble("panscan", if (enabled) 1.0 else 0.0)
+        } catch (_: Throwable) {
+            // Ignore - mpv might not be ready yet.
+        }
+    }
+
     // Activity lifetime
 
     override fun onCreate(icicle: Bundle?) {
@@ -273,7 +284,9 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
 
         // Gesture handlers must exist before we attach listeners.
         gestures = TouchGestures(this)
-        zoomGestures = VideoZoomGestures(binding.player)
+        zoomGestures = VideoZoomGestures(binding.player) { enabled ->
+            setPanscanEnabled(enabled)
+        }
 
         // Init controls to be hidden and view fullscreen
         hideControls()
