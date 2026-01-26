@@ -2031,6 +2031,12 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
     /** Last whole-second seek target during a drag seek gesture. */
     private var lastSeekTargetSec = Int.MIN_VALUE
 
+    // For drag-scrubbing we want the preview frame to match the shown time.
+    // Temporarily enforce precise seeking while the user is scrubbing.
+    private var hrSeekWas: String? = null
+    private var hrSeekFrameDropWas: String? = null
+    private var hrSeekTweakedForGesture = false
+
     private fun fadeGestureText() {
         fadeHandler.removeCallbacks(fadeRunnable3)
         binding.gestureTextView.visibility = View.VISIBLE
@@ -2057,7 +2063,14 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
                 if (!isPlayingAudio)
                     maxVolume = 0 // disallow volume gesture if no audio
                 pausedForSeek = 0
-                lastSeekTargetSec = Int.MIN_VALUE
+                // Initialize the scrubbing position in whole seconds so we can do efficient
+                // relative exact seeks during the gesture.
+                lastSeekTargetSec = if (initialSeek < 0f) Int.MIN_VALUE else initialSeek.roundToInt()
+
+                // Reset temporary seek-tweaks for this gesture.
+                hrSeekWas = null
+                hrSeekFrameDropWas = null
+                hrSeekTweakedForGesture = false
 
                 fadeHandler.removeCallbacks(fadeRunnable3)
                 gestureTextView.visibility = View.VISIBLE
@@ -2074,6 +2087,18 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
                     pausedForSeek = if (psc.pause) 2 else 1
                     if (pausedForSeek == 1)
                         player.paused = true
+
+                    // Force precise seeks while scrubbing so the preview frame matches the
+                    // shown timestamp, even on files with sparse keyframes.
+                    // This increases decoding workload (as requested), but prevents the
+                    // displayed frame from sticking to keyframes.
+                    if (!hrSeekTweakedForGesture) {
+                        hrSeekWas = MPVLib.getPropertyString("options/hr-seek")
+                        hrSeekFrameDropWas = MPVLib.getPropertyString("options/hr-seek-framedrop")
+                        MPVLib.setPropertyString("options/hr-seek", "yes")
+                        MPVLib.setPropertyString("options/hr-seek-framedrop", "no")
+                        hrSeekTweakedForGesture = true
+                    }
                 }
 
                 // Force scrubbing to whole seconds, and force accurate (non-keyframe) seeks.
@@ -2082,10 +2107,21 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
                 val targetSec = newPosExact.roundToInt().coerceIn(0, duration.roundToInt())
                 val newDiff = (targetSec - initialSeek).roundToInt()
 
-                // Only issue the seek when the target second actually changes.
+                // Only issue a seek when the target second actually changes.
+                // Use *exact* seeks (not keyframes) so the displayed frame matches the shown time.
+                // Prefer small relative seeks for smooth scrubbing (avoids repeatedly jumping to keyframes).
                 if (targetSec != lastSeekTargetSec) {
+                    val prev = lastSeekTargetSec
+                    val delta = if (prev == Int.MIN_VALUE) Int.MIN_VALUE else targetSec - prev
+
+                    if (delta != Int.MIN_VALUE && kotlin.math.abs(delta) <= 3) {
+                        // Small step: relative exact seek (best for continuous scrubbing)
+                        MPVLib.command(arrayOf("seek", delta.toString(), "relative+exact"))
+                    } else {
+                        // Large jump (or unknown previous): absolute exact seek
+                        MPVLib.command(arrayOf("seek", targetSec.toString(), "absolute+exact"))
+                    }
                     lastSeekTargetSec = targetSec
-                    player.timePos = targetSec.toDouble() // exact seek to the requested second
                 }
                 // Note: don't call updatePlaybackPos() here because mpv will seek a timestamp
                 // actually present in the file, and not the exact one we specified.
@@ -2112,6 +2148,17 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
                 gestureTextView.text = getString(R.string.ui_brightness, (newBright * 100).roundToInt())
             }
             PropertyChange.Finalize -> {
+                // Ensure we end up exactly on the last requested second (and show that frame)
+                // before resuming playback.
+                if (lastSeekTargetSec != Int.MIN_VALUE)
+                    MPVLib.command(arrayOf("seek", lastSeekTargetSec.toString(), "absolute+exact"))
+
+                // Restore original seek options after scrubbing.
+                if (hrSeekTweakedForGesture) {
+                    MPVLib.setPropertyString("options/hr-seek", hrSeekWas ?: "default")
+                    MPVLib.setPropertyString("options/hr-seek-framedrop", hrSeekFrameDropWas ?: "yes")
+                    hrSeekTweakedForGesture = false
+                }
                 if (pausedForSeek == 1)
                     player.paused = false
                 gestureTextView.visibility = View.GONE
