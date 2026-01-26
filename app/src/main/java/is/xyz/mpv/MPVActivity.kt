@@ -85,6 +85,7 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
 
     private lateinit var binding: PlayerBinding
     private lateinit var gestures: TouchGestures
+    private lateinit var zoomGestures: VideoZoomGestures
 
     // convenience alias
     private val player get() = binding.player
@@ -215,7 +216,21 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
         }
 
         player.setOnTouchListener { _, e ->
-            if (lockedUI) false else gestures.onTouchEvent(e)
+            if (lockedUI)
+                return@setOnTouchListener false
+
+            // If multi-touch starts, cancel any in-progress single-touch gesture state.
+            if (e.actionMasked == MotionEvent.ACTION_POINTER_DOWN)
+                gestures.cancel()
+
+            // Zoom handler first.
+            val blockDefault = zoomGestures.shouldBlockOtherGestures(e)
+            val handledByZoom = zoomGestures.onTouchEvent(e)
+
+            when {
+                blockDefault -> handledByZoom // if false => allow Activity to toggle controls on tap
+                else -> gestures.onTouchEvent(e)
+            }
         }
 
         ViewCompat.setOnApplyWindowInsetsListener(binding.outside) { _, windowInsets ->
@@ -256,13 +271,15 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
         binding = PlayerBinding.inflate(layoutInflater)
         setContentView(binding.root)
 
+        // Gesture handlers must exist before we attach listeners.
+        gestures = TouchGestures(this)
+        zoomGestures = VideoZoomGestures(binding.player)
+
         // Init controls to be hidden and view fullscreen
         hideControls()
 
         // Initialize listeners for the player view
         initListeners()
-
-        gestures = TouchGestures(this)
 
         // set up initial UI state
         readSettings()
@@ -963,11 +980,17 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
             val wm = windowManager.currentWindowMetrics
-            gestures.setMetrics(wm.bounds.width().toFloat(), wm.bounds.height().toFloat())
+            val w = wm.bounds.width().toFloat()
+            val h = wm.bounds.height().toFloat()
+            gestures.setMetrics(w, h)
+            zoomGestures.setMetrics(w, h)
         } else @Suppress("DEPRECATION") {
             val dm = DisplayMetrics()
             windowManager.defaultDisplay.getRealMetrics(dm)
-            gestures.setMetrics(dm.widthPixels.toFloat(), dm.heightPixels.toFloat())
+            val w = dm.widthPixels.toFloat()
+            val h = dm.heightPixels.toFloat()
+            gestures.setMetrics(w, h)
+            zoomGestures.setMetrics(w, h)
         }
 
         // Adjust control margins
@@ -1965,6 +1988,12 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
             finishWithResult(if (playbackHasStarted) RESULT_OK else RESULT_CANCELED)
 
         if (eventId == MpvEvent.MPV_EVENT_START_FILE) {
+            // Reset interactive zoom/pan for each new file.
+            zoomGestures.reset()
+            // Also make sure mpv-side transforms are cleared (in case an older build used them).
+            MPVLib.setPropertyDouble("video-zoom", 0.0)
+            MPVLib.setPropertyDouble("video-pan-x", 0.0)
+            MPVLib.setPropertyDouble("video-pan-y", 0.0)
             for (c in onloadCommands)
                 MPVLib.command(c)
             if (this.statsLuaMode > 0 && !playbackHasStarted) {
