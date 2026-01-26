@@ -86,6 +86,7 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
     private lateinit var binding: PlayerBinding
     private lateinit var gestures: TouchGestures
     private lateinit var zoomGestures: VideoZoomGestures
+    private lateinit var seekScrubPreview: SeekScrubPreview
 
     // convenience alias
     private val player get() = binding.player
@@ -215,22 +216,13 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
             playbackSeekbar.setOnSeekBarChangeListener(seekBarChangeListener)
         }
 
-        // NOTE: touch events must come from an untransformed view. See player.xml.
         binding.gestureLayer.setOnTouchListener { _, e ->
-            if (lockedUI)
-                return@setOnTouchListener false
-
-            // If multi-touch starts, cancel any in-progress single-touch gesture state.
-            if (e.actionMasked == MotionEvent.ACTION_POINTER_DOWN)
-                gestures.cancel()
-
-            // Zoom handler first.
-            val blockDefault = zoomGestures.shouldBlockOtherGestures(e)
-            val handledByZoom = zoomGestures.onTouchEvent(e)
-
-            when {
-                blockDefault -> handledByZoom // if false => allow Activity to toggle controls on tap
-                else -> gestures.onTouchEvent(e)
+            if (lockedUI) {
+                false
+            } else {
+                val blockDefault = zoomGestures.shouldBlockOtherGestures(e)
+                val handledByZoom = zoomGestures.onTouchEvent(e)
+                if (blockDefault) handledByZoom else gestures.onTouchEvent(e)
             }
         }
 
@@ -260,16 +252,6 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
     private var playbackHasStarted = false
     private var onloadCommands = mutableListOf<Array<String>>()
 
-    private fun setPanscanEnabled(enabled: Boolean) {
-        // Used by VideoZoomGestures to crop away pillar/letterboxing while zooming.
-        // (mpv "panscan" is defined as cropping to avoid black bands.)
-        try {
-            MPVLib.setPropertyDouble("panscan", if (enabled) 1.0 else 0.0)
-        } catch (_: Throwable) {
-            // Ignore - mpv might not be ready yet.
-        }
-    }
-
     // Activity lifetime
 
     override fun onCreate(icicle: Bundle?) {
@@ -282,14 +264,12 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
         binding = PlayerBinding.inflate(layoutInflater)
         setContentView(binding.root)
 
-        // Gesture handlers must exist before we attach listeners.
-        gestures = TouchGestures(this)
-        zoomGestures = VideoZoomGestures(binding.player) { enabled ->
-            setPanscanEnabled(enabled)
-        }
-
         // Init controls to be hidden and view fullscreen
         hideControls()
+
+        gestures = TouchGestures(this)
+        zoomGestures = VideoZoomGestures(binding.player) { enabled -> setPanscanEnabled(enabled) }
+        seekScrubPreview = SeekScrubPreview(this, binding.seekPreview)
 
         // Initialize listeners for the player view
         initListeners()
@@ -380,6 +360,8 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
 
         // take the background service with us
         stopServiceRunnable.run()
+
+        try { seekScrubPreview.release() } catch (_: Throwable) {}
 
         player.removeObserver(this)
         player.destroy()
@@ -2001,12 +1983,6 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
             finishWithResult(if (playbackHasStarted) RESULT_OK else RESULT_CANCELED)
 
         if (eventId == MpvEvent.MPV_EVENT_START_FILE) {
-            // Reset interactive zoom/pan for each new file.
-            zoomGestures.reset()
-            // Also make sure mpv-side transforms are cleared (in case an older build used them).
-            MPVLib.setPropertyDouble("video-zoom", 0.0)
-            MPVLib.setPropertyDouble("video-pan-x", 0.0)
-            MPVLib.setPropertyDouble("video-pan-y", 0.0)
             for (c in onloadCommands)
                 MPVLib.command(c)
             if (this.statsLuaMode > 0 && !playbackHasStarted) {
@@ -2014,6 +1990,15 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
             }
 
             playbackHasStarted = true
+
+            // Reset any zoom/pan transforms when a new file starts.
+            try {
+                zoomGestures.reset()
+                MPVLib.setPropertyDouble("video-zoom", 0.0)
+                MPVLib.setPropertyDouble("video-pan-x", 0.0)
+                MPVLib.setPropertyDouble("video-pan-y", 0.0)
+                setPanscanEnabled(false)
+            } catch (_: Throwable) {}
         }
 
         if (!activityIsForeground) return
@@ -2021,6 +2006,23 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
     }
 
     // Gesture handler
+
+    private fun setPanscanEnabled(enabled: Boolean) {
+        // Remove black bars while zooming/panning by temporarily enabling panscan.
+        // Keep it disabled otherwise so normal aspect handling remains unchanged.
+        try {
+            MPVLib.setPropertyDouble("panscan", if (enabled) 1.0 else 0.0)
+        } catch (_: Throwable) {}
+    }
+
+    private fun currentPlaybackSourceForPreview(): String? {
+        val src = MPVLib.getPropertyString("path")
+            ?: MPVLib.getPropertyString("stream-open-filename")
+        if (src.isNullOrBlank()) return null
+        // memory playlists and non-file sources usually can't be preview-decoded via MMR.
+        if (src.startsWith("memory://")) return null
+        return src
+    }
 
     private var initialSeek = 0f
     private var initialBright = 0f
@@ -2030,12 +2032,8 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
     private var pausedForSeek = 0
     /** Last whole-second seek target during a drag seek gesture. */
     private var lastSeekTargetSec = Int.MIN_VALUE
-
-    // For drag-scrubbing we want the preview frame to match the shown time.
-    // Temporarily enforce precise seeking while the user is scrubbing.
-    private var hrSeekWas: String? = null
-    private var hrSeekFrameDropWas: String? = null
-    private var hrSeekTweakedForGesture = false
+    /** Whether the current drag gesture is a seek gesture (used for preview overlay). */
+    private var seekPreviewActive = false
 
     private fun fadeGestureText() {
         fadeHandler.removeCallbacks(fadeRunnable3)
@@ -2063,14 +2061,10 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
                 if (!isPlayingAudio)
                     maxVolume = 0 // disallow volume gesture if no audio
                 pausedForSeek = 0
-                // Initialize the scrubbing position in whole seconds so we can do efficient
-                // relative exact seeks during the gesture.
-                lastSeekTargetSec = if (initialSeek < 0f) Int.MIN_VALUE else initialSeek.roundToInt()
-
-                // Reset temporary seek-tweaks for this gesture.
-                hrSeekWas = null
-                hrSeekFrameDropWas = null
-                hrSeekTweakedForGesture = false
+                lastSeekTargetSec = Int.MIN_VALUE
+                seekPreviewActive = false
+                // Ensure no stale preview is shown from a previous gesture.
+                seekScrubPreview.hideAndClear()
 
                 fadeHandler.removeCallbacks(fadeRunnable3)
                 gestureTextView.visibility = View.VISIBLE
@@ -2081,47 +2075,32 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
                 val duration = (psc.duration / 1000f)
                 if (duration == 0f || initialSeek < 0)
                     return
-                // Pause while seeking (finger still on screen) and only resume on release.
-                // If playback was already paused, keep it paused.
+                // Pause while the finger is down (resume happens on Finalize).
                 if (pausedForSeek == 0) {
                     pausedForSeek = if (psc.pause) 2 else 1
                     if (pausedForSeek == 1)
                         player.paused = true
-
-                    // Force precise seeks while scrubbing so the preview frame matches the
-                    // shown timestamp, even on files with sparse keyframes.
-                    // This increases decoding workload (as requested), but prevents the
-                    // displayed frame from sticking to keyframes.
-                    if (!hrSeekTweakedForGesture) {
-                        hrSeekWas = MPVLib.getPropertyString("options/hr-seek")
-                        hrSeekFrameDropWas = MPVLib.getPropertyString("options/hr-seek-framedrop")
-                        MPVLib.setPropertyString("options/hr-seek", "yes")
-                        MPVLib.setPropertyString("options/hr-seek-framedrop", "no")
-                        hrSeekTweakedForGesture = true
-                    }
                 }
 
-                // Force scrubbing to whole seconds, and force accurate (non-keyframe) seeks.
-                // This avoids "waiting" for the next keyframe on highly-compressed videos.
+                // Start the preview overlay the first time we enter seek mode.
+                if (!seekPreviewActive) {
+                    seekPreviewActive = true
+                    seekScrubPreview.prepare(currentPlaybackSourceForPreview())
+                    seekScrubPreview.show()
+                }
+
+                // Force 1-second stepping and *exact* seeks (not keyframes-only).
                 val newPosExact = (initialSeek + diff).coerceIn(0f, duration)
-                val targetSec = newPosExact.roundToInt().coerceIn(0, duration.roundToInt())
-                val newDiff = (targetSec - initialSeek).roundToInt()
+                val durationSec = duration.toInt().coerceAtLeast(0)
+                val targetSec = newPosExact.roundToInt().coerceIn(0, durationSec)
+                val newDiff = (targetSec.toFloat() - initialSeek).roundToInt()
 
-                // Only issue a seek when the target second actually changes.
-                // Use *exact* seeks (not keyframes) so the displayed frame matches the shown time.
-                // Prefer small relative seeks for smooth scrubbing (avoids repeatedly jumping to keyframes).
+                // Only issue work when the whole-second target changes.
                 if (targetSec != lastSeekTargetSec) {
-                    val prev = lastSeekTargetSec
-                    val delta = if (prev == Int.MIN_VALUE) Int.MIN_VALUE else targetSec - prev
-
-                    if (delta != Int.MIN_VALUE && kotlin.math.abs(delta) <= 3) {
-                        // Small step: relative exact seek (best for continuous scrubbing)
-                        MPVLib.command(arrayOf("seek", delta.toString(), "relative+exact"))
-                    } else {
-                        // Large jump (or unknown previous): absolute exact seek
-                        MPVLib.command(arrayOf("seek", targetSec.toString(), "absolute+exact"))
-                    }
                     lastSeekTargetSec = targetSec
+                    player.timePos = targetSec.toDouble() // exact seek
+                    // Keep the UI responsive even during very fast scrubbing.
+                    seekScrubPreview.requestSecond(targetSec)
                 }
                 // Note: don't call updatePlaybackPos() here because mpv will seek a timestamp
                 // actually present in the file, and not the exact one we specified.
@@ -2148,19 +2127,10 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
                 gestureTextView.text = getString(R.string.ui_brightness, (newBright * 100).roundToInt())
             }
             PropertyChange.Finalize -> {
-                // Ensure we end up exactly on the last requested second (and show that frame)
-                // before resuming playback.
-                if (lastSeekTargetSec != Int.MIN_VALUE)
-                    MPVLib.command(arrayOf("seek", lastSeekTargetSec.toString(), "absolute+exact"))
-
-                // Restore original seek options after scrubbing.
-                if (hrSeekTweakedForGesture) {
-                    MPVLib.setPropertyString("options/hr-seek", hrSeekWas ?: "default")
-                    MPVLib.setPropertyString("options/hr-seek-framedrop", hrSeekFrameDropWas ?: "yes")
-                    hrSeekTweakedForGesture = false
-                }
                 if (pausedForSeek == 1)
                     player.paused = false
+                // Hide the preview slightly later to avoid a visible "pop" if mpv is still finishing a seek.
+                seekScrubPreview.hideAndClear(80L)
                 gestureTextView.visibility = View.GONE
             }
 
