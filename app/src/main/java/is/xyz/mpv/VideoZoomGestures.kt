@@ -7,30 +7,34 @@ import android.view.ScaleGestureDetector
 import android.view.View
 import android.view.ViewConfiguration
 import kotlin.math.hypot
+import kotlin.math.max
+import kotlin.math.min
 
 /**
  * High-FPS pinch-to-zoom + pan for mpv output.
  *
+ * Design goals (Samsung-like):
+ *  - 60fps zoom/pan (compositor-level by transforming the Android view)
+ *  - While zoomed: one-finger pan, double-tap resets, seeking disabled
+ *  - Black bars (letter/pillarbox) are treated as "not part of video":
+ *      * They remain visible at small zoom.
+ *      * They disappear naturally once the zoom reaches the point where the
+ *        video content fills the viewport.
+ *      * Panning is clamped to the *video content rect*, not the whole view,
+ *        so you can't pan into the black bars.
+ *
  * IMPORTANT:
- *  - We zoom by transforming the Android SurfaceView (compositor-level), not via mpv video-zoom/video-pan.
- *  - Touch input MUST come from an untransformed overlay view (see player.xml: gestureLayer), otherwise
- *    Android delivers inverse-transformed coordinates and you can get feedback/jitter.
- *
- * While zoomed:
- *  - One-finger drag pans the image (seeking disabled)
- *  - Double-tap resets zoom
- *  - Pinch zoom is smooth (60fps) and video keeps playing
- *
- * Also:
- *  - When entering zoom, we enable mpv "panscan" to crop away pillar/letterboxing (black bands around video).
+ *  - Touch input must come from an UNTRANSFORMED overlay view (gesture layer),
+ *    not from the transformed SurfaceView itself.
  */
 internal class VideoZoomGestures(
     private val target: View,
-    private val setPanscanEnabled: (Boolean) -> Unit = {},
 ) {
-
     private var viewWidth = 0f
     private var viewHeight = 0f
+
+    /** video aspect ratio (rotation already applied). 0 => unknown */
+    private var videoAspect = 0.0
 
     private val touchSlop = ViewConfiguration.get(target.context).scaledTouchSlop.toFloat()
 
@@ -50,41 +54,27 @@ internal class VideoZoomGestures(
     private var lastTapX = 0f
     private var lastTapY = 0f
 
-    private var panscanOn = false
-
     // Coalesce view property updates to vsync to avoid SurfaceView transaction jitter.
     private val choreographer: Choreographer = Choreographer.getInstance()
     private var applyScheduled = false
     private val frameCallback = Choreographer.FrameCallback {
         applyScheduled = false
-        clampTranslation()
+        clampTranslationToVideoContent()
         applyToView()
     }
 
     private fun scheduleApply() {
-        if (applyScheduled)
-            return
+        if (applyScheduled) return
         applyScheduled = true
         choreographer.postFrameCallback(frameCallback)
     }
 
-    private fun setPanscan(on: Boolean) {
-        if (panscanOn == on)
-            return
-        panscanOn = on
-        setPanscanEnabled(on)
-    }
-
-    private val scaleDetector = ScaleGestureDetector(target.context,
+    private val scaleDetector = ScaleGestureDetector(
+        target.context,
         object : ScaleGestureDetector.SimpleOnScaleGestureListener() {
-
             override fun onScaleBegin(detector: ScaleGestureDetector): Boolean {
-                // Any multi-touch invalidates tap state.
                 lastTapTime = 0L
                 didDrag = true
-
-                // Remove black bands as soon as user starts zooming.
-                setPanscan(true)
                 return true
             }
 
@@ -110,15 +100,21 @@ internal class VideoZoomGestures(
             }
 
             override fun onScaleEnd(detector: ScaleGestureDetector) {
-                // If user pinched back to normal, cleanly reset.
                 if (scale <= 1f + EPS)
                     reset()
             }
-        })
+        }
+    )
 
     fun setMetrics(width: Float, height: Float) {
         viewWidth = width
         viewHeight = height
+        if (isZoomed())
+            scheduleApply()
+    }
+
+    fun setVideoAspect(aspect: Double?) {
+        videoAspect = aspect ?: 0.0
         if (isZoomed())
             scheduleApply()
     }
@@ -130,7 +126,6 @@ internal class VideoZoomGestures(
     }
 
     fun reset() {
-        // Cancel pending apply so we don't re-apply old values after reset.
         if (applyScheduled) {
             choreographer.removeFrameCallback(frameCallback)
             applyScheduled = false
@@ -141,7 +136,6 @@ internal class VideoZoomGestures(
         ty = 0f
         didDrag = false
         lastTapTime = 0L
-        setPanscan(false)
         applyToView()
     }
 
@@ -159,8 +153,6 @@ internal class VideoZoomGestures(
         if (e.actionMasked == MotionEvent.ACTION_POINTER_UP && isZoomed()) {
             lastTapTime = 0L
             didDrag = true
-
-            // The event still contains both pointers, actionIndex is the lifted one.
             if (e.pointerCount >= 2) {
                 val upIdx = e.actionIndex
                 val remainIdx = if (upIdx == 0) 1 else 0
@@ -206,8 +198,6 @@ internal class VideoZoomGestures(
                 }
 
                 if (didDrag) {
-                    // NOTE: dx/dy are in the overlay's coordinate space (untransformed, screen-like).
-                    // translationX/Y are in parent coords, so apply directly.
                     tx += dx
                     ty += dy
                     scheduleApply()
@@ -220,7 +210,7 @@ internal class VideoZoomGestures(
 
                 if (!wasTap) {
                     lastTapTime = 0L
-                    return true // consume so controls don't toggle after dragging
+                    return true
                 }
 
                 // Double-tap anywhere while zoomed => reset.
@@ -235,7 +225,7 @@ internal class VideoZoomGestures(
                 lastTapTime = now
                 lastTapX = e.x
                 lastTapY = e.y
-                return false // allow Activity to toggle controls on single tap
+                return false
             }
             MotionEvent.ACTION_CANCEL -> {
                 lastTapTime = 0L
@@ -247,7 +237,34 @@ internal class VideoZoomGestures(
         return true
     }
 
-    private fun clampTranslation() {
+    /**
+     * Compute the content (video) rect within the view at base scale.
+     */
+    private fun contentRect(): ContentRect {
+        val w = viewWidth
+        val h = viewHeight
+        if (w <= 1f || h <= 1f)
+            return ContentRect(0f, 0f, w, h)
+
+        val ar = if (videoAspect > 0.001) videoAspect.toFloat() else (w / h)
+        val viewAr = w / h
+        val cw: Float
+        val ch: Float
+        if (ar > viewAr) {
+            // video wider => fit width
+            cw = w
+            ch = w / ar
+        } else {
+            // video taller/narrower => fit height
+            ch = h
+            cw = h * ar
+        }
+        val ox = (w - cw) * 0.5f
+        val oy = (h - ch) * 0.5f
+        return ContentRect(ox, oy, cw, ch)
+    }
+
+    private fun clampTranslationToVideoContent() {
         if (viewWidth <= 1f || viewHeight <= 1f)
             return
 
@@ -257,15 +274,35 @@ internal class VideoZoomGestures(
             return
         }
 
-        // With pivot(0,0): allowed translation range is [view - view*scale, 0]
-        val minTx = viewWidth - (viewWidth * scale)
-        val minTy = viewHeight - (viewHeight * scale)
-        tx = tx.coerceIn(minTx, 0f)
-        ty = ty.coerceIn(minTy, 0f)
+        val c = contentRect()
+
+        // Clamp independently per axis.
+        // Use the transformed content rect (not the transformed whole view) so black bars are never "pan space".
+        val contentWScaled = scale * c.w
+        val contentHScaled = scale * c.h
+
+        // X axis
+        tx = if (contentWScaled <= viewWidth + EPS) {
+            // Content smaller than viewport: keep it centered (no horizontal panning)
+            ((viewWidth - contentWScaled) * 0.5f) - scale * c.ox
+        } else {
+            val minTx = viewWidth - scale * (c.ox + c.w)
+            val maxTx = -scale * c.ox
+            tx.coerceIn(minTx, maxTx)
+        }
+
+        // Y axis
+        ty = if (contentHScaled <= viewHeight + EPS) {
+            // Content smaller than viewport: keep it centered (no vertical panning)
+            ((viewHeight - contentHScaled) * 0.5f) - scale * c.oy
+        } else {
+            val minTy = viewHeight - scale * (c.oy + c.h)
+            val maxTy = -scale * c.oy
+            ty.coerceIn(minTy, maxTy)
+        }
     }
 
     private fun applyToView() {
-        // Use pivot(0,0) for stable math.
         target.pivotX = 0f
         target.pivotY = 0f
         target.scaleX = scale
@@ -273,6 +310,8 @@ internal class VideoZoomGestures(
         target.translationX = tx
         target.translationY = ty
     }
+
+    private data class ContentRect(val ox: Float, val oy: Float, val w: Float, val h: Float)
 
     companion object {
         private const val EPS = 0.001f
