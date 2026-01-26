@@ -1,6 +1,7 @@
 package `is`.xyz.mpv
 
 import android.os.SystemClock
+import android.view.Choreographer
 import android.view.MotionEvent
 import android.view.ScaleGestureDetector
 import android.view.View
@@ -10,14 +11,23 @@ import kotlin.math.hypot
 /**
  * High-FPS pinch-to-zoom + pan for mpv output.
  *
- * IMPORTANT: We intentionally zoom by transforming the Android View (SurfaceView layer)
- * instead of using mpv's video-zoom / video-pan-x/y.
+ * IMPORTANT:
+ *  - We zoom by transforming the Android SurfaceView (compositor-level), not via mpv video-zoom/video-pan.
+ *  - Touch input MUST come from an untransformed overlay view (see player.xml: gestureLayer), otherwise
+ *    Android delivers inverse-transformed coordinates and you can get feedback/jitter.
  *
- * Reason: mpv typically only redraws on video frame updates (e.g. 24fps), which makes
- * interactive zoom/pan feel choppy. View transforms are animated by the compositor and
- * remain smooth at display refresh rate (60/90/120Hz) like Samsung Video Player.
+ * While zoomed:
+ *  - One-finger drag pans the image (seeking disabled)
+ *  - Double-tap resets zoom
+ *  - Pinch zoom is smooth (60fps) and video keeps playing
+ *
+ * Also:
+ *  - When entering zoom, we enable mpv "panscan" to crop away pillar/letterboxing (black bands around video).
  */
-internal class VideoZoomGestures(private val target: View) {
+internal class VideoZoomGestures(
+    private val target: View,
+    private val setPanscanEnabled: (Boolean) -> Unit = {},
+) {
 
     private var viewWidth = 0f
     private var viewHeight = 0f
@@ -40,13 +50,41 @@ internal class VideoZoomGestures(private val target: View) {
     private var lastTapX = 0f
     private var lastTapY = 0f
 
+    private var panscanOn = false
+
+    // Coalesce view property updates to vsync to avoid SurfaceView transaction jitter.
+    private val choreographer: Choreographer = Choreographer.getInstance()
+    private var applyScheduled = false
+    private val frameCallback = Choreographer.FrameCallback {
+        applyScheduled = false
+        clampTranslation()
+        applyToView()
+    }
+
+    private fun scheduleApply() {
+        if (applyScheduled)
+            return
+        applyScheduled = true
+        choreographer.postFrameCallback(frameCallback)
+    }
+
+    private fun setPanscan(on: Boolean) {
+        if (panscanOn == on)
+            return
+        panscanOn = on
+        setPanscanEnabled(on)
+    }
+
     private val scaleDetector = ScaleGestureDetector(target.context,
         object : ScaleGestureDetector.SimpleOnScaleGestureListener() {
 
             override fun onScaleBegin(detector: ScaleGestureDetector): Boolean {
-                // Any multi-touch invalidates tap state
+                // Any multi-touch invalidates tap state.
                 lastTapTime = 0L
                 didDrag = true
+
+                // Remove black bands as soon as user starts zooming.
+                setPanscan(true)
                 return true
             }
 
@@ -60,18 +98,19 @@ internal class VideoZoomGestures(private val target: View) {
                 if (newScale == oldScale)
                     return true
 
-                // Keep the pinch focus stable (we use pivot (0,0) for deterministic math)
+                // Keep pinch focus stable (pivot (0,0) simplifies the math)
                 val fx = detector.focusX
                 val fy = detector.focusY
                 tx += fx * (oldScale - newScale)
                 ty += fy * (oldScale - newScale)
                 scale = newScale
 
-                clampAndApply()
+                scheduleApply()
                 return true
             }
 
             override fun onScaleEnd(detector: ScaleGestureDetector) {
+                // If user pinched back to normal, cleanly reset.
                 if (scale <= 1f + EPS)
                     reset()
             }
@@ -80,9 +119,8 @@ internal class VideoZoomGestures(private val target: View) {
     fun setMetrics(width: Float, height: Float) {
         viewWidth = width
         viewHeight = height
-        // After rotation/resizes, re-clamp so we don't end up out of bounds.
         if (isZoomed())
-            clampAndApply()
+            scheduleApply()
     }
 
     fun isZoomed(): Boolean = scale > 1f + EPS
@@ -92,20 +130,48 @@ internal class VideoZoomGestures(private val target: View) {
     }
 
     fun reset() {
+        // Cancel pending apply so we don't re-apply old values after reset.
+        if (applyScheduled) {
+            choreographer.removeFrameCallback(frameCallback)
+            applyScheduled = false
+        }
+
         scale = 1f
         tx = 0f
         ty = 0f
+        didDrag = false
+        lastTapTime = 0L
+        setPanscan(false)
         applyToView()
     }
 
     /**
      * @return true if the event should be consumed.
-     *         When zoomed: pinch/pan/double-tap are consumed.
+     *         While zoomed: pinch/pan/double-tap are consumed.
      *         Single tap returns false so the Activity can toggle controls.
      */
     fun onTouchEvent(e: MotionEvent): Boolean {
-        // Always feed the scale detector.
+        // Always feed the scale detector first.
         scaleDetector.onTouchEvent(e)
+
+        // Pointer transitions during pinch:
+        // If one finger lifts and another remains down, update lastX/lastY so we don't jump.
+        if (e.actionMasked == MotionEvent.ACTION_POINTER_UP && isZoomed()) {
+            lastTapTime = 0L
+            didDrag = true
+
+            // The event still contains both pointers, actionIndex is the lifted one.
+            if (e.pointerCount >= 2) {
+                val upIdx = e.actionIndex
+                val remainIdx = if (upIdx == 0) 1 else 0
+                lastX = e.getX(remainIdx)
+                lastY = e.getY(remainIdx)
+                downX = lastX
+                downY = lastY
+                downTime = SystemClock.uptimeMillis()
+            }
+            return true
+        }
 
         // Multi-touch (or active pinch) should always be consumed.
         if (e.pointerCount > 1 || scaleDetector.isInProgress) {
@@ -140,11 +206,11 @@ internal class VideoZoomGestures(private val target: View) {
                 }
 
                 if (didDrag) {
-                    // MotionEvent coordinates are provided in the view's local coordinate system
-                    // (inverse-transformed). Convert back to screen-space deltas.
-                    tx += dx * scale
-                    ty += dy * scale
-                    clampAndApply()
+                    // NOTE: dx/dy are in the overlay's coordinate space (untransformed, screen-like).
+                    // translationX/Y are in parent coords, so apply directly.
+                    tx += dx
+                    ty += dy
+                    scheduleApply()
                 }
                 return true
             }
@@ -179,11 +245,6 @@ internal class VideoZoomGestures(private val target: View) {
         }
 
         return true
-    }
-
-    private fun clampAndApply() {
-        clampTranslation()
-        applyToView()
     }
 
     private fun clampTranslation() {
