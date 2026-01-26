@@ -2065,7 +2065,9 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
                 val duration = (psc.duration / 1000f)
                 if (duration == 0f || initialSeek < 0)
                     return
-                if (smoothSeekGesture && pausedForSeek == 0) {
+                // Pause while seeking (finger still on screen) and only resume on release.
+                // If playback was already paused, keep it paused.
+                if (pausedForSeek == 0) {
                     pausedForSeek = if (psc.pause) 2 else 1
                     if (pausedForSeek == 1)
                         player.paused = true
