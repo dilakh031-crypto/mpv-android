@@ -38,6 +38,7 @@ import androidx.annotation.DrawableRes
 import androidx.annotation.IdRes
 import androidx.annotation.LayoutRes
 import androidx.annotation.RequiresApi
+import java.security.MessageDigest
 import androidx.annotation.StringRes
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.IntentCompat
@@ -1175,6 +1176,81 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
         return uri.toString()
     }
 
+    // --- Per-file subtitle persistence (chosen subtitle track/file is restored on reopen) ---
+
+    private fun sha1Hex(input: String): String {
+        val bytes = MessageDigest.getInstance("SHA-1").digest(input.toByteArray(Charsets.UTF_8))
+        val sb = StringBuilder(bytes.size * 2)
+        for (b in bytes) sb.append(String.format("%02x", b))
+        return sb.toString()
+    }
+
+    private fun perFileKey(suffix: String, path: String): String = "perfile_${suffix}_${sha1Hex(path)}"
+
+    private fun rememberSubtitleSelectionForCurrentFile() {
+        val mediaPath = MPVLib.getPropertyString("path") ?: return
+        val prefs = getDefaultSharedPreferences(applicationContext)
+
+        val sid = MPVLib.getPropertyInt("sid") ?: -1
+        val ext = findExternalSubFilenameForSid(sid)
+
+        with (prefs.edit()) {
+            if (!ext.isNullOrEmpty()) {
+                putString(perFileKey(PREF_SUB_KIND, mediaPath), PREF_SUB_KIND_EXTERNAL)
+                putString(perFileKey(PREF_SUB_EXTERNAL, mediaPath), ext)
+            } else {
+                putString(perFileKey(PREF_SUB_KIND, mediaPath), PREF_SUB_KIND_SID)
+                putInt(perFileKey(PREF_SUB_SID, mediaPath), sid)
+            }
+            apply()
+        }
+    }
+
+    private fun rememberExternalSubtitleForCurrentFile(subPath: String) {
+        val mediaPath = MPVLib.getPropertyString("path") ?: return
+        val prefs = getDefaultSharedPreferences(applicationContext)
+        with (prefs.edit()) {
+            // We treat adding an external subtitle as the user's chosen subtitle.
+            putString(perFileKey(PREF_SUB_KIND, mediaPath), PREF_SUB_KIND_EXTERNAL)
+            putString(perFileKey(PREF_SUB_EXTERNAL, mediaPath), subPath)
+            apply()
+        }
+    }
+
+    private fun restoreSubtitleSelectionForCurrentFile() {
+        val mediaPath = MPVLib.getPropertyString("path") ?: return
+        val prefs = getDefaultSharedPreferences(applicationContext)
+
+        val kind = prefs.getString(perFileKey(PREF_SUB_KIND, mediaPath), null) ?: return
+        if (kind == PREF_SUB_KIND_EXTERNAL) {
+            val sub = prefs.getString(perFileKey(PREF_SUB_EXTERNAL, mediaPath), null)
+            if (!sub.isNullOrEmpty()) {
+                // "cached" will select the subtitle; if it already exists, it will be reused.
+                MPVLib.command(arrayOf("sub-add", sub, "cached"))
+            }
+        } else if (kind == PREF_SUB_KIND_SID) {
+            if (prefs.contains(perFileKey(PREF_SUB_SID, mediaPath))) {
+                val sid = prefs.getInt(perFileKey(PREF_SUB_SID, mediaPath), -1)
+                MPVLib.setPropertyInt("sid", sid)
+            }
+        }
+    }
+
+    private fun findExternalSubFilenameForSid(sid: Int): String? {
+        if (sid < 0) return null
+        val count = MPVLib.getPropertyInt("track-list/count") ?: return null
+        for (i in 0 until count) {
+            val type = MPVLib.getPropertyString("track-list/$i/type") ?: continue
+            if (type != "sub") continue
+            val id = MPVLib.getPropertyInt("track-list/$i/id") ?: continue
+            if (id != sid) continue
+            val isExternal = MPVLib.getPropertyBoolean("track-list/$i/external") == true
+            if (!isExternal) return null
+            return MPVLib.getPropertyString("track-list/$i/external-filename")
+        }
+        return null
+    }
+
     private fun parseIntentExtras(extras: Bundle?) {
         onloadCommands.clear()
         if (extras == null)
@@ -1235,7 +1311,9 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
         player.cycleAudio(); TrackData(player.aid, "audio")
     }
     private fun cycleSub() = trackSwitchNotification {
-        player.cycleSub(); TrackData(player.sid, "sub")
+        player.cycleSub()
+        try { rememberSubtitleSelectionForCurrentFile() } catch (_: Throwable) {}
+        TrackData(player.sid, "sub")
     }
 
     private fun selectTrack(type: String, get: () -> Int, set: (Int) -> Unit) {
@@ -1249,6 +1327,9 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
                 val trackId = tracks[item].mpvId
 
                 set(trackId)
+                if (type == "sub") {
+                    try { rememberSubtitleSelectionForCurrentFile() } catch (_: Throwable) {}
+                }
                 dialog.dismiss()
                 trackSwitchNotification { TrackData(trackId, type) }
             }
@@ -1268,6 +1349,10 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
                 player.secondarySid = it.mpvId
             else
                 player.sid = it.mpvId
+
+            if (!secondary) {
+                try { rememberSubtitleSelectionForCurrentFile() } catch (_: Throwable) {}
+            }
             dialog.dismiss()
             trackSwitchNotification { TrackData(it.mpvId, SubTrackDialog.TRACK_TYPE) }
         }
@@ -1427,6 +1512,11 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
             else
                 path
             MPVLib.command(arrayOf(cmd, path2, "cached"))
+
+            // Persist the chosen external subtitle per video so it gets reloaded on reopen.
+            if (cmd == "sub-add") {
+                try { rememberExternalSubtitleForCurrentFile(path2) } catch (_: Throwable) {}
+            }
         }
 
         /******/
@@ -2045,6 +2135,9 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
 
             for (c in onloadCommands)
                 MPVLib.command(c)
+
+            // Restore the user's previously chosen subtitle (track or external file) for this video.
+            try { restoreSubtitleSelectionForCurrentFile() } catch (_: Throwable) {}
             if (this.statsLuaMode > 0 && !playbackHasStarted) {
                 MPVLib.command(arrayOf("script-binding", "stats/display-page-${this.statsLuaMode}-toggle"))
             }
@@ -2200,5 +2293,12 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
         private const val STREAM_TYPE = AudioManager.STREAM_MUSIC
         // precision used by seekbar (1/s)
         private const val SEEK_BAR_PRECISION = 2
+
+        // Per-file subtitle persistence keys
+        private const val PREF_SUB_KIND = "sub_kind"
+        private const val PREF_SUB_EXTERNAL = "sub_external"
+        private const val PREF_SUB_SID = "sub_sid"
+        private const val PREF_SUB_KIND_EXTERNAL = "external"
+        private const val PREF_SUB_KIND_SID = "sid"
     }
 }
