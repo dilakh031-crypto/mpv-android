@@ -10,6 +10,7 @@ import androidx.core.view.ViewCompat
 import androidx.recyclerview.widget.RecyclerView
 
 internal typealias Listener = (MPVView.Track, Boolean) -> Unit
+internal typealias RemoveListener = (Int, Boolean) -> Unit
 
 internal class SubTrackDialog(private val player: MPVView) {
     private lateinit var binding: DialogTrackBinding
@@ -22,6 +23,7 @@ internal class SubTrackDialog(private val player: MPVView) {
     private var selectedMpvId2 = -1
 
     var listener: Listener? = null
+    var removeListener: RemoveListener? = null
 
     fun buildView(layoutInflater: LayoutInflater): View {
         binding = DialogTrackBinding.inflate(layoutInflater)
@@ -37,6 +39,11 @@ internal class SubTrackDialog(private val player: MPVView) {
 
         // Set up recycler view
         binding.list.adapter = CustomAdapter(this)
+
+        binding.removeBtn.setOnClickListener {
+            val id = if (secondary) selectedMpvId2 else selectedMpvId
+            removeListener?.invoke(id, secondary)
+        }
         refresh()
 
         Utils.handleInsetsAsPadding(binding.root)
@@ -47,6 +54,13 @@ internal class SubTrackDialog(private val player: MPVView) {
         tracks = player.tracks.getValue(TRACK_TYPE)
         selectedMpvId = player.sid
         selectedMpvId2 = player.secondarySid
+
+        val hasExternal = hasAnyExternalSubTracks()
+        binding.removeBtn.visibility = if (hasExternal) View.VISIBLE else View.GONE
+        if (hasExternal) {
+            val currentId = if (secondary) selectedMpvId2 else selectedMpvId
+            binding.removeBtn.isEnabled = currentId != -1 && isExternalSubTrackId(currentId)
+        }
 
         // this is what you get for not using a proper tab view...
         val darkenDrawable = ContextCompat.getDrawable(binding.root.context, R.drawable.alpha_darken)
@@ -124,5 +138,29 @@ internal class SubTrackDialog(private val player: MPVView) {
 
     companion object {
         const val TRACK_TYPE = "sub"
+    }
+
+    private fun hasAnyExternalSubTracks(): Boolean {
+        val count = MPVLib.getPropertyInt("track-list/count") ?: return false
+        for (i in 0 until count) {
+            val type = MPVLib.getPropertyString("track-list/$i/type") ?: continue
+            if (type != TRACK_TYPE) continue
+            if (MPVLib.getPropertyBoolean("track-list/$i/external") == true)
+                return true
+        }
+        return false
+    }
+
+    private fun isExternalSubTrackId(trackId: Int): Boolean {
+        if (trackId == -1) return false
+        val count = MPVLib.getPropertyInt("track-list/count") ?: return false
+        for (i in 0 until count) {
+            val type = MPVLib.getPropertyString("track-list/$i/type") ?: continue
+            if (type != TRACK_TYPE) continue
+            val id = MPVLib.getPropertyInt("track-list/$i/id") ?: continue
+            if (id != trackId) continue
+            return MPVLib.getPropertyBoolean("track-list/$i/external") == true
+        }
+        return false
     }
 }
