@@ -31,6 +31,19 @@
 
     </TableRow>
 
+    <ImageButton
+        android:id="@+id/removeBtn"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_alignTop="@id/buttonRow"
+        android:layout_alignBottom="@id/buttonRow"
+        android:layout_alignParentEnd="true"
+        android:layout_marginEnd="8dp"
+        android:background="?attr/selectableItemBackgroundBorderless"
+        android:contentDescription="@string/track_remove"
+        android:padding="12dp"
+        android:src="@drawable/ic_sub_remove_24dp" />
+
     <View
         android:id="@+id/divider"
         android:layout_width="match_parent"
