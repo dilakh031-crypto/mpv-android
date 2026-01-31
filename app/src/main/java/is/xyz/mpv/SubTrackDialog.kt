@@ -67,8 +67,10 @@ internal class SubTrackDialog(private val player: MPVView) {
         binding.primaryBtn.background = if (secondary) null else darkenDrawable
         binding.secondaryBtn.background = if (secondary) darkenDrawable else null
 
-        // show primary/secondary toggle if applicable
-        if (secondary || selectedMpvId2 != -1 || tracks.size > 2) {
+        // show primary/secondary toggle if applicable.
+        // Keep it visible whenever external subtitles exist so the remove button doesn't
+        // collapse (removeBtn is positioned relative to this row in the layout).
+        if (secondary || selectedMpvId2 != -1 || tracks.size > 2 || hasExternal) {
             binding.buttonRow.visibility = View.VISIBLE
             binding.divider.visibility = View.VISIBLE
         } else {
