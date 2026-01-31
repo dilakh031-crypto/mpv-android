@@ -680,6 +680,8 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
     private var btnSelected = -1
 
     private var mightWantToToggleControls = false
+    private var tapDownX = 0f
+    private var tapDownY = 0f
 
     /** true if we're actually outputting any audio (includes the mute state, but not pausing) */
     private var isPlayingAudio = false
@@ -847,6 +849,23 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
         if (ev.actionMasked == MotionEvent.ACTION_DOWN) {
             cancelPendingTapToggle()
             mightWantToToggleControls = true
+            tapDownX = ev.x
+            tapDownY = ev.y
+        }
+        // If the user is dragging (e.g., pulling the notification shade), don't treat it as a tap.
+        if (ev.actionMasked == MotionEvent.ACTION_MOVE && mightWantToToggleControls) {
+            val dx = ev.x - tapDownX
+            val dy = ev.y - tapDownY
+            val slop = ViewConfiguration.get(this).scaledTouchSlop
+            if (dx * dx + dy * dy > slop.toFloat() * slop.toFloat()) {
+                mightWantToToggleControls = false
+                cancelPendingTapToggle()
+            }
+        }
+        // Multi-touch should never toggle controls.
+        if (ev.actionMasked == MotionEvent.ACTION_POINTER_DOWN) {
+            mightWantToToggleControls = false
+            cancelPendingTapToggle()
         }
 
         if (super.dispatchTouchEvent(ev)) {
@@ -859,8 +878,14 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
         }
 
         if (ev.actionMasked == MotionEvent.ACTION_UP && mightWantToToggleControls) {
-            // Defer toggling so a second tap (double-tap play/pause) can cancel it.
-            scheduleSingleTapToggle()
+            // Only toggle if it was actually a tap (no meaningful movement).
+            val dx = ev.x - tapDownX
+            val dy = ev.y - tapDownY
+            val slop = ViewConfiguration.get(this).scaledTouchSlop
+            if (dx * dx + dy * dy <= slop.toFloat() * slop.toFloat()) {
+                // Defer toggling so a second tap (double-tap play/pause) can cancel it.
+                scheduleSingleTapToggle()
+            }
             mightWantToToggleControls = false
         }
         if (ev.actionMasked == MotionEvent.ACTION_CANCEL) {
@@ -1513,8 +1538,19 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
                 player.secondarySid = it.mpvId
             else
                 player.sid = it.mpvId
+            // Persist subtitle selection per-file (and also mpv watch-later state).
+            rememberCurrentSubtitleSelectionForCurrentFile()
             dialog.dismiss()
             trackSwitchNotification { TrackData(it.mpvId, SubTrackDialog.TRACK_TYPE) }
+        }
+
+        impl.removeListener = { trackId, secondary ->
+            removeSelectedExternalSubtitle(trackId, secondary)
+            // mpv updates track-list asynchronously; refresh after a short delay.
+            eventUiHandler.postDelayed({
+                try { player.loadTracks() } catch (_: Throwable) {}
+                impl.refresh()
+            }, 120L)
         }
 
         dialog = with (AlertDialog.Builder(this)) {
@@ -1524,6 +1560,45 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
             create()
         }
         dialog.show()
+    }
+
+    private fun forgetExternalSubtitleForCurrentFile(subPath: String) {
+        val mediaKey = currentMediaKeyForPrefs() ?: return
+        val list = loadExternalSubtitleList(mediaKey)
+        val newList = list.filterNot { it == subPath }
+        if (newList.size != list.size) {
+            saveExternalSubtitleList(mediaKey, newList)
+        }
+    }
+
+    private fun removeSelectedExternalSubtitle(trackId: Int, secondary: Boolean) {
+        if (trackId == -1) return
+
+        val otherSelectedId = if (secondary) player.sid else player.secondarySid
+        val otherUsesSameTrack = otherSelectedId == trackId
+
+        // Always disable the selected slot first.
+        if (secondary) player.secondarySid = -1 else player.sid = -1
+
+        val extFilename = getExternalSubtitleFilenameById(trackId)
+        if (extFilename == null) {
+            // Not an external subtitle track (or no longer present).
+            rememberCurrentSubtitleSelectionForCurrentFile()
+            return
+        }
+
+        // If the other slot is using the same track, we must not remove it globally.
+        if (!otherUsesSameTrack) {
+            try {
+                MPVLib.command(arrayOf("sub-remove", trackId.toString()))
+            } catch (_: Throwable) {
+            }
+            // Remove it from our per-file external subtitles list so it won't come back.
+            forgetExternalSubtitleForCurrentFile(extFilename)
+        }
+
+        // Persist selections (primary/secondary) and mpv watch-later state.
+        rememberCurrentSubtitleSelectionForCurrentFile()
     }
 
     private fun openPlaylistMenu(restore: StateRestoreCallback) {
