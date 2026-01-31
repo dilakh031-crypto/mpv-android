@@ -207,6 +207,7 @@
         <activity
             android:name=".FilePickerActivity"
             android:configChanges="orientation|screenSize"
+            android:screenOrientation="behind"
             android:theme="@style/FilePickerThemeSpecial"
             android:exported="false" />
 
