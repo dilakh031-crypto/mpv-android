@@ -3,7 +3,6 @@ package `is`.xyz.mpv
 import `is`.xyz.filepicker.AbstractFilePickerFragment
 import android.app.UiModeManager
 import android.content.Intent
-import android.content.pm.ActivityInfo
 import android.content.pm.PackageManager
 import android.content.res.Configuration
 import android.net.Uri
@@ -42,9 +41,6 @@ class FilePickerActivity : AppCompatActivity(), AbstractFilePickerFragment.OnFil
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
-        // Apply forced orientation *before* calling super to avoid an initial portrait frame.
-        if (intent.getBooleanExtra(EXTRA_FORCE_LANDSCAPE, false))
-            requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
         super.onCreate(null)
         Log.v(TAG, "FilePickerActivity: created")
 
@@ -90,10 +86,6 @@ class FilePickerActivity : AppCompatActivity(), AbstractFilePickerFragment.OnFil
             add(R.id.fragment_container_view, ChoiceFragment::class.java, args, null)
             commit()
         }
-    }
-
-    companion object {
-        const val EXTRA_FORCE_LANDSCAPE = "force_landscape"
     }
 
     private fun doUiTweaks() {
