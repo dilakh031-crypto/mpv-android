@@ -20,6 +20,7 @@ import android.content.res.Configuration
 import android.graphics.drawable.Icon
 import android.util.Log
 import android.media.AudioManager
+import android.media.MediaMetadataRetriever
 import android.net.Uri
 import android.os.*
 import android.preference.PreferenceManager.getDefaultSharedPreferences
@@ -279,20 +280,41 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
         Utils.copyAssets(this)
         BackgroundPlaybackService.createNotificationChannel(this)
 
+        // Parse the intent early so we can preselect orientation before the first frame is drawn.
+        // This avoids the visible "portrait -> rotate -> landscape" flash when opening a landscape video
+        // while the UI is currently in portrait.
+        val filepath = parsePathFromIntent(intent)
+        if (intent.action == Intent.ACTION_VIEW) {
+            parseIntentExtras(intent.extras)
+        }
+        if (filepath == null) {
+            Log.e(TAG, "No file given, exiting")
+            showToast(getString(R.string.error_no_file))
+            finishWithResult(RESULT_CANCELED)
+            return
+        }
+
         binding = PlayerBinding.inflate(layoutInflater)
-        setContentView(binding.root)
 
         // Init controls to be hidden and view fullscreen
         hideControls()
 
+        // Must exist before readSettings() (it calls gestures.syncSettings()).
         gestures = TouchGestures(this)
+        readSettings()
+
+        // If auto-rotation is enabled, try to guess the video's orientation up-front (local files)
+        // and lock it before setContentView() so the first visible frame is already correct.
+        preselectOrientationForFile(filepath)
+
+        setContentView(binding.root)
+
         zoomGestures = VideoZoomGestures(binding.player)
 
         // Initialize listeners for the player view
         initListeners()
 
         // set up initial UI state
-        readSettings()
         onConfigurationChanged(resources.configuration)
         run {
             // edge-to-edge & immersive mode
@@ -308,21 +330,6 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
 
         if (showMediaTitle)
             binding.controlsTitleGroup.visibility = View.VISIBLE
-
-        updateOrientation(true)
-
-        // Parse the intent
-        val filepath = parsePathFromIntent(intent)
-        if (intent.action == Intent.ACTION_VIEW) {
-            parseIntentExtras(intent.extras)
-        }
-
-        if (filepath == null) {
-            Log.e(TAG, "No file given, exiting")
-            showToast(getString(R.string.error_no_file))
-            finishWithResult(RESULT_CANCELED)
-            return
-        }
 
         player.addObserver(this)
         player.initialize(filesDir.path, cacheDir.path)
@@ -1834,12 +1841,12 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
         val hiddenButtons = mutableSetOf<Int>()
         val buttons: MutableList<MenuItem> = mutableListOf(
                 MenuItem(R.id.audioBtn) {
-                    openFilePickerFor(RCODE_EXTERNAL_AUDIO, R.string.open_external_audio) { result, data ->
+                    openFilePickerFor(RCODE_EXTERNAL_AUDIO, R.string.open_external_audio, isLandscapeVideo()) { result, data ->
                         addExternalThing("audio-add", result, data)
                     }; false
                 },
                 MenuItem(R.id.subBtn) {
-                    openFilePickerFor(RCODE_EXTERNAL_SUB, R.string.open_external_sub) { result, data ->
+                    openFilePickerFor(RCODE_EXTERNAL_SUB, R.string.open_external_sub, isLandscapeVideo()) { result, data ->
                         addExternalThing("sub-add", result, data)
                     }; false
                 },
@@ -2036,9 +2043,14 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
 
     private var activityResultCallbacks: MutableMap<Int, ActivityResultCallback> = mutableMapOf()
     private fun openFilePickerFor(requestCode: Int, title: String, skip: Int?, callback: ActivityResultCallback) {
+        openFilePickerFor(requestCode, title, skip, false, callback)
+    }
+
+    private fun openFilePickerFor(requestCode: Int, title: String, skip: Int?, forceLandscape: Boolean, callback: ActivityResultCallback) {
         val intent = Intent(this, FilePickerActivity::class.java)
         intent.putExtra("title", title)
         intent.putExtra("allow_document", true)
+        intent.putExtra("force_landscape", forceLandscape)
         skip?.let { intent.putExtra("skip", it) }
         // start file picker at directory of current file
         val path = MPVLib.getPropertyString("path") ?: ""
@@ -2050,6 +2062,19 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
     }
     private fun openFilePickerFor(requestCode: Int, @StringRes titleRes: Int, callback: ActivityResultCallback) {
         openFilePickerFor(requestCode, getString(titleRes), null, callback)
+    }
+
+    private fun openFilePickerFor(requestCode: Int, @StringRes titleRes: Int, forceLandscape: Boolean, callback: ActivityResultCallback) {
+        openFilePickerFor(requestCode, getString(titleRes), null, forceLandscape, callback)
+    }
+
+    private fun isLandscapeVideo(): Boolean {
+        val ratio = (MPVLib.getPropertyDouble("video-params/aspect") ?: player.getVideoAspect() ?: 0.0).toFloat()
+        if (ratio == 0f)
+            return resources.configuration.orientation == Configuration.ORIENTATION_LANDSCAPE
+        if (ratio in (1f / ASPECT_RATIO_MIN) .. ASPECT_RATIO_MIN)
+            return false
+        return ratio > 1f
     }
 
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
@@ -2226,6 +2251,62 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
             ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
         else
             ActivityInfo.SCREEN_ORIENTATION_SENSOR_PORTRAIT
+    }
+
+    /**
+     * Try to preselect orientation for local videos before the first visible frame.
+     *
+     * mpv can only determine aspect ratio after starting playback; if we wait for that,
+     * opening a landscape video from a portrait UI will briefly show a portrait frame
+     * and then rotate. We avoid that by guessing from metadata up-front for local files.
+     */
+    private fun preselectOrientationForFile(filepath: String) {
+        // screen orientation is fixed (Android TV)
+        if (!packageManager.hasSystemFeature(PackageManager.FEATURE_SCREEN_PORTRAIT))
+            return
+        if (autoRotationMode != "auto")
+            return
+
+        // Only attempt for local/known URIs; avoid blocking on network streams.
+        val isLocalPath = filepath.startsWith('/')
+        val isLocalUri = filepath.startsWith("file://") || filepath.startsWith("content://")
+        if (!isLocalPath && !isLocalUri)
+            return
+
+        val mmr = MediaMetadataRetriever()
+        try {
+            if (isLocalPath) {
+                mmr.setDataSource(filepath)
+            } else {
+                mmr.setDataSource(this, Uri.parse(filepath))
+            }
+
+            val w = mmr.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_WIDTH)?.toIntOrNull()
+            val h = mmr.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_HEIGHT)?.toIntOrNull()
+            if (w == null || h == null || w <= 0 || h <= 0)
+                return
+
+            val rot = mmr.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_ROTATION)?.toIntOrNull() ?: 0
+            val effectiveW = if (rot % 180 == 0) w else h
+            val effectiveH = if (rot % 180 == 0) h else w
+            if (effectiveW <= 0 || effectiveH <= 0)
+                return
+
+            val ratio = effectiveW.toFloat() / effectiveH.toFloat()
+            if (ratio == 0f || ratio in (1f / ASPECT_RATIO_MIN) .. ASPECT_RATIO_MIN) {
+                requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
+                return
+            }
+
+            requestedOrientation = if (ratio > 1f)
+                ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
+            else
+                ActivityInfo.SCREEN_ORIENTATION_SENSOR_PORTRAIT
+        } catch (_: Throwable) {
+            // ignore and fall back to normal orientation handling
+        } finally {
+            try { mmr.release() } catch (_: Throwable) {}
+        }
     }
 
     @RequiresApi(26)

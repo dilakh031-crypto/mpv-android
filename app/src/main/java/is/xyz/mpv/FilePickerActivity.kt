@@ -3,6 +3,7 @@ package `is`.xyz.mpv
 import `is`.xyz.filepicker.AbstractFilePickerFragment
 import android.app.UiModeManager
 import android.content.Intent
+import android.content.pm.ActivityInfo
 import android.content.pm.PackageManager
 import android.content.res.Configuration
 import android.net.Uri
@@ -41,6 +42,11 @@ class FilePickerActivity : AppCompatActivity(), AbstractFilePickerFragment.OnFil
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
+        // If requested by the caller (MPVActivity), keep this UI in landscape while picking
+        // external subs/audio for a landscape video.
+        if (intent.getBooleanExtra("force_landscape", false)) {
+            requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
+        }
         super.onCreate(null)
         Log.v(TAG, "FilePickerActivity: created")
 
