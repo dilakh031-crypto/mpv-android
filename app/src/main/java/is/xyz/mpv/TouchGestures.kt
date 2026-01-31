@@ -239,10 +239,7 @@ internal class TouchGestures(private val observer: TouchGesturesObserver) {
         when (e.actionMasked) {
             MotionEvent.ACTION_UP -> {
                 gestureHandled = processMovement(point) or processTap(point)
-                // Only finalize when a control gesture was active. If state is Up, we didn't
-                // start a gesture (this can happen after multi-touch cancel), and Finalize
-                // must NOT fire (it could incorrectly resume playback).
-                if (state != State.Down && state != State.Up)
+                if (state != State.Down)
                     sendPropertyChange(PropertyChange.Finalize, 0f)
                 state = State.Up
             }
