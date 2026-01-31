@@ -20,7 +20,6 @@ import android.content.res.Configuration
 import android.graphics.drawable.Icon
 import android.util.Log
 import android.media.AudioManager
-import android.media.MediaMetadataRetriever
 import android.net.Uri
 import android.os.*
 import android.preference.PreferenceManager.getDefaultSharedPreferences
@@ -53,6 +52,8 @@ import androidx.media.AudioFocusRequestCompat
 import androidx.media.AudioManagerCompat
 import java.io.File
 import java.lang.IllegalArgumentException
+import java.security.MessageDigest
+import org.json.JSONArray
 import kotlin.math.roundToInt
 
 typealias ActivityResultCallback = (Int, Intent?) -> Unit
@@ -68,10 +69,10 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
     // for deferring single-tap control toggling (so double-tap play/pause doesn't flash controls)
     private val tapToggleHandler = Handler(Looper.getMainLooper())
     private var pendingTapToggle: Runnable? = null
+    // External subtitles persistence (per file)
+    private var pendingSubtitleRestoreKey: String? = null
+    private var pendingSubtitleRestoreAttempts = 0
 
-    // Track tap slop so drags (e.g. pulling notification shade) don't toggle controls.
-    private var tapDownX = 0f
-    private var tapDownY = 0f
 
     /**
      * DO NOT USE THIS
@@ -277,41 +278,20 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
         Utils.copyAssets(this)
         BackgroundPlaybackService.createNotificationChannel(this)
 
-        // Parse the intent early so we can preselect orientation before the first frame is drawn.
-        // This avoids the visible "portrait UI -> rotate -> landscape UI" jank when opening a
-        // landscape video while holding the device in portrait.
-        val filepath = parsePathFromIntent(intent)
-        if (intent.action == Intent.ACTION_VIEW) {
-            parseIntentExtras(intent.extras)
-        }
-        if (filepath == null) {
-            Log.e(TAG, "No file given, exiting")
-            showToast(getString(R.string.error_no_file))
-            finishWithResult(RESULT_CANCELED)
-            return
-        }
-
-        // Must exist before readSettings() (it calls gestures.syncSettings()).
-        gestures = TouchGestures(this)
-        readSettings()
-
-        // If auto-rotation is enabled, try to guess the video's aspect ratio up-front (local files)
-        // and lock orientation before setContentView() to make the transition smooth.
-        preselectOrientationForFile(filepath)
-        updateOrientation(true)
-
         binding = PlayerBinding.inflate(layoutInflater)
         setContentView(binding.root)
 
         // Init controls to be hidden and view fullscreen
         hideControls()
 
+        gestures = TouchGestures(this)
         zoomGestures = VideoZoomGestures(binding.player)
 
         // Initialize listeners for the player view
         initListeners()
 
         // set up initial UI state
+        readSettings()
         onConfigurationChanged(resources.configuration)
         run {
             // edge-to-edge & immersive mode
@@ -327,6 +307,21 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
 
         if (showMediaTitle)
             binding.controlsTitleGroup.visibility = View.VISIBLE
+
+        updateOrientation(true)
+
+        // Parse the intent
+        val filepath = parsePathFromIntent(intent)
+        if (intent.action == Intent.ACTION_VIEW) {
+            parseIntentExtras(intent.extras)
+        }
+
+        if (filepath == null) {
+            Log.e(TAG, "No file given, exiting")
+            showToast(getString(R.string.error_no_file))
+            finishWithResult(RESULT_CANCELED)
+            return
+        }
 
         player.addObserver(this)
         player.initialize(filesDir.path, cacheDir.path)
@@ -344,62 +339,6 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
             Log.w(TAG, "AudioManager.generateAudioSessionId() returned error")
 
         volumeControlStream = STREAM_TYPE
-    }
-
-    /**
-     * Try to preselect the requested orientation for local videos before the UI is shown.
-     *
-     * This is purely a UX improvement: MPV's own aspect-based updateOrientation() will still
-     * run later (once tracks are ready) and correct any wrong guess.
-     */
-    private fun preselectOrientationForFile(filepath: String) {
-        // screen orientation is fixed (Android TV)
-        if (!packageManager.hasSystemFeature(PackageManager.FEATURE_SCREEN_PORTRAIT))
-            return
-        if (autoRotationMode != "auto")
-            return
-
-        // Only attempt for local/known URIs; avoid blocking on network streams.
-        val isLocalPath = filepath.startsWith('/')
-        val isLocalUri = filepath.startsWith("file://") || filepath.startsWith("content://")
-        if (!isLocalPath && !isLocalUri)
-            return
-
-        val mmr = MediaMetadataRetriever()
-        try {
-            if (isLocalPath) {
-                mmr.setDataSource(filepath)
-            } else {
-                mmr.setDataSource(this, Uri.parse(filepath))
-            }
-
-            val w = mmr.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_WIDTH)?.toIntOrNull()
-            val h = mmr.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_HEIGHT)?.toIntOrNull()
-            if (w == null || h == null || w <= 0 || h <= 0)
-                return
-
-            val rot = mmr.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_ROTATION)?.toIntOrNull() ?: 0
-            val effectiveW = if (rot % 180 == 0) w else h
-            val effectiveH = if (rot % 180 == 0) h else w
-            if (effectiveW <= 0 || effectiveH <= 0)
-                return
-
-            val ratio = effectiveW.toFloat() / effectiveH.toFloat()
-            if (ratio == 0f || ratio in (1f / ASPECT_RATIO_MIN) .. ASPECT_RATIO_MIN) {
-                // Square-ish, let Android decide
-                requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
-                return
-            }
-
-            requestedOrientation = if (ratio > 1f)
-                ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
-            else
-                ActivityInfo.SCREEN_ORIENTATION_SENSOR_PORTRAIT
-        } catch (_: Throwable) {
-            // ignore: fall back to normal orientation handling
-        } finally {
-            try { mmr.release() } catch (_: Throwable) {}
-        }
     }
 
     private fun finishWithResult(code: Int, includeTimePos: Boolean = false) {
@@ -904,29 +843,10 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
             return super.dispatchTouchEvent(ev)
         }
 
-        val slop = ViewConfiguration.get(this).scaledTouchSlop.toFloat()
-        val slop2 = slop * slop
-
         // Any new touch down cancels a pending single-tap toggle (so double-tap won't flash controls).
         if (ev.actionMasked == MotionEvent.ACTION_DOWN) {
             cancelPendingTapToggle()
-            tapDownX = ev.x
-            tapDownY = ev.y
             mightWantToToggleControls = true
-        }
-
-        // Multi-touch should never toggle controls, and a drag shouldn't either.
-        if (ev.actionMasked == MotionEvent.ACTION_POINTER_DOWN) {
-            cancelPendingTapToggle()
-            mightWantToToggleControls = false
-        }
-        if (ev.actionMasked == MotionEvent.ACTION_MOVE && mightWantToToggleControls) {
-            val dx = ev.x - tapDownX
-            val dy = ev.y - tapDownY
-            if ((dx * dx + dy * dy) > slop2) {
-                cancelPendingTapToggle()
-                mightWantToToggleControls = false
-            }
         }
 
         if (super.dispatchTouchEvent(ev)) {
@@ -1296,11 +1216,250 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
         // TODO: `headers` would be good, maybe `tls_verify`
     }
 
-    // UI (Part 2)
+    
+    // Per-file external subtitles persistence
+
+    private data class DesiredSubSelection(
+        val mode: Mode,
+        val id: Int? = null,
+        val externalFilename: String? = null
+    ) {
+        enum class Mode { OFF, ID, EXT }
+    }
+
+    private fun currentMediaKeyForPrefs(): String? {
+        val path = MPVLib.getPropertyString("path") ?: return null
+        if (path.isBlank()) return null
+        if (path.startsWith("/") || path.contains("://")) return path
+        val wd = MPVLib.getPropertyString("working-directory") ?: return path
+        return if (wd.endsWith("/")) wd + path else "$wd/$path"
+    }
+
+    private fun sha1Hex(s: String): String {
+        val bytes = MessageDigest.getInstance("SHA-1").digest(s.toByteArray(Charsets.UTF_8))
+        val sb = StringBuilder(bytes.size * 2)
+        for (b in bytes) sb.append(String.format("%02x", b))
+        return sb.toString()
+    }
+
+    private fun perFilePrefKey(prefix: String, mediaKey: String): String = prefix + sha1Hex(mediaKey)
+
+    private fun loadExternalSubtitleList(mediaKey: String): MutableList<String> {
+        val prefs = getDefaultSharedPreferences(applicationContext)
+        val raw = prefs.getString(perFilePrefKey(PREF_EXTSUBS_PREFIX, mediaKey), null) ?: return mutableListOf()
+        return try {
+            val arr = JSONArray(raw)
+            val out = mutableListOf<String>()
+            for (i in 0 until arr.length()) {
+                val v = arr.optString(i, "")
+                if (v.isNotBlank()) out.add(v)
+            }
+            out
+        } catch (_: Throwable) {
+            mutableListOf()
+        }
+    }
+
+    private fun saveExternalSubtitleList(mediaKey: String, list: List<String>) {
+        val prefs = getDefaultSharedPreferences(applicationContext)
+        val arr = JSONArray()
+        for (v in list) arr.put(v)
+        prefs.edit().putString(perFilePrefKey(PREF_EXTSUBS_PREFIX, mediaKey), arr.toString()).commit()
+    }
+
+    private fun rememberExternalSubtitleForCurrentFile(subPath: String) {
+        val mediaKey = currentMediaKeyForPrefs() ?: return
+        val list = loadExternalSubtitleList(mediaKey)
+        if (!list.contains(subPath)) {
+            list.add(subPath)
+            while (list.size > PREF_EXTSUBS_MAX) list.removeAt(0)
+            saveExternalSubtitleList(mediaKey, list)
+        }
+    }
+
+    private fun parseDesiredSubSelection(raw: String?): DesiredSubSelection? {
+        if (raw.isNullOrBlank()) return null
+        return when {
+            raw == "off" -> DesiredSubSelection(DesiredSubSelection.Mode.OFF)
+            raw.startsWith("id:") -> raw.substringAfter("id:").toIntOrNull()
+                ?.let { DesiredSubSelection(DesiredSubSelection.Mode.ID, id = it) }
+            raw.startsWith("ext:") -> raw.substringAfter("ext:").takeIf { it.isNotBlank() }
+                ?.let { DesiredSubSelection(DesiredSubSelection.Mode.EXT, externalFilename = it) }
+            else -> null
+        }
+    }
+
+    private fun getExternalSubtitleFilenameById(trackId: Int): String? {
+        if (trackId == -1) return null
+        val count = MPVLib.getPropertyInt("track-list/count") ?: return null
+        for (i in 0 until count) {
+            val type = MPVLib.getPropertyString("track-list/$i/type") ?: continue
+            if (type != "sub") continue
+            val id = MPVLib.getPropertyInt("track-list/$i/id") ?: continue
+            if (id != trackId) continue
+            val extFlag = MPVLib.getPropertyString("track-list/$i/external")
+            val isExternal = extFlag == "yes" || extFlag == "true" || extFlag == "1"
+            if (!isExternal) return null
+            return MPVLib.getPropertyString("track-list/$i/external-filename")
+        }
+        return null
+    }
+
+    private fun encodeDesiredSubSelectionFromTrackId(trackId: Int): String {
+        if (trackId == -1) return "off"
+        val ext = getExternalSubtitleFilenameById(trackId)
+        return if (ext != null) "ext:$ext" else "id:$trackId"
+    }
+
+    private fun buildExternalSubtitleFilenameToIdMap(): Map<String, Int> {
+        val out = mutableMapOf<String, Int>()
+        val count = MPVLib.getPropertyInt("track-list/count") ?: return out
+        for (i in 0 until count) {
+            val type = MPVLib.getPropertyString("track-list/$i/type") ?: continue
+            if (type != "sub") continue
+            val extFlag = MPVLib.getPropertyString("track-list/$i/external")
+            val isExternal = extFlag == "yes" || extFlag == "true" || extFlag == "1"
+            if (!isExternal) continue
+            val fn = MPVLib.getPropertyString("track-list/$i/external-filename") ?: continue
+            val id = MPVLib.getPropertyInt("track-list/$i/id") ?: continue
+            out[fn] = id
+        }
+        return out
+    }
+
+    private fun rememberCurrentSubtitleSelectionForCurrentFile() {
+        val mediaKey = currentMediaKeyForPrefs() ?: return
+        val prefs = getDefaultSharedPreferences(applicationContext)
+
+        val primaryEncoded = encodeDesiredSubSelectionFromTrackId(player.sid)
+        val secondaryEncoded = encodeDesiredSubSelectionFromTrackId(player.secondarySid)
+
+        getExternalSubtitleFilenameById(player.sid)?.let { rememberExternalSubtitleForCurrentFile(it) }
+        getExternalSubtitleFilenameById(player.secondarySid)?.let { rememberExternalSubtitleForCurrentFile(it) }
+
+        prefs.edit()
+            .putString(perFilePrefKey(PREF_SUBSEL_PRIMARY_PREFIX, mediaKey), primaryEncoded)
+            .putString(perFilePrefKey(PREF_SUBSEL_SECONDARY_PREFIX, mediaKey), secondaryEncoded)
+            .commit()
+
+        // Also persist mpv's own watch-later state (sub delay, etc).
+        try {
+            MPVLib.command(arrayOf("write-watch-later-config"))
+        } catch (_: Throwable) {
+        }
+    }
+
+    private fun restoreExternalSubtitlesAndScheduleSelection() {
+        val mediaKey = currentMediaKeyForPrefs() ?: return
+        val prefs = getDefaultSharedPreferences(applicationContext)
+
+        val desiredPrimary = parseDesiredSubSelection(
+            prefs.getString(perFilePrefKey(PREF_SUBSEL_PRIMARY_PREFIX, mediaKey), null)
+        )
+        val desiredSecondary = parseDesiredSubSelection(
+            prefs.getString(perFilePrefKey(PREF_SUBSEL_SECONDARY_PREFIX, mediaKey), null)
+        )
+
+        val list = loadExternalSubtitleList(mediaKey)
+        var listModified = false
+
+        desiredPrimary?.externalFilename?.let {
+            if (!list.contains(it)) {
+                list.add(it)
+                listModified = true
+            }
+        }
+        desiredSecondary?.externalFilename?.let {
+            if (!list.contains(it)) {
+                list.add(it)
+                listModified = true
+            }
+        }
+
+        if (list.isNotEmpty()) {
+            val already = buildExternalSubtitleFilenameToIdMap().keys
+            for (sub in list) {
+                if (already.contains(sub)) continue
+                try {
+                    MPVLib.command(arrayOf("sub-add", sub, "auto"))
+                } catch (_: Throwable) {
+                }
+            }
+        }
+
+        if (listModified) {
+            while (list.size > PREF_EXTSUBS_MAX) list.removeAt(0)
+            saveExternalSubtitleList(mediaKey, list)
+        }
+
+        pendingSubtitleRestoreKey = mediaKey
+        pendingSubtitleRestoreAttempts = 0
+        eventUiHandler.post { maybeApplySavedSubtitleSelection() }
+    }
+
+    private fun maybeApplySavedSubtitleSelection() {
+        val mediaKey = pendingSubtitleRestoreKey ?: return
+        val currentKey = currentMediaKeyForPrefs() ?: return
+        if (currentKey != mediaKey) {
+            pendingSubtitleRestoreKey = null
+            return
+        }
+
+        val prefs = getDefaultSharedPreferences(applicationContext)
+        val desiredPrimary = parseDesiredSubSelection(
+            prefs.getString(perFilePrefKey(PREF_SUBSEL_PRIMARY_PREFIX, mediaKey), null)
+        )
+        val desiredSecondary = parseDesiredSubSelection(
+            prefs.getString(perFilePrefKey(PREF_SUBSEL_SECONDARY_PREFIX, mediaKey), null)
+        )
+        if (desiredPrimary == null && desiredSecondary == null) {
+            pendingSubtitleRestoreKey = null
+            return
+        }
+
+        val extMap = buildExternalSubtitleFilenameToIdMap()
+        var waitingForTracks = false
+
+        fun resolve(sel: DesiredSubSelection?): Int? {
+            if (sel == null) return null
+            return when (sel.mode) {
+                DesiredSubSelection.Mode.OFF -> -1
+                DesiredSubSelection.Mode.ID -> sel.id
+                DesiredSubSelection.Mode.EXT -> {
+                    val fn = sel.externalFilename
+                    if (fn == null) null
+                    else extMap[fn].also { if (it == null) waitingForTracks = true }
+                }
+            }
+        }
+
+        val desiredPrimaryId = resolve(desiredPrimary)
+        val desiredSecondaryId = resolve(desiredSecondary)
+
+        if (waitingForTracks) {
+            pendingSubtitleRestoreAttempts++
+            if (pendingSubtitleRestoreAttempts <= SUB_RESTORE_MAX_ATTEMPTS) {
+                eventUiHandler.postDelayed({ maybeApplySavedSubtitleSelection() }, 150L)
+            } else {
+                pendingSubtitleRestoreKey = null
+            }
+            return
+        }
+
+        desiredPrimaryId?.let { if (player.sid != it) player.sid = it }
+        desiredSecondaryId?.let { if (player.secondarySid != it) player.secondarySid = it }
+
+        pendingSubtitleRestoreKey = null
+    }
+
+// UI (Part 2)
 
     data class TrackData(val trackId: Int, val trackType: String)
     private fun trackSwitchNotification(f: () -> TrackData) {
         val (track_id, track_type) = f()
+        if (track_type == "sub") {
+            rememberCurrentSubtitleSelectionForCurrentFile()
+        }
         val trackPrefix = when (track_type) {
             "audio" -> getString(R.string.track_audio)
             "sub"   -> getString(R.string.track_subs)
@@ -1513,6 +1672,11 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
             else
                 path
             MPVLib.command(arrayOf(cmd, path2, "cached"))
+                if (cmd == "sub-add") {
+                    rememberExternalSubtitleForCurrentFile(path2)
+                    // Give mpv a moment to update track-list/sid, then persist the selection.
+                    eventUiHandler.postDelayed({ rememberCurrentSubtitleSelectionForCurrentFile() }, 200L)
+                }
         }
 
         /******/
@@ -1995,7 +2159,7 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
     private fun eventPropertyUi(property: String, dummy: Any?, metaUpdated: Boolean) {
         if (!activityIsForeground) return
         when (property) {
-            "track-list" -> player.loadTracks()
+            "track-list" -> { player.loadTracks(); maybeApplySavedSubtitleSelection() }
             "current-tracks/audio/selected", "current-tracks/video/image" -> updateAudioUI()
             "hwdec-current" -> updateDecoderButton()
         }
@@ -2138,6 +2302,11 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
             playbackHasStarted = true
         }
 
+        if (eventId == MpvEvent.MPV_EVENT_FILE_LOADED) {
+            // Restore previously added external subtitles (and their selection) for this file.
+            restoreExternalSubtitlesAndScheduleSelection()
+        }
+
         if (!activityIsForeground) return
         eventUiHandler.post { eventUi(eventId) }
     }
@@ -2236,7 +2405,6 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
             PropertyChange.Finalize -> {
                 if (pausedForSeek == 1)
                     player.paused = false
-                pausedForSeek = 0
                 gestureTextView.visibility = View.GONE
             }
 
@@ -2287,5 +2455,12 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
         private const val STREAM_TYPE = AudioManager.STREAM_MUSIC
         // precision used by seekbar (1/s)
         private const val SEEK_BAR_PRECISION = 2
+        // Per-file external subtitles persistence (JSON array of external subtitle files)
+        private const val PREF_EXTSUBS_PREFIX = "perfile_external_subs_v1_"
+        private const val PREF_SUBSEL_PRIMARY_PREFIX = "perfile_subsel_primary_v1_"
+        private const val PREF_SUBSEL_SECONDARY_PREFIX = "perfile_subsel_secondary_v1_"
+        // Safety cap (oldest entries are dropped) to avoid unbounded preference growth.
+        private const val PREF_EXTSUBS_MAX = 80
+        private const val SUB_RESTORE_MAX_ATTEMPTS = 20
     }
 }
