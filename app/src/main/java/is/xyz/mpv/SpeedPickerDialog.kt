@@ -57,6 +57,9 @@ internal class SpeedPickerDialog : PickerDialog {
     override fun isInteger(): Boolean = false
 
     override var number: Double?
-        set(v) { binding.seekBar.progress = fromSpeed(v!!) }
-        get() = toSpeed(binding.seekBar.progress)
+    set(v) {
+        val progress = fromSpeed(v ?: 1.0).coerceIn(0, binding.seekBar.max)
+        binding.seekBar.progress = progress
+    }
+    get() = toSpeed(binding.seekBar.progress)
 }
