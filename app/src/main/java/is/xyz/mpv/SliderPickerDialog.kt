@@ -40,10 +40,6 @@ internal class SliderPickerDialog(
     override fun isInteger(): Boolean = intScale == 1
 
     override var number: Double?
-    set(v) {
-        val value = (v ?: (rangeMin + (rangeMax - rangeMin) / 2)).coerceIn(rangeMin, rangeMax)
-        val progress = scale(value).coerceIn(0, binding.seekBar.max)
-        binding.seekBar.progress = progress
-    }
-    get() = unscale(binding.seekBar.progress)
+        set(v) { binding.seekBar.progress = scale(v!!) }
+        get() = unscale(binding.seekBar.progress)
 }
