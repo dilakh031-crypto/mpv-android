@@ -20,6 +20,8 @@ import android.content.res.Configuration
 import android.graphics.drawable.Icon
 import android.util.Log
 import android.media.AudioManager
+import android.media.MediaExtractor
+import android.media.MediaFormat
 import android.media.MediaMetadataRetriever
 import android.net.Uri
 import android.os.*
@@ -54,7 +56,6 @@ import androidx.media.AudioManagerCompat
 import java.io.File
 import java.lang.IllegalArgumentException
 import java.security.MessageDigest
-import java.util.ArrayDeque
 import org.json.JSONArray
 import kotlin.math.roundToInt
 
@@ -219,8 +220,8 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
             cycleAudioBtn.setOnLongClickListener { pickAudio(); true }
             cycleSpeedBtn.setOnLongClickListener { pickSpeed(); true }
             cycleSubsBtn.setOnLongClickListener { pickSub(); true }
-            prevBtn.setOnLongClickListener { openPlaylistMenu(); true }
-            nextBtn.setOnLongClickListener { openPlaylistMenu(); true }
+            prevBtn.setOnLongClickListener { openPlaylistMenu(pauseForDialog()); true }
+            nextBtn.setOnLongClickListener { openPlaylistMenu(pauseForDialog()); true }
             cycleDecoderBtn.setOnLongClickListener { pickDecoder(); true }
 
             playbackSeekbar.setOnSeekBarChangeListener(seekBarChangeListener)
@@ -280,13 +281,11 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
         Utils.copyAssets(this)
         BackgroundPlaybackService.createNotificationChannel(this)
 
-        // Parse the intent early so we can preselect orientation before the first frame is drawn.
-        // This avoids the visible "portrait -> rotate -> landscape" flash when opening a landscape video
-        // while the UI is currently in portrait.
+        // Parse the intent early so we can preselect orientation before rendering the first frame.
         val filepath = parsePathFromIntent(intent)
-        if (intent.action == Intent.ACTION_VIEW) {
+        if (intent.action == Intent.ACTION_VIEW)
             parseIntentExtras(intent.extras)
-        }
+
         if (filepath == null) {
             Log.e(TAG, "No file given, exiting")
             showToast(getString(R.string.error_no_file))
@@ -294,20 +293,19 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
             return
         }
 
-        binding = PlayerBinding.inflate(layoutInflater)
-
-        // Init controls to be hidden and view fullscreen
-        hideControls()
-
-        // Must exist before readSettings() (it calls gestures.syncSettings()).
+        // Read settings early (needed for rotation mode decisions).
         gestures = TouchGestures(this)
         readSettings()
 
-        // If auto-rotation is enabled, try to guess the video's orientation up-front (local files)
-        // and lock it before setContentView() so the first visible frame is already correct.
+        // Apply rotation preference (manual/forced portrait/landscape) and preselect video orientation for auto mode.
+        updateOrientation(true)
         preselectOrientationForFile(filepath)
 
+        binding = PlayerBinding.inflate(layoutInflater)
         setContentView(binding.root)
+
+        // Init controls to be hidden and view fullscreen
+        hideControls()
 
         zoomGestures = VideoZoomGestures(binding.player)
 
@@ -720,100 +718,6 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
             if (!wasPlayerPaused)
                 player.paused = false
         }
-    }
-
-    // --------------------
-    // Settings dialog navigation
-    // --------------------
-
-    private val settingsDialogStack: ArrayDeque<AlertDialog> = ArrayDeque()
-    private var settingsRestoreCallback: StateRestoreCallback? = null
-    private var suppressSettingsDismissCallback = false
-
-    private fun ensureSettingsSession() {
-        if (settingsRestoreCallback == null) {
-            settingsRestoreCallback = pauseForDialog()
-        }
-    }
-
-    private fun finishSettingsSessionIfNeeded() {
-        if (settingsDialogStack.isEmpty()) {
-            settingsRestoreCallback?.invoke()
-            settingsRestoreCallback = null
-        }
-    }
-
-    private fun pushSettingsDialog(dialog: AlertDialog) {
-        ensureSettingsSession()
-
-        settingsDialogStack.lastOrNull()?.hide()
-        settingsDialogStack.addLast(dialog)
-
-        dialog.setCanceledOnTouchOutside(true)
-        // Outside tap should exit to video immediately from anywhere in the stack.
-        dialog.setOnCancelListener {
-            clearSettingsDialogs()
-        }
-        // Back should go one level back (until the last, then return to video).
-        dialog.setOnKeyListener { _, keyCode, event ->
-            if (keyCode == KeyEvent.KEYCODE_BACK && event.action == KeyEvent.ACTION_UP) {
-                popSettingsDialog()
-                true
-            } else {
-                false
-            }
-        }
-        dialog.setOnDismissListener {
-            if (suppressSettingsDismissCallback) return@setOnDismissListener
-
-            // If this dialog was dismissed by Android (e.g. list item auto-dismiss),
-            // treat it like a single-level back.
-            val wasTop = (settingsDialogStack.lastOrNull() === dialog)
-            settingsDialogStack.remove(dialog)
-            if (wasTop) {
-                settingsDialogStack.lastOrNull()?.show()
-                finishSettingsSessionIfNeeded()
-            }
-        }
-
-        dialog.show()
-    }
-
-    private fun popSettingsDialog() {
-        if (settingsDialogStack.isEmpty()) return
-        val top = settingsDialogStack.removeLast()
-        suppressSettingsDismissCallback = true
-        try {
-            top.setOnCancelListener(null)
-            top.setOnDismissListener(null)
-            top.setOnKeyListener(null)
-            top.dismiss()
-        } finally {
-            suppressSettingsDismissCallback = false
-        }
-
-        settingsDialogStack.lastOrNull()?.show()
-        finishSettingsSessionIfNeeded()
-    }
-
-    private fun clearSettingsDialogs() {
-        if (settingsDialogStack.isEmpty()) {
-            finishSettingsSessionIfNeeded()
-            return
-        }
-        suppressSettingsDismissCallback = true
-        try {
-            while (settingsDialogStack.isNotEmpty()) {
-                val d = settingsDialogStack.removeLast()
-                d.setOnCancelListener(null)
-                d.setOnDismissListener(null)
-                d.setOnKeyListener(null)
-                d.dismiss()
-            }
-        } finally {
-            suppressSettingsDismissCallback = false
-        }
-        finishSettingsSessionIfNeeded()
     }
 
     private fun updateStats() {
@@ -1614,21 +1518,27 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
         val tracks = player.tracks.getValue(type)
         val selectedMpvId = get()
         val selectedIndex = tracks.indexOfFirst { it.mpvId == selectedMpvId }
-        val dialog = with (AlertDialog.Builder(this)) {
-            setSingleChoiceItems(tracks.map { it.name }.toTypedArray(), selectedIndex) { _, item ->
+        val restore = pauseForDialog()
+
+        with (AlertDialog.Builder(this)) {
+            setSingleChoiceItems(tracks.map { it.name }.toTypedArray(), selectedIndex) { dialog, item ->
                 val trackId = tracks[item].mpvId
+
                 set(trackId)
+                dialog.dismiss()
                 trackSwitchNotification { TrackData(trackId, type) }
             }
-            create()
+            setOnDismissListener { restore() }
+            create().show()
         }
-        pushSettingsDialog(dialog)
     }
 
     private fun pickAudio() = selectTrack("audio", { player.aid }, { player.aid = it })
 
     private fun pickSub() {
+        val restore = pauseForDialog()
         val impl = SubTrackDialog(player)
+        lateinit var dialog: AlertDialog
         impl.listener = { it, secondary ->
             if (secondary)
                 player.secondarySid = it.mpvId
@@ -1636,9 +1546,8 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
                 player.sid = it.mpvId
             // Persist subtitle selection per-file (and also mpv watch-later state).
             rememberCurrentSubtitleSelectionForCurrentFile()
+            dialog.dismiss()
             trackSwitchNotification { TrackData(it.mpvId, SubTrackDialog.TRACK_TYPE) }
-            // Keep the dialog open (don't kick the user back to video).
-            impl.refresh()
         }
 
         impl.removeListener = { trackId, secondary ->
@@ -1650,12 +1559,13 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
             }, 120L)
         }
 
-        val dialog = with (AlertDialog.Builder(this)) {
+        dialog = with (AlertDialog.Builder(this)) {
             val inflater = LayoutInflater.from(context)
             setView(impl.buildView(inflater))
+            setOnDismissListener { restore() }
             create()
         }
-        pushSettingsDialog(dialog)
+        dialog.show()
     }
 
     private fun forgetExternalSubtitleForCurrentFile(subPath: String) {
@@ -1697,9 +1607,9 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
         rememberCurrentSubtitleSelectionForCurrentFile()
     }
 
-    private fun openPlaylistMenu() {
+    private fun openPlaylistMenu(restore: StateRestoreCallback) {
         val impl = PlaylistDialog(player)
-        lateinit var playlistDialog: AlertDialog
+        lateinit var dialog: AlertDialog
 
         impl.listeners = object : PlaylistDialog.Listeners {
             private fun openFilePicker(skip: Int) {
@@ -1716,36 +1626,33 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
             override fun openUrl() {
                 val helper = Utils.OpenUrlDialog(this@MPVActivity)
                 with (helper) {
-                    builder.setPositiveButton(R.string.dialog_ok, null)
-                    builder.setNegativeButton(R.string.dialog_cancel) { dialog, _ -> dialog.dismiss() }
-                    val d = create()
-                    d.setOnShowListener {
-                        // Apply without closing; exit via Back or outside-tap.
-                        d.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener {
-                            MPVLib.command(arrayOf("loadfile", helper.text, "append"))
-                            impl.refresh()
-                        }
+                    builder.setPositiveButton(R.string.dialog_ok) { _, _ ->
+                        MPVLib.command(arrayOf("loadfile", helper.text, "append"))
+                        impl.refresh()
                     }
-                    pushSettingsDialog(d)
+                    builder.setNegativeButton(R.string.dialog_cancel) { dialog, _ -> dialog.cancel() }
+                    create().show()
                 }
             }
 
             override fun onItemPicked(item: MPVView.PlaylistItem) {
                 MPVLib.setPropertyInt("playlist-pos", item.index)
-                impl.refresh()
+                dialog.dismiss()
             }
         }
 
-        playlistDialog = with (AlertDialog.Builder(this)) {
+        dialog = with (AlertDialog.Builder(this)) {
             val inflater = LayoutInflater.from(context)
             setView(impl.buildView(inflater))
+            setOnDismissListener { restore() }
             create()
         }
-
-        pushSettingsDialog(playlistDialog)
+        dialog.show()
     }
 
     private fun pickDecoder() {
+        val restore = pauseForDialog()
+
         val items = mutableListOf(
             Pair("HW (mediacodec-copy)", "mediacodec-copy"),
             Pair("SW", "no")
@@ -1754,13 +1661,14 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
             items.add(0, Pair("HW+ (mediacodec)", "mediacodec"))
         val hwdecActive = player.hwdecActive
         val selectedIndex = items.indexOfFirst { it.second == hwdecActive }
-        val dialog = with (AlertDialog.Builder(this)) {
-            setSingleChoiceItems(items.map { it.first }.toTypedArray(), selectedIndex ) { _, idx ->
+        with (AlertDialog.Builder(this)) {
+            setSingleChoiceItems(items.map { it.first }.toTypedArray(), selectedIndex ) { dialog, idx ->
                 MPVLib.setPropertyString("hwdec", items[idx].second)
+                dialog.dismiss()
             }
-            create()
+            setOnDismissListener { restore() }
+            create().show()
         }
-        pushSettingsDialog(dialog)
     }
 
     private fun cycleSpeed() {
@@ -1770,7 +1678,11 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
     private fun pickSpeed() {
         // TODO: replace this with SliderPickerDialog
         val picker = SpeedPickerDialog()
-        genericPickerDialog(picker, R.string.title_speed_dialog, "speed")
+
+        val restore = pauseForDialog()
+        genericPickerDialog(picker, R.string.title_speed_dialog, "speed") {
+            restore()
+        }
     }
 
     private fun goIntoPiP() {
@@ -1793,17 +1705,20 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
 
     data class MenuItem(@IdRes val idRes: Int, val handler: () -> Boolean)
     private fun genericMenu(
-            @LayoutRes layoutRes: Int, buttons: List<MenuItem>, hiddenButtons: Set<Int>
-    ): AlertDialog? {
+            @LayoutRes layoutRes: Int, buttons: List<MenuItem>, hiddenButtons: Set<Int>,
+            restoreState: StateRestoreCallback) {
+        lateinit var dialog: AlertDialog
+
         val builder = AlertDialog.Builder(this)
         val dialogView = LayoutInflater.from(builder.context).inflate(layoutRes, null)
 
         for (button in buttons) {
             val buttonView = dialogView.findViewById<Button>(button.idRes)
             buttonView.setOnClickListener {
-                // Keep the menu open. If a sub-dialog is opened, it will be pushed onto
-                // the settings stack and this one will be hidden automatically.
-                button.handler()
+                val ret = button.handler()
+                if (ret) // restore state immediately
+                    restoreState()
+                dialog.dismiss()
             }
         }
 
@@ -1811,15 +1726,23 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
 
         if (Utils.visibleChildren(dialogView) == 0) {
             Log.w(TAG, "Not showing menu because it would be empty")
-            return null
+            restoreState()
+            return
         }
 
         Utils.handleInsetsAsPadding(dialogView)
-        builder.setView(dialogView)
-        return builder.create()
+
+        with (builder) {
+            setView(dialogView)
+            setOnCancelListener { restoreState() }
+            dialog = create()
+        }
+        dialog.show()
     }
 
     private fun openTopMenu() {
+        val restoreState = pauseForDialog()
+
         fun addExternalThing(cmd: String, result: Int, data: Intent?) {
             if (result != RESULT_OK)
                 return
@@ -1841,21 +1764,23 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
         val hiddenButtons = mutableSetOf<Int>()
         val buttons: MutableList<MenuItem> = mutableListOf(
                 MenuItem(R.id.audioBtn) {
-                    openFilePickerFor(RCODE_EXTERNAL_AUDIO, R.string.open_external_audio, isLandscapeVideo()) { result, data ->
+                    openFilePickerFor(RCODE_EXTERNAL_AUDIO, getString(R.string.open_external_audio), null, true) { result, data ->
                         addExternalThing("audio-add", result, data)
+                        restoreState()
                     }; false
                 },
                 MenuItem(R.id.subBtn) {
-                    openFilePickerFor(RCODE_EXTERNAL_SUB, R.string.open_external_sub, isLandscapeVideo()) { result, data ->
+                    openFilePickerFor(RCODE_EXTERNAL_SUB, getString(R.string.open_external_sub), null, true) { result, data ->
                         addExternalThing("sub-add", result, data)
+                        restoreState()
                     }; false
                 },
                 MenuItem(R.id.playlistBtn) {
-                    openPlaylistMenu(); false
+                    openPlaylistMenu(restoreState); false
                 },
                 MenuItem(R.id.backgroundBtn) {
-                    // Exit the dialog stack before moving to background.
-                    clearSettingsDialogs()
+                    // restoring state may (un)pause so do that first
+                    restoreState()
                     backgroundPlayMode = "always"
                     player.paused = false
                     moveTaskToBack(true)
@@ -1873,14 +1798,14 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
                             getString(R.string.ui_chapter_fallback, it.index+1, timecode)
                     }.toTypedArray()
                     val selectedIndex = MPVLib.getPropertyInt("chapter") ?: 0
-                    val dialog = with (AlertDialog.Builder(this)) {
-                        setSingleChoiceItems(chapterArray, selectedIndex) { _, item ->
+                    with (AlertDialog.Builder(this)) {
+                        setSingleChoiceItems(chapterArray, selectedIndex) { dialog, item ->
                             MPVLib.setPropertyInt("chapter", chapters[item].index)
+                            dialog.dismiss()
                         }
-                        create()
-                    }
-                    pushSettingsDialog(dialog)
-                    false
+                        setOnDismissListener { restoreState() }
+                        create().show()
+                    }; false
                 },
                 MenuItem(R.id.chapterPrev) {
                     MPVLib.command(arrayOf("add", "chapter", "-1")); true
@@ -1888,7 +1813,7 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
                 MenuItem(R.id.chapterNext) {
                     MPVLib.command(arrayOf("add", "chapter", "1")); true
                 },
-                MenuItem(R.id.advancedBtn) { openAdvancedMenu(); false },
+                MenuItem(R.id.advancedBtn) { openAdvancedMenu(restoreState); false },
                 MenuItem(R.id.orientationBtn) {
                     autoRotationMode = "manual"
                     cycleOrientation()
@@ -1902,25 +1827,18 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
             hiddenButtons.add(R.id.rowChapter)
         /******/
 
-        val dialog = genericMenu(R.layout.dialog_top_menu, buttons, hiddenButtons) ?: return
-        pushSettingsDialog(dialog)
+        genericMenu(R.layout.dialog_top_menu, buttons, hiddenButtons, restoreState)
     }
 
     private fun genericPickerDialog(
-        picker: PickerDialog, @StringRes titleRes: Int, property: String
+        picker: PickerDialog, @StringRes titleRes: Int, property: String,
+        restoreState: StateRestoreCallback
     ) {
-        // Keep the settings UI open: apply on OK but don't close (exit via Back or outside-tap).
-        picker.number = MPVLib.getPropertyDouble(property)
-
-        val dialog = AlertDialog.Builder(this)
-            .setTitle(titleRes)
-            .setView(picker.buildView(LayoutInflater.from(this)))
-            .setPositiveButton(R.string.dialog_ok, null)
-            .setNegativeButton(R.string.dialog_cancel) { d, _ -> d.dismiss() }
-            .create()
-
-        dialog.setOnShowListener {
-            dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener {
+        val dialog = with(AlertDialog.Builder(this)) {
+            setTitle(titleRes)
+            val inflater = LayoutInflater.from(context)
+            setView(picker.buildView(inflater))
+            setPositiveButton(R.string.dialog_ok) { _, _ ->
                 picker.number?.let {
                     if (picker.isInteger())
                         MPVLib.setPropertyInt(property, it.toInt())
@@ -1928,12 +1846,16 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
                         MPVLib.setPropertyDouble(property, it)
                 }
             }
+            setNegativeButton(R.string.dialog_cancel) { dialog, _ -> dialog.cancel() }
+            setOnDismissListener { restoreState() }
+            create()
         }
 
-        pushSettingsDialog(dialog)
+        picker.number = MPVLib.getPropertyDouble(property)
+        dialog.show()
     }
 
-    private fun openAdvancedMenu() {
+    private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
         /******/
         val hiddenButtons = mutableSetOf<Int>()
         val buttons: MutableList<MenuItem> = mutableListOf(
@@ -1948,18 +1870,8 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
                 },
                 MenuItem(R.id.aspectBtn) {
                     val ratios = resources.getStringArray(R.array.aspect_ratios)
-                    val names = resources.getStringArray(R.array.aspect_ratio_names)
-
-                    val currentPanscan = MPVLib.getPropertyDouble("panscan") ?: 0.0
-                    val currentAspect = MPVLib.getPropertyString("video-aspect-override")
-                    val selectedIndex = when {
-                        currentPanscan >= 0.5 -> ratios.indexOf("panscan")
-                        currentAspect != null -> ratios.indexOf(currentAspect)
-                        else -> -1
-                    }.coerceAtLeast(0)
-
-                    val dialog = AlertDialog.Builder(this)
-                        .setSingleChoiceItems(names, selectedIndex) { _, item ->
+                    with (AlertDialog.Builder(this)) {
+                        setItems(R.array.aspect_ratio_names) { dialog, item ->
                             if (ratios[item] == "panscan") {
                                 MPVLib.setPropertyString("video-aspect-override", "-1")
                                 MPVLib.setPropertyDouble("panscan", 1.0)
@@ -1967,10 +1879,11 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
                                 MPVLib.setPropertyString("video-aspect-override", ratios[item])
                                 MPVLib.setPropertyDouble("panscan", 0.0)
                             }
+                            dialog.dismiss()
                         }
-                        .create()
-                    pushSettingsDialog(dialog)
-                    false
+                        setOnDismissListener { restoreState() }
+                        create().show()
+                    }; false
                 },
         )
 
@@ -1988,7 +1901,7 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
         basicIds.forEachIndexed { index, id ->
             buttons.add(MenuItem(id) {
                 val slider = SliderPickerDialog(-100.0, 100.0, 1, R.string.format_fixed_number)
-                genericPickerDialog(slider, basicTitles[index], basicProps[index])
+                genericPickerDialog(slider, basicTitles[index], basicProps[index], restoreState)
                 false
             })
         }
@@ -1996,29 +1909,27 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
         // audio / sub delay get a decimal picker
         buttons.add(MenuItem(R.id.audioDelayBtn) {
             val picker = DecimalPickerDialog(-600.0, 600.0)
-            genericPickerDialog(picker, R.string.audio_delay, "audio-delay")
+            genericPickerDialog(picker, R.string.audio_delay, "audio-delay", restoreState)
             false
         })
         buttons.add(MenuItem(R.id.subDelayBtn) {
             val picker = SubDelayDialog(-600.0, 600.0)
-            picker.delay1 = player.subDelay ?: 0.0
-            picker.delay2 = if (player.secondarySid != -1) player.secondarySubDelay else null
-
-            val dialog = AlertDialog.Builder(this)
-                .setTitle(R.string.sub_delay)
-                .setView(picker.buildView(LayoutInflater.from(this)))
-                .setPositiveButton(R.string.dialog_ok, null)
-                .setNegativeButton(R.string.dialog_cancel) { d, _ -> d.dismiss() }
-                .create()
-
-            dialog.setOnShowListener {
-                dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener {
+            val dialog = with(AlertDialog.Builder(this)) {
+                setTitle(R.string.sub_delay)
+                val inflater = LayoutInflater.from(context)
+                setView(picker.buildView(inflater))
+                setPositiveButton(R.string.dialog_ok) { _, _ ->
                     picker.delay1?.let { player.subDelay = it }
                     picker.delay2?.let { player.secondarySubDelay = it }
                 }
+                setNegativeButton(R.string.dialog_cancel) { dialog, _ -> dialog.cancel() }
+                setOnDismissListener { restoreState() }
+                create()
             }
 
-            pushSettingsDialog(dialog)
+            picker.delay1 = player.subDelay ?: 0.0
+            picker.delay2 = if (player.secondarySid != -1) player.secondarySubDelay else null
+            dialog.show()
             false
         })
 
@@ -2030,8 +1941,7 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
             hiddenButtons.addAll(arrayOf(R.id.subDelayBtn, R.id.rowSubSeek))
         /******/
 
-        val dialog = genericMenu(R.layout.dialog_advanced_menu, buttons, hiddenButtons) ?: return
-        pushSettingsDialog(dialog)
+        genericMenu(R.layout.dialog_advanced_menu, buttons, hiddenButtons, restoreState)
     }
 
     private fun cycleOrientation() {
@@ -2042,39 +1952,57 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
     }
 
     private var activityResultCallbacks: MutableMap<Int, ActivityResultCallback> = mutableMapOf()
-    private fun openFilePickerFor(requestCode: Int, title: String, skip: Int?, callback: ActivityResultCallback) {
-        openFilePickerFor(requestCode, title, skip, false, callback)
+    private var restoreOrientationAfterPicker: Int? = null
+
+    private fun isCurrentVideoLandscape(): Boolean {
+        val ratio = player.getVideoAspect()?.toFloat() ?: return false
+        if (ratio == 0f || ratio in (1f / ASPECT_RATIO_MIN)..ASPECT_RATIO_MIN)
+            return false
+        return ratio > 1f
     }
 
-    private fun openFilePickerFor(requestCode: Int, title: String, skip: Int?, forceLandscape: Boolean, callback: ActivityResultCallback) {
+    private fun openFilePickerFor(
+        requestCode: Int,
+        title: String,
+        skip: Int?,
+        forceLandscape: Boolean = false,
+        callback: ActivityResultCallback
+    ) {
         val intent = Intent(this, FilePickerActivity::class.java)
         intent.putExtra("title", title)
         intent.putExtra("allow_document", true)
-        intent.putExtra("force_landscape", forceLandscape)
         skip?.let { intent.putExtra("skip", it) }
         // start file picker at directory of current file
         val path = MPVLib.getPropertyString("path") ?: ""
         if (path.startsWith('/'))
             intent.putExtra("default_path", File(path).parent)
 
-        activityResultCallbacks[requestCode] = callback
-        startActivityForResult(intent, requestCode)
+        val shouldForceLandscape = forceLandscape && isCurrentVideoLandscape()
+        if (shouldForceLandscape) {
+            intent.putExtra(EXTRA_FORCE_LANDSCAPE, true)
+            // Ensure the picker starts in landscape immediately (no portrait flash).
+            restoreOrientationAfterPicker = requestedOrientation
+            requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
+        }
+
+        activityResultCallbacks[requestCode] = { result, data ->
+            if (shouldForceLandscape) {
+                restoreOrientationAfterPicker?.let { requestedOrientation = it }
+                restoreOrientationAfterPicker = null
+                // Re-apply auto orientation after picker (keeps landscape while video is landscape).
+                updateOrientation()
+            }
+            callback(result, data)
+        }
+
+        if (shouldForceLandscape) {
+            window.decorView.post { startActivityForResult(intent, requestCode) }
+        } else {
+            startActivityForResult(intent, requestCode)
+        }
     }
     private fun openFilePickerFor(requestCode: Int, @StringRes titleRes: Int, callback: ActivityResultCallback) {
-        openFilePickerFor(requestCode, getString(titleRes), null, callback)
-    }
-
-    private fun openFilePickerFor(requestCode: Int, @StringRes titleRes: Int, forceLandscape: Boolean, callback: ActivityResultCallback) {
-        openFilePickerFor(requestCode, getString(titleRes), null, forceLandscape, callback)
-    }
-
-    private fun isLandscapeVideo(): Boolean {
-        val ratio = (MPVLib.getPropertyDouble("video-params/aspect") ?: player.getVideoAspect() ?: 0.0).toFloat()
-        if (ratio == 0f)
-            return resources.configuration.orientation == Configuration.ORIENTATION_LANDSCAPE
-        if (ratio in (1f / ASPECT_RATIO_MIN) .. ASPECT_RATIO_MIN)
-            return false
-        return ratio > 1f
+        openFilePickerFor(requestCode, getString(titleRes), null, false, callback)
     }
 
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
@@ -2224,9 +2152,136 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
         binding.nextBtn.imageTintList = ColorStateList.valueOf(if (plPos == plCount-1) g else w)
     }
 
+    private data class VideoDims(val width: Int, val height: Int, val rotationDeg: Int)
+
+    /**
+     * Try to lock orientation before the first frame is rendered.
+     * This avoids the brief portrait flash when opening a landscape video from a portrait UI.
+     */
+    private fun preselectOrientationForFile(filepath: String) {
+        // screen orientation is fixed (Android TV)
+        if (!packageManager.hasSystemFeature(PackageManager.FEATURE_SCREEN_PORTRAIT))
+            return
+        if (autoRotationMode != "auto")
+            return
+
+        // Avoid blocking startup on remote streams/URLs.
+        if (filepath.contains("://") && !filepath.startsWith("content://") && !filepath.startsWith("file://"))
+            return
+
+        val prefs = getDefaultSharedPreferences(applicationContext)
+        val cached = prefs.getInt(perFilePrefKey(PREF_ORIENT_HINT_PREFIX, filepath), 0)
+        if (cached == 1) {
+            requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
+            return
+        }
+        if (cached == -1) {
+            requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_SENSOR_PORTRAIT
+            return
+        }
+
+        val dims = probeVideoDims(filepath) ?: return
+        if (dims.width <= 0 || dims.height <= 0)
+            return
+        val rot = ((dims.rotationDeg % 360) + 360) % 360
+        val (w, h) = if (rot == 90 || rot == 270) dims.height to dims.width else dims.width to dims.height
+        if (w <= 0 || h <= 0) return
+
+        val ratio = w.toFloat() / h.toFloat()
+        if (ratio == 0f || ratio in (1f / ASPECT_RATIO_MIN)..ASPECT_RATIO_MIN)
+            return // square-ish; let Android decide
+
+        requestedOrientation = if (ratio > 1f)
+            ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
+        else
+            ActivityInfo.SCREEN_ORIENTATION_SENSOR_PORTRAIT
+    }
+
+    /** Remember a simple landscape/portrait hint for faster next startup. */
+    private fun rememberOrientationHintForCurrentFile() {
+        if (autoRotationMode != "auto")
+            return
+        val mediaKey = currentMediaKeyForPrefs() ?: return
+        val ratio = player.getVideoAspect()?.toFloat() ?: return
+        if (ratio == 0f || ratio in (1f / ASPECT_RATIO_MIN)..ASPECT_RATIO_MIN)
+            return
+        val hint = if (ratio > 1f) 1 else -1
+        val prefs = getDefaultSharedPreferences(applicationContext)
+        prefs.edit().putInt(perFilePrefKey(PREF_ORIENT_HINT_PREFIX, mediaKey), hint).apply()
+    }
+
+    private fun probeVideoDims(filepath: String): VideoDims? {
+        // First try MediaMetadataRetriever (fast for many containers)
+        probeWithMetadataRetriever(filepath)?.let { return it }
+        // Fallback to MediaExtractor (works for many cases where retriever fails)
+        return probeWithExtractor(filepath)
+    }
+
+    private fun probeWithMetadataRetriever(filepath: String): VideoDims? {
+        val mmr = MediaMetadataRetriever()
+        return try {
+            if (filepath.startsWith("content://")) {
+                val uri = Uri.parse(filepath)
+                contentResolver.openFileDescriptor(uri, "r")?.use { pfd ->
+                    mmr.setDataSource(pfd.fileDescriptor)
+                } ?: return null
+            } else if (filepath.startsWith("file://")) {
+                mmr.setDataSource(filepath.removePrefix("file://"))
+            } else {
+                mmr.setDataSource(filepath)
+            }
+
+            val w = mmr.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_WIDTH)?.toIntOrNull() ?: return null
+            val h = mmr.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_HEIGHT)?.toIntOrNull() ?: return null
+            val rot = mmr.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_ROTATION)?.toIntOrNull() ?: 0
+            VideoDims(w, h, rot)
+        } catch (_: Throwable) {
+            null
+        } finally {
+            try { mmr.release() } catch (_: Throwable) {}
+        }
+    }
+
+    private fun probeWithExtractor(filepath: String): VideoDims? {
+        val ex = MediaExtractor()
+        return try {
+            if (filepath.startsWith("content://")) {
+                ex.setDataSource(this, Uri.parse(filepath), null)
+            } else if (filepath.startsWith("file://")) {
+                ex.setDataSource(filepath.removePrefix("file://"))
+            } else {
+                ex.setDataSource(filepath)
+            }
+
+            for (i in 0 until ex.trackCount) {
+                val format = ex.getTrackFormat(i)
+                val mime = format.getString(MediaFormat.KEY_MIME) ?: continue
+                if (!mime.startsWith("video/")) continue
+                if (!format.containsKey(MediaFormat.KEY_WIDTH) || !format.containsKey(MediaFormat.KEY_HEIGHT))
+                    continue
+                val w = format.getInteger(MediaFormat.KEY_WIDTH)
+                val h = format.getInteger(MediaFormat.KEY_HEIGHT)
+                val rot = when {
+                    format.containsKey("rotation-degrees") -> format.getInteger("rotation-degrees")
+                    else -> 0
+                }
+                return VideoDims(w, h, rot)
+            }
+            null
+        } catch (_: Throwable) {
+            null
+        } finally {
+            try { ex.release() } catch (_: Throwable) {}
+        }
+    }
+
     private fun updateOrientation(initial: Boolean = false) {
         // screen orientation is fixed (Android TV)
         if (!packageManager.hasSystemFeature(PackageManager.FEATURE_SCREEN_PORTRAIT))
+            return
+
+        // Manual mode means "keep whatever requestedOrientation currently is".
+        if (autoRotationMode == "manual")
             return
 
         if (autoRotationMode != "auto") {
@@ -2251,62 +2306,6 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
             ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
         else
             ActivityInfo.SCREEN_ORIENTATION_SENSOR_PORTRAIT
-    }
-
-    /**
-     * Try to preselect orientation for local videos before the first visible frame.
-     *
-     * mpv can only determine aspect ratio after starting playback; if we wait for that,
-     * opening a landscape video from a portrait UI will briefly show a portrait frame
-     * and then rotate. We avoid that by guessing from metadata up-front for local files.
-     */
-    private fun preselectOrientationForFile(filepath: String) {
-        // screen orientation is fixed (Android TV)
-        if (!packageManager.hasSystemFeature(PackageManager.FEATURE_SCREEN_PORTRAIT))
-            return
-        if (autoRotationMode != "auto")
-            return
-
-        // Only attempt for local/known URIs; avoid blocking on network streams.
-        val isLocalPath = filepath.startsWith('/')
-        val isLocalUri = filepath.startsWith("file://") || filepath.startsWith("content://")
-        if (!isLocalPath && !isLocalUri)
-            return
-
-        val mmr = MediaMetadataRetriever()
-        try {
-            if (isLocalPath) {
-                mmr.setDataSource(filepath)
-            } else {
-                mmr.setDataSource(this, Uri.parse(filepath))
-            }
-
-            val w = mmr.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_WIDTH)?.toIntOrNull()
-            val h = mmr.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_HEIGHT)?.toIntOrNull()
-            if (w == null || h == null || w <= 0 || h <= 0)
-                return
-
-            val rot = mmr.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_ROTATION)?.toIntOrNull() ?: 0
-            val effectiveW = if (rot % 180 == 0) w else h
-            val effectiveH = if (rot % 180 == 0) h else w
-            if (effectiveW <= 0 || effectiveH <= 0)
-                return
-
-            val ratio = effectiveW.toFloat() / effectiveH.toFloat()
-            if (ratio == 0f || ratio in (1f / ASPECT_RATIO_MIN) .. ASPECT_RATIO_MIN) {
-                requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
-                return
-            }
-
-            requestedOrientation = if (ratio > 1f)
-                ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
-            else
-                ActivityInfo.SCREEN_ORIENTATION_SENSOR_PORTRAIT
-        } catch (_: Throwable) {
-            // ignore and fall back to normal orientation handling
-        } finally {
-            try { mmr.release() } catch (_: Throwable) {}
-        }
     }
 
     @RequiresApi(26)
@@ -2436,6 +2435,7 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
             "duration/full" -> updatePlaybackDuration(psc.durationSec)
             "video-params/aspect", "video-params/rotate" -> {
                 updateOrientation()
+                rememberOrientationHintForCurrentFile()
                 updatePiPParams()
                 zoomGestures.setVideoAspect(player.getVideoAspect())
             }
@@ -2704,8 +2704,11 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
         private const val PREF_EXTSUBS_PREFIX = "perfile_external_subs_v1_"
         private const val PREF_SUBSEL_PRIMARY_PREFIX = "perfile_subsel_primary_v1_"
         private const val PREF_SUBSEL_SECONDARY_PREFIX = "perfile_subsel_secondary_v1_"
+        private const val PREF_ORIENT_HINT_PREFIX = "perfile_orientation_hint_v1_"
         // Safety cap (oldest entries are dropped) to avoid unbounded preference growth.
         private const val PREF_EXTSUBS_MAX = 80
         private const val SUB_RESTORE_MAX_ATTEMPTS = 20
+
+        private const val EXTRA_FORCE_LANDSCAPE = "force_landscape"
     }
 }

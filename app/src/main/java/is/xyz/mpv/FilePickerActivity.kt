@@ -42,11 +42,9 @@ class FilePickerActivity : AppCompatActivity(), AbstractFilePickerFragment.OnFil
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
-        // If requested by the caller (MPVActivity), keep this UI in landscape while picking
-        // external subs/audio for a landscape video.
-        if (intent.getBooleanExtra("force_landscape", false)) {
+        // Apply forced orientation *before* calling super to avoid an initial portrait frame.
+        if (intent.getBooleanExtra(EXTRA_FORCE_LANDSCAPE, false))
             requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
-        }
         super.onCreate(null)
         Log.v(TAG, "FilePickerActivity: created")
 
@@ -92,6 +90,10 @@ class FilePickerActivity : AppCompatActivity(), AbstractFilePickerFragment.OnFil
             add(R.id.fragment_container_view, ChoiceFragment::class.java, args, null)
             commit()
         }
+    }
+
+    companion object {
+        const val EXTRA_FORCE_LANDSCAPE = "force_landscape"
     }
 
     private fun doUiTweaks() {
