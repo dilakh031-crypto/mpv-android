@@ -43,8 +43,8 @@ internal class DecimalPickerDialog(
     override fun isInteger(): Boolean = false
 
     override var number: Double?
-    set(v) = binding.editText.setText((v ?: 0.0).toString())
-    get() = binding.editText.text.toString().toDoubleOrNull()
+        set(v) = binding.editText.setText(v!!.toString())
+        get() = binding.editText.text.toString().toDoubleOrNull()
 
     companion object {
         private const val STEP = 1.0
