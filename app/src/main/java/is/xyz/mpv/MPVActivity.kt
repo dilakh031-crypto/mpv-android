@@ -53,6 +53,7 @@ import androidx.media.AudioManagerCompat
 import java.io.File
 import java.lang.IllegalArgumentException
 import java.security.MessageDigest
+import java.util.ArrayDeque
 import org.json.JSONArray
 import kotlin.math.roundToInt
 
@@ -217,8 +218,8 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
             cycleAudioBtn.setOnLongClickListener { pickAudio(); true }
             cycleSpeedBtn.setOnLongClickListener { pickSpeed(); true }
             cycleSubsBtn.setOnLongClickListener { pickSub(); true }
-            prevBtn.setOnLongClickListener { openPlaylistMenu(pauseForDialog()); true }
-            nextBtn.setOnLongClickListener { openPlaylistMenu(pauseForDialog()); true }
+            prevBtn.setOnLongClickListener { openPlaylistMenu(); true }
+            nextBtn.setOnLongClickListener { openPlaylistMenu(); true }
             cycleDecoderBtn.setOnLongClickListener { pickDecoder(); true }
 
             playbackSeekbar.setOnSeekBarChangeListener(seekBarChangeListener)
@@ -712,6 +713,100 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
             if (!wasPlayerPaused)
                 player.paused = false
         }
+    }
+
+    // --------------------
+    // Settings dialog navigation
+    // --------------------
+
+    private val settingsDialogStack: ArrayDeque<AlertDialog> = ArrayDeque()
+    private var settingsRestoreCallback: StateRestoreCallback? = null
+    private var suppressSettingsDismissCallback = false
+
+    private fun ensureSettingsSession() {
+        if (settingsRestoreCallback == null) {
+            settingsRestoreCallback = pauseForDialog()
+        }
+    }
+
+    private fun finishSettingsSessionIfNeeded() {
+        if (settingsDialogStack.isEmpty()) {
+            settingsRestoreCallback?.invoke()
+            settingsRestoreCallback = null
+        }
+    }
+
+    private fun pushSettingsDialog(dialog: AlertDialog) {
+        ensureSettingsSession()
+
+        settingsDialogStack.lastOrNull()?.hide()
+        settingsDialogStack.addLast(dialog)
+
+        dialog.setCanceledOnTouchOutside(true)
+        // Outside tap should exit to video immediately from anywhere in the stack.
+        dialog.setOnCancelListener {
+            clearSettingsDialogs()
+        }
+        // Back should go one level back (until the last, then return to video).
+        dialog.setOnKeyListener { _, keyCode, event ->
+            if (keyCode == KeyEvent.KEYCODE_BACK && event.action == KeyEvent.ACTION_UP) {
+                popSettingsDialog()
+                true
+            } else {
+                false
+            }
+        }
+        dialog.setOnDismissListener {
+            if (suppressSettingsDismissCallback) return@setOnDismissListener
+
+            // If this dialog was dismissed by Android (e.g. list item auto-dismiss),
+            // treat it like a single-level back.
+            val wasTop = (settingsDialogStack.lastOrNull() === dialog)
+            settingsDialogStack.remove(dialog)
+            if (wasTop) {
+                settingsDialogStack.lastOrNull()?.show()
+                finishSettingsSessionIfNeeded()
+            }
+        }
+
+        dialog.show()
+    }
+
+    private fun popSettingsDialog() {
+        if (settingsDialogStack.isEmpty()) return
+        val top = settingsDialogStack.removeLast()
+        suppressSettingsDismissCallback = true
+        try {
+            top.setOnCancelListener(null)
+            top.setOnDismissListener(null)
+            top.setOnKeyListener(null)
+            top.dismiss()
+        } finally {
+            suppressSettingsDismissCallback = false
+        }
+
+        settingsDialogStack.lastOrNull()?.show()
+        finishSettingsSessionIfNeeded()
+    }
+
+    private fun clearSettingsDialogs() {
+        if (settingsDialogStack.isEmpty()) {
+            finishSettingsSessionIfNeeded()
+            return
+        }
+        suppressSettingsDismissCallback = true
+        try {
+            while (settingsDialogStack.isNotEmpty()) {
+                val d = settingsDialogStack.removeLast()
+                d.setOnCancelListener(null)
+                d.setOnDismissListener(null)
+                d.setOnKeyListener(null)
+                d.dismiss()
+            }
+        } finally {
+            suppressSettingsDismissCallback = false
+        }
+        finishSettingsSessionIfNeeded()
     }
 
     private fun updateStats() {
@@ -1512,27 +1607,21 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
         val tracks = player.tracks.getValue(type)
         val selectedMpvId = get()
         val selectedIndex = tracks.indexOfFirst { it.mpvId == selectedMpvId }
-        val restore = pauseForDialog()
-
-        with (AlertDialog.Builder(this)) {
-            setSingleChoiceItems(tracks.map { it.name }.toTypedArray(), selectedIndex) { dialog, item ->
+        val dialog = with (AlertDialog.Builder(this)) {
+            setSingleChoiceItems(tracks.map { it.name }.toTypedArray(), selectedIndex) { _, item ->
                 val trackId = tracks[item].mpvId
-
                 set(trackId)
-                dialog.dismiss()
                 trackSwitchNotification { TrackData(trackId, type) }
             }
-            setOnDismissListener { restore() }
-            create().show()
+            create()
         }
+        pushSettingsDialog(dialog)
     }
 
     private fun pickAudio() = selectTrack("audio", { player.aid }, { player.aid = it })
 
     private fun pickSub() {
-        val restore = pauseForDialog()
         val impl = SubTrackDialog(player)
-        lateinit var dialog: AlertDialog
         impl.listener = { it, secondary ->
             if (secondary)
                 player.secondarySid = it.mpvId
@@ -1540,8 +1629,9 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
                 player.sid = it.mpvId
             // Persist subtitle selection per-file (and also mpv watch-later state).
             rememberCurrentSubtitleSelectionForCurrentFile()
-            dialog.dismiss()
             trackSwitchNotification { TrackData(it.mpvId, SubTrackDialog.TRACK_TYPE) }
+            // Keep the dialog open (don't kick the user back to video).
+            impl.refresh()
         }
 
         impl.removeListener = { trackId, secondary ->
@@ -1553,13 +1643,12 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
             }, 120L)
         }
 
-        dialog = with (AlertDialog.Builder(this)) {
+        val dialog = with (AlertDialog.Builder(this)) {
             val inflater = LayoutInflater.from(context)
             setView(impl.buildView(inflater))
-            setOnDismissListener { restore() }
             create()
         }
-        dialog.show()
+        pushSettingsDialog(dialog)
     }
 
     private fun forgetExternalSubtitleForCurrentFile(subPath: String) {
@@ -1601,9 +1690,9 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
         rememberCurrentSubtitleSelectionForCurrentFile()
     }
 
-    private fun openPlaylistMenu(restore: StateRestoreCallback) {
+    private fun openPlaylistMenu() {
         val impl = PlaylistDialog(player)
-        lateinit var dialog: AlertDialog
+        lateinit var playlistDialog: AlertDialog
 
         impl.listeners = object : PlaylistDialog.Listeners {
             private fun openFilePicker(skip: Int) {
@@ -1620,33 +1709,36 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
             override fun openUrl() {
                 val helper = Utils.OpenUrlDialog(this@MPVActivity)
                 with (helper) {
-                    builder.setPositiveButton(R.string.dialog_ok) { _, _ ->
-                        MPVLib.command(arrayOf("loadfile", helper.text, "append"))
-                        impl.refresh()
+                    builder.setPositiveButton(R.string.dialog_ok, null)
+                    builder.setNegativeButton(R.string.dialog_cancel) { dialog, _ -> dialog.dismiss() }
+                    val d = create()
+                    d.setOnShowListener {
+                        // Apply without closing; exit via Back or outside-tap.
+                        d.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener {
+                            MPVLib.command(arrayOf("loadfile", helper.text, "append"))
+                            impl.refresh()
+                        }
                     }
-                    builder.setNegativeButton(R.string.dialog_cancel) { dialog, _ -> dialog.cancel() }
-                    create().show()
+                    pushSettingsDialog(d)
                 }
             }
 
             override fun onItemPicked(item: MPVView.PlaylistItem) {
                 MPVLib.setPropertyInt("playlist-pos", item.index)
-                dialog.dismiss()
+                impl.refresh()
             }
         }
 
-        dialog = with (AlertDialog.Builder(this)) {
+        playlistDialog = with (AlertDialog.Builder(this)) {
             val inflater = LayoutInflater.from(context)
             setView(impl.buildView(inflater))
-            setOnDismissListener { restore() }
             create()
         }
-        dialog.show()
+
+        pushSettingsDialog(playlistDialog)
     }
 
     private fun pickDecoder() {
-        val restore = pauseForDialog()
-
         val items = mutableListOf(
             Pair("HW (mediacodec-copy)", "mediacodec-copy"),
             Pair("SW", "no")
@@ -1655,14 +1747,13 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
             items.add(0, Pair("HW+ (mediacodec)", "mediacodec"))
         val hwdecActive = player.hwdecActive
         val selectedIndex = items.indexOfFirst { it.second == hwdecActive }
-        with (AlertDialog.Builder(this)) {
-            setSingleChoiceItems(items.map { it.first }.toTypedArray(), selectedIndex ) { dialog, idx ->
+        val dialog = with (AlertDialog.Builder(this)) {
+            setSingleChoiceItems(items.map { it.first }.toTypedArray(), selectedIndex ) { _, idx ->
                 MPVLib.setPropertyString("hwdec", items[idx].second)
-                dialog.dismiss()
             }
-            setOnDismissListener { restore() }
-            create().show()
+            create()
         }
+        pushSettingsDialog(dialog)
     }
 
     private fun cycleSpeed() {
@@ -1672,11 +1763,7 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
     private fun pickSpeed() {
         // TODO: replace this with SliderPickerDialog
         val picker = SpeedPickerDialog()
-
-        val restore = pauseForDialog()
-        genericPickerDialog(picker, R.string.title_speed_dialog, "speed") {
-            restore()
-        }
+        genericPickerDialog(picker, R.string.title_speed_dialog, "speed")
     }
 
     private fun goIntoPiP() {
@@ -1699,20 +1786,17 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
 
     data class MenuItem(@IdRes val idRes: Int, val handler: () -> Boolean)
     private fun genericMenu(
-            @LayoutRes layoutRes: Int, buttons: List<MenuItem>, hiddenButtons: Set<Int>,
-            restoreState: StateRestoreCallback) {
-        lateinit var dialog: AlertDialog
-
+            @LayoutRes layoutRes: Int, buttons: List<MenuItem>, hiddenButtons: Set<Int>
+    ): AlertDialog? {
         val builder = AlertDialog.Builder(this)
         val dialogView = LayoutInflater.from(builder.context).inflate(layoutRes, null)
 
         for (button in buttons) {
             val buttonView = dialogView.findViewById<Button>(button.idRes)
             buttonView.setOnClickListener {
-                val ret = button.handler()
-                if (ret) // restore state immediately
-                    restoreState()
-                dialog.dismiss()
+                // Keep the menu open. If a sub-dialog is opened, it will be pushed onto
+                // the settings stack and this one will be hidden automatically.
+                button.handler()
             }
         }
 
@@ -1720,23 +1804,15 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
 
         if (Utils.visibleChildren(dialogView) == 0) {
             Log.w(TAG, "Not showing menu because it would be empty")
-            restoreState()
-            return
+            return null
         }
 
         Utils.handleInsetsAsPadding(dialogView)
-
-        with (builder) {
-            setView(dialogView)
-            setOnCancelListener { restoreState() }
-            dialog = create()
-        }
-        dialog.show()
+        builder.setView(dialogView)
+        return builder.create()
     }
 
     private fun openTopMenu() {
-        val restoreState = pauseForDialog()
-
         fun addExternalThing(cmd: String, result: Int, data: Intent?) {
             if (result != RESULT_OK)
                 return
@@ -1760,21 +1836,19 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
                 MenuItem(R.id.audioBtn) {
                     openFilePickerFor(RCODE_EXTERNAL_AUDIO, R.string.open_external_audio) { result, data ->
                         addExternalThing("audio-add", result, data)
-                        restoreState()
                     }; false
                 },
                 MenuItem(R.id.subBtn) {
                     openFilePickerFor(RCODE_EXTERNAL_SUB, R.string.open_external_sub) { result, data ->
                         addExternalThing("sub-add", result, data)
-                        restoreState()
                     }; false
                 },
                 MenuItem(R.id.playlistBtn) {
-                    openPlaylistMenu(restoreState); false
+                    openPlaylistMenu(); false
                 },
                 MenuItem(R.id.backgroundBtn) {
-                    // restoring state may (un)pause so do that first
-                    restoreState()
+                    // Exit the dialog stack before moving to background.
+                    clearSettingsDialogs()
                     backgroundPlayMode = "always"
                     player.paused = false
                     moveTaskToBack(true)
@@ -1792,14 +1866,14 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
                             getString(R.string.ui_chapter_fallback, it.index+1, timecode)
                     }.toTypedArray()
                     val selectedIndex = MPVLib.getPropertyInt("chapter") ?: 0
-                    with (AlertDialog.Builder(this)) {
-                        setSingleChoiceItems(chapterArray, selectedIndex) { dialog, item ->
+                    val dialog = with (AlertDialog.Builder(this)) {
+                        setSingleChoiceItems(chapterArray, selectedIndex) { _, item ->
                             MPVLib.setPropertyInt("chapter", chapters[item].index)
-                            dialog.dismiss()
                         }
-                        setOnDismissListener { restoreState() }
-                        create().show()
-                    }; false
+                        create()
+                    }
+                    pushSettingsDialog(dialog)
+                    false
                 },
                 MenuItem(R.id.chapterPrev) {
                     MPVLib.command(arrayOf("add", "chapter", "-1")); true
@@ -1807,7 +1881,7 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
                 MenuItem(R.id.chapterNext) {
                     MPVLib.command(arrayOf("add", "chapter", "1")); true
                 },
-                MenuItem(R.id.advancedBtn) { openAdvancedMenu(restoreState); false },
+                MenuItem(R.id.advancedBtn) { openAdvancedMenu(); false },
                 MenuItem(R.id.orientationBtn) {
                     autoRotationMode = "manual"
                     cycleOrientation()
@@ -1821,18 +1895,25 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
             hiddenButtons.add(R.id.rowChapter)
         /******/
 
-        genericMenu(R.layout.dialog_top_menu, buttons, hiddenButtons, restoreState)
+        val dialog = genericMenu(R.layout.dialog_top_menu, buttons, hiddenButtons) ?: return
+        pushSettingsDialog(dialog)
     }
 
     private fun genericPickerDialog(
-        picker: PickerDialog, @StringRes titleRes: Int, property: String,
-        restoreState: StateRestoreCallback
+        picker: PickerDialog, @StringRes titleRes: Int, property: String
     ) {
-        val dialog = with(AlertDialog.Builder(this)) {
-            setTitle(titleRes)
-            val inflater = LayoutInflater.from(context)
-            setView(picker.buildView(inflater))
-            setPositiveButton(R.string.dialog_ok) { _, _ ->
+        // Keep the settings UI open: apply on OK but don't close (exit via Back or outside-tap).
+        picker.number = MPVLib.getPropertyDouble(property)
+
+        val dialog = AlertDialog.Builder(this)
+            .setTitle(titleRes)
+            .setView(picker.buildView(LayoutInflater.from(this)))
+            .setPositiveButton(R.string.dialog_ok, null)
+            .setNegativeButton(R.string.dialog_cancel) { d, _ -> d.dismiss() }
+            .create()
+
+        dialog.setOnShowListener {
+            dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener {
                 picker.number?.let {
                     if (picker.isInteger())
                         MPVLib.setPropertyInt(property, it.toInt())
@@ -1840,16 +1921,12 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
                         MPVLib.setPropertyDouble(property, it)
                 }
             }
-            setNegativeButton(R.string.dialog_cancel) { dialog, _ -> dialog.cancel() }
-            setOnDismissListener { restoreState() }
-            create()
         }
 
-        picker.number = MPVLib.getPropertyDouble(property)
-        dialog.show()
+        pushSettingsDialog(dialog)
     }
 
-    private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
+    private fun openAdvancedMenu() {
         /******/
         val hiddenButtons = mutableSetOf<Int>()
         val buttons: MutableList<MenuItem> = mutableListOf(
@@ -1864,8 +1941,18 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
                 },
                 MenuItem(R.id.aspectBtn) {
                     val ratios = resources.getStringArray(R.array.aspect_ratios)
-                    with (AlertDialog.Builder(this)) {
-                        setItems(R.array.aspect_ratio_names) { dialog, item ->
+                    val names = resources.getStringArray(R.array.aspect_ratio_names)
+
+                    val currentPanscan = MPVLib.getPropertyDouble("panscan") ?: 0.0
+                    val currentAspect = MPVLib.getPropertyString("video-aspect-override")
+                    val selectedIndex = when {
+                        currentPanscan >= 0.5 -> ratios.indexOf("panscan")
+                        currentAspect != null -> ratios.indexOf(currentAspect)
+                        else -> -1
+                    }.coerceAtLeast(0)
+
+                    val dialog = AlertDialog.Builder(this)
+                        .setSingleChoiceItems(names, selectedIndex) { _, item ->
                             if (ratios[item] == "panscan") {
                                 MPVLib.setPropertyString("video-aspect-override", "-1")
                                 MPVLib.setPropertyDouble("panscan", 1.0)
@@ -1873,11 +1960,10 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
                                 MPVLib.setPropertyString("video-aspect-override", ratios[item])
                                 MPVLib.setPropertyDouble("panscan", 0.0)
                             }
-                            dialog.dismiss()
                         }
-                        setOnDismissListener { restoreState() }
-                        create().show()
-                    }; false
+                        .create()
+                    pushSettingsDialog(dialog)
+                    false
                 },
         )
 
@@ -1895,7 +1981,7 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
         basicIds.forEachIndexed { index, id ->
             buttons.add(MenuItem(id) {
                 val slider = SliderPickerDialog(-100.0, 100.0, 1, R.string.format_fixed_number)
-                genericPickerDialog(slider, basicTitles[index], basicProps[index], restoreState)
+                genericPickerDialog(slider, basicTitles[index], basicProps[index])
                 false
             })
         }
@@ -1903,27 +1989,29 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
         // audio / sub delay get a decimal picker
         buttons.add(MenuItem(R.id.audioDelayBtn) {
             val picker = DecimalPickerDialog(-600.0, 600.0)
-            genericPickerDialog(picker, R.string.audio_delay, "audio-delay", restoreState)
+            genericPickerDialog(picker, R.string.audio_delay, "audio-delay")
             false
         })
         buttons.add(MenuItem(R.id.subDelayBtn) {
             val picker = SubDelayDialog(-600.0, 600.0)
-            val dialog = with(AlertDialog.Builder(this)) {
-                setTitle(R.string.sub_delay)
-                val inflater = LayoutInflater.from(context)
-                setView(picker.buildView(inflater))
-                setPositiveButton(R.string.dialog_ok) { _, _ ->
+            picker.delay1 = player.subDelay ?: 0.0
+            picker.delay2 = if (player.secondarySid != -1) player.secondarySubDelay else null
+
+            val dialog = AlertDialog.Builder(this)
+                .setTitle(R.string.sub_delay)
+                .setView(picker.buildView(LayoutInflater.from(this)))
+                .setPositiveButton(R.string.dialog_ok, null)
+                .setNegativeButton(R.string.dialog_cancel) { d, _ -> d.dismiss() }
+                .create()
+
+            dialog.setOnShowListener {
+                dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener {
                     picker.delay1?.let { player.subDelay = it }
                     picker.delay2?.let { player.secondarySubDelay = it }
                 }
-                setNegativeButton(R.string.dialog_cancel) { dialog, _ -> dialog.cancel() }
-                setOnDismissListener { restoreState() }
-                create()
             }
 
-            picker.delay1 = player.subDelay ?: 0.0
-            picker.delay2 = if (player.secondarySid != -1) player.secondarySubDelay else null
-            dialog.show()
+            pushSettingsDialog(dialog)
             false
         })
 
@@ -1935,7 +2023,8 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
             hiddenButtons.addAll(arrayOf(R.id.subDelayBtn, R.id.rowSubSeek))
         /******/
 
-        genericMenu(R.layout.dialog_advanced_menu, buttons, hiddenButtons, restoreState)
+        val dialog = genericMenu(R.layout.dialog_advanced_menu, buttons, hiddenButtons) ?: return
+        pushSettingsDialog(dialog)
     }
 
     private fun cycleOrientation() {
