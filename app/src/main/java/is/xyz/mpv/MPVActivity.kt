@@ -676,6 +676,27 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
 
     private var mightWantToToggleControls = false
 
+    // Prevent accidental single-tap UI toggle while user swipes from the very top to open
+    // Android's notification shade / status bar.
+    private var statusBarSwipeCandidate = false
+    private var statusBarSwipeStartY = 0f
+    private var statusBarSwipeCanceledToggle = false
+
+    private fun isInTopSystemGestureDeadzone(y: Float): Boolean {
+        // Use the gesture layer height if available (covers edge-to-edge/immersive scenarios).
+        val h = when {
+            ::binding.isInitialized && binding.gestureLayer.height > 0 -> binding.gestureLayer.height
+            (window?.decorView?.height ?: 0) > 0 -> window.decorView.height
+            else -> 0
+        }
+        if (h <= 0) return false
+        return y <= h * STATUS_BAR_DEADZONE_PERCENT / 100f
+    }
+
+    private fun statusBarSwipeCancelPx(): Float {
+        return STATUS_BAR_SWIPE_CANCEL_DP * resources.displayMetrics.density
+    }
+
     /** true if we're actually outputting any audio (includes the mute state, but not pausing) */
     private var isPlayingAudio = false
 
@@ -842,6 +863,21 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
         if (ev.actionMasked == MotionEvent.ACTION_DOWN) {
             cancelPendingTapToggle()
             mightWantToToggleControls = true
+
+            // If the gesture starts from the very top, treat it as a possible status-bar swipe.
+            // We'll only cancel the tap-to-toggle if the finger moves down noticeably.
+            statusBarSwipeCandidate = isInTopSystemGestureDeadzone(ev.y)
+            statusBarSwipeStartY = ev.y
+            statusBarSwipeCanceledToggle = false
+        }
+
+        if (ev.actionMasked == MotionEvent.ACTION_MOVE && statusBarSwipeCandidate && !statusBarSwipeCanceledToggle) {
+            // User is likely pulling down the notification shade; don't show player controls.
+            if (ev.y - statusBarSwipeStartY > statusBarSwipeCancelPx()) {
+                statusBarSwipeCanceledToggle = true
+                mightWantToToggleControls = false
+                cancelPendingTapToggle()
+            }
         }
 
         if (super.dispatchTouchEvent(ev)) {
@@ -849,11 +885,24 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
             // ideally we'd want to know if the event was delivered to controls, but we can't
             if (binding.controls.visibility == View.VISIBLE && !fadeRunnable.hasStarted)
                 showControls()
+            // Always reset status-bar swipe tracking when a gesture ends, even if a child view
+            // handled the event.
+            if (ev.actionMasked == MotionEvent.ACTION_UP || ev.actionMasked == MotionEvent.ACTION_CANCEL) {
+                statusBarSwipeCandidate = false
+                statusBarSwipeCanceledToggle = false
+            }
             if (ev.action == MotionEvent.ACTION_UP)
                 return true
         }
 
-        if (ev.actionMasked == MotionEvent.ACTION_UP && mightWantToToggleControls) {
+        if (ev.actionMasked == MotionEvent.ACTION_UP) {
+            // Reset status-bar swipe tracking.
+            statusBarSwipeCandidate = false
+            statusBarSwipeCanceledToggle = false
+
+            if (!mightWantToToggleControls)
+                return true
+
             // Defer toggling so a second tap (double-tap play/pause) can cancel it.
             scheduleSingleTapToggle()
             mightWantToToggleControls = false
@@ -861,6 +910,8 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
         if (ev.actionMasked == MotionEvent.ACTION_CANCEL) {
             cancelPendingTapToggle()
             mightWantToToggleControls = false
+            statusBarSwipeCandidate = false
+            statusBarSwipeCanceledToggle = false
         }
         return true
     }
@@ -2277,6 +2328,12 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
         private const val CONTROLS_FADE_DURATION = 500L
         // Delay single-tap UI toggling so double-tap play/pause won't show the controls.
         private const val TAP_TOGGLE_DELAY_MS = 300L
+
+        // Reserve the very top portion of the screen for Android system gestures (notification
+        // shade/status bar). We only suppress the tap-to-toggle if the finger *moves down*
+        // meaningfully from this region.
+        private const val STATUS_BAR_DEADZONE_PERCENT = 5f
+        private const val STATUS_BAR_SWIPE_CANCEL_DP = 16f
         // resolution (px) of the thumbnail displayed with playback notification
         private const val THUMB_SIZE = 384
         // smallest aspect ratio that is considered non-square
