@@ -65,6 +65,12 @@ abstract class BaseMPVView(context: Context, attrs: AttributeSet) : SurfaceView(
 
     private var voInUse: String = "gpu"
 
+    // When rotating, Android destroys/creates the Surface quickly. Disabling VO immediately causes a visible stutter.
+    // We delay it briefly and cancel if a new surface appears right away.
+    private var pendingDisableVo: Runnable? = null
+    private var voDisabled: Boolean = false
+
+
     /**
      * Sets the VO to use.
      * It is automatically disabled/enabled when the surface dis-/appears.
@@ -81,6 +87,12 @@ abstract class BaseMPVView(context: Context, attrs: AttributeSet) : SurfaceView(
     }
 
     override fun surfaceCreated(holder: SurfaceHolder) {
+        // If we were about to disable VO (rotation), cancel it so mpv can keep the same VO instance.
+        pendingDisableVo?.let {
+            removeCallbacks(it)
+            pendingDisableVo = null
+        }
+
         Log.w(TAG, "attaching surface")
         MPVLib.attachSurface(holder.surface)
         // This forces mpv to render subs/osd/whatever into our surface even if it would ordinarily not
@@ -90,20 +102,33 @@ abstract class BaseMPVView(context: Context, attrs: AttributeSet) : SurfaceView(
             MPVLib.command(arrayOf("loadfile", filePath as String))
             filePath = null
         } else {
-            // We disable video output when the context disappears, enable it back
-            MPVLib.setPropertyString("vo", voInUse)
+            // Re-enable video output only if we actually disabled it.
+            if (voDisabled) {
+                MPVLib.setPropertyString("vo", voInUse)
+                voDisabled = false
+            }
         }
     }
 
     override fun surfaceDestroyed(holder: SurfaceHolder) {
         Log.w(TAG, "detaching surface")
-        MPVLib.setPropertyString("vo", "null")
         MPVLib.setPropertyString("force-window", "no")
-        // Note that before calling detachSurface() we need to be sure that libmpv
-        // is done using the surface.
-        // FIXME: There could be a race condition here, because I don't think
-        // setting a property will wait for VO deinit.
+
+        // Detach the ANativeWindow immediately to stop rendering to a dead surface.
         MPVLib.detachSurface()
+
+        // Delay disabling the VO to avoid stutter during quick surface re-creation (e.g., rotation).
+        pendingDisableVo?.let { removeCallbacks(it) }
+        val r = Runnable {
+            try {
+                MPVLib.setPropertyString("vo", "null")
+            } finally {
+                voDisabled = true
+                pendingDisableVo = null
+            }
+        }
+        pendingDisableVo = r
+        postDelayed(r, 300)
     }
 
     companion object {
