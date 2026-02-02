@@ -24,6 +24,9 @@ import android.widget.ImageView
 import android.util.Log
 import android.media.AudioManager
 import android.media.MediaMetadataRetriever
+import android.media.MediaExtractor
+import android.media.MediaFormat
+import android.content.res.AssetFileDescriptor
 import android.net.Uri
 import android.os.*
 import android.preference.PreferenceManager.getDefaultSharedPreferences
@@ -334,6 +337,16 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
                 packageManager.hasSystemFeature(PackageManager.FEATURE_SCREEN_PORTRAIT)
             ) {
                 val probed = probeOrientationFromMetadata(filepath)
+
+                // Some containers/codecs don't expose width/height via Android's metadata APIs.
+                // For those local-ish files, fall back to a quick mpv-based probe (off the UI thread)
+                // and keep the UI hidden until the correct orientation is applied.
+                if (probed == ProbedOrientation.UNKNOWN && isLocalLikePath(filepath)) {
+                    beginDeferredStartup(filepath)
+                    startAsyncMpvStartupProbe(filepath)
+                    return
+                }
+
                 val desired = when (probed) {
                     ProbedOrientation.LANDSCAPE -> ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
                     ProbedOrientation.PORTRAIT -> ActivityInfo.SCREEN_ORIENTATION_SENSOR_PORTRAIT
@@ -2207,47 +2220,230 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
 
     private enum class ProbedOrientation { LANDSCAPE, PORTRAIT, SQUARE, UNKNOWN }
 
-    private fun probeOrientationFromMetadata(path: String): ProbedOrientation {
-        // Skip unsupported / remote schemes (mpv will update orientation later from video-params).
-        if (path.startsWith("http://") || path.startsWith("https://") ||
+    private fun isLocalLikePath(path: String): Boolean {
+        return !(path.startsWith("http://") || path.startsWith("https://") ||
             path.startsWith("rtsp://") || path.startsWith("rtmp://") ||
             path.startsWith("rtmps://") || path.startsWith("udp://") ||
             path.startsWith("tcp://") || path.startsWith("memory://") ||
-            path.startsWith("data://") || path.startsWith("lavf://")
-        ) return ProbedOrientation.UNKNOWN
+            path.startsWith("data://") || path.startsWith("lavf://"))
+    }
 
-        val mmr = MediaMetadataRetriever()
+    private fun beginDeferredStartup(filepath: String) {
+        startupFilePath = filepath
+        deferPlayerInit = true
+        // Avoid briefly showing the UI in the wrong orientation (portrait -> landscape flash).
+        // Show a simple black placeholder until Android applies the requested orientation.
+        window.decorView.setBackgroundColor(Color.BLACK)
+        setContentView(View(this).apply { setBackgroundColor(Color.BLACK) })
+    }
+
+    private fun startAsyncMpvStartupProbe(filepath: String) {
+        // If user backed out quickly or we already moved on, don't start.
+        if (isFinishing || finishPending)
+            return
+
+        Thread {
+            val probed = probeOrientationFromMpv(filepath)
+            eventUiHandler.post {
+                if (isFinishing || finishPending)
+                    return@post
+                if (startupFilePath != filepath || !deferPlayerInit)
+                    return@post
+
+                val desired = when (probed) {
+                    ProbedOrientation.LANDSCAPE -> ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
+                    ProbedOrientation.PORTRAIT -> ActivityInfo.SCREEN_ORIENTATION_SENSOR_PORTRAIT
+                    ProbedOrientation.SQUARE -> ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
+                    ProbedOrientation.UNKNOWN -> null
+                }
+
+                if (desired == null) {
+                    // Give up and start normally to avoid getting stuck behind a black screen.
+                    val fp = startupFilePath
+                    startupFilePath = null
+                    deferPlayerInit = false
+                    startupDesiredConfigOrientation = Configuration.ORIENTATION_UNDEFINED
+                    if (fp != null)
+                        setupUiAndStart(fp)
+                    return@post
+                }
+
+                // If we're already portrait and the app is not locked, don't force-lock portrait.
+                val skipPortrait =
+                    desired == ActivityInfo.SCREEN_ORIENTATION_SENSOR_PORTRAIT &&
+                        resources.configuration.orientation == Configuration.ORIENTATION_PORTRAIT &&
+                        requestedOrientation == ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
+
+                if (!skipPortrait && requestedOrientation != desired)
+                    requestedOrientation = desired
+
+                lastOrientationProbePath = filepath
+
+                startupDesiredConfigOrientation = when (desired) {
+                    ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE -> Configuration.ORIENTATION_LANDSCAPE
+                    ActivityInfo.SCREEN_ORIENTATION_SENSOR_PORTRAIT -> Configuration.ORIENTATION_PORTRAIT
+                    else -> Configuration.ORIENTATION_UNDEFINED
+                }
+
+                // If Android still needs to rotate, wait for onConfigurationChanged().
+                if (startupDesiredConfigOrientation != Configuration.ORIENTATION_UNDEFINED &&
+                    resources.configuration.orientation != startupDesiredConfigOrientation
+                ) return@post
+
+                // Orientation already applied; start now.
+                val fp = startupFilePath
+                startupFilePath = null
+                deferPlayerInit = false
+                startupDesiredConfigOrientation = Configuration.ORIENTATION_UNDEFINED
+                if (fp != null)
+                    setupUiAndStart(fp)
+            }
+        }.start()
+    }
+
+    private fun probeOrientationFromMpv(path: String, timeoutMs: Long = 1200L): ProbedOrientation {
+        // Only used as a fallback when Android metadata APIs fail.
+        var created = false
         try {
-            if (path.startsWith("content://")) {
-                mmr.setDataSource(this, Uri.parse(path))
-            } else if (path.startsWith("file://")) {
-                mmr.setDataSource(Uri.parse(path).path)
-            } else {
-                // Assume local filesystem path
-                mmr.setDataSource(path)
+            MPVLib.create(applicationContext)
+            created = true
+
+            // Keep this as lightweight as possible.
+            MPVLib.setOptionString("config", "no")
+            MPVLib.setOptionString("vo", "null")
+            MPVLib.setOptionString("ao", "null")
+            MPVLib.setOptionString("idle", "yes")
+            MPVLib.setOptionString("pause", "yes")
+            MPVLib.setOptionString("force-window", "no")
+
+            MPVLib.init()
+
+            MPVLib.command(arrayOf("loadfile", path, "replace"))
+
+            val start = SystemClock.uptimeMillis()
+            var ratio = 0.0
+            while (SystemClock.uptimeMillis() - start < timeoutMs) {
+                ratio = MPVLib.getPropertyDouble("video-params/aspect") ?: 0.0
+                if (ratio > 0.01)
+                    break
+
+                val w = MPVLib.getPropertyInt("video-params/w")
+                val h = MPVLib.getPropertyInt("video-params/h")
+                if (w != null && h != null && w > 0 && h > 0) {
+                    ratio = w.toDouble() / h.toDouble()
+                    if (ratio > 0.01)
+                        break
+                }
+
+                SystemClock.sleep(10)
             }
 
-            val w0 = mmr.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_WIDTH)?.toIntOrNull()
-            val h0 = mmr.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_HEIGHT)?.toIntOrNull()
-            if (w0 == null || h0 == null || w0 <= 0 || h0 <= 0)
+            try { MPVLib.command(arrayOf("stop")) } catch (_: Throwable) {}
+
+            if (ratio <= 0.01)
+                return ProbedOrientation.UNKNOWN
+            if (ratio in (1.0 / ASPECT_RATIO_MIN) .. ASPECT_RATIO_MIN)
+                return ProbedOrientation.SQUARE
+            return if (ratio > 1.0) ProbedOrientation.LANDSCAPE else ProbedOrientation.PORTRAIT
+        } catch (_: Throwable) {
+            return ProbedOrientation.UNKNOWN
+        } finally {
+            if (created) {
+                try { MPVLib.destroy() } catch (_: Throwable) {}
+            }
+        }
+    }
+
+    private fun probeOrientationFromMetadata(path: String): ProbedOrientation {
+        // Skip unsupported / remote schemes (mpv will update orientation later from video-params).
+        if (!isLocalLikePath(path))
+            return ProbedOrientation.UNKNOWN
+
+        fun decide(w0: Int, h0: Int, rot: Int): ProbedOrientation {
+            if (w0 <= 0 || h0 <= 0)
                 return ProbedOrientation.UNKNOWN
 
-            // Apply rotation metadata (common on phone recordings)
-            val rot = mmr.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_ROTATION)?.toIntOrNull() ?: 0
-            val (w, h) = if (rot % 180 != 0) Pair(h0, w0) else Pair(w0, h0)
+            // Some Android implementations already report rotated dimensions even when rotation metadata exists.
+            // Only swap when rotation suggests it AND the raw dimensions look rotated (portrait-like).
+            val swap = (rot % 180 != 0) && (w0 < h0)
+            val (w, h) = if (swap) Pair(h0, w0) else Pair(w0, h0)
 
             val ratio = w.toFloat() / h.toFloat()
             if (ratio == 0f || ratio in (1f / ASPECT_RATIO_MIN) .. ASPECT_RATIO_MIN)
                 return ProbedOrientation.SQUARE
             return if (ratio > 1f) ProbedOrientation.LANDSCAPE else ProbedOrientation.PORTRAIT
-        } catch (_: Throwable) {
-            return ProbedOrientation.UNKNOWN
-        } finally {
-            try { mmr.release() } catch (_: Throwable) {}
         }
+
+        // 1) Try MediaMetadataRetriever (fast path)
+        run {
+            val mmr = MediaMetadataRetriever()
+            try {
+                if (path.startsWith("content://")) {
+                    mmr.setDataSource(this, Uri.parse(path))
+                } else if (path.startsWith("file://")) {
+                    mmr.setDataSource(Uri.parse(path).path)
+                } else {
+                    mmr.setDataSource(path)
+                }
+
+                val w0 = mmr.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_WIDTH)?.toIntOrNull()
+                val h0 = mmr.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_HEIGHT)?.toIntOrNull()
+                if (w0 != null && h0 != null && w0 > 0 && h0 > 0) {
+                    val rot = mmr.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_ROTATION)?.toIntOrNull() ?: 0
+                    return decide(w0, h0, rot)
+                }
+            } catch (_: Throwable) {
+                // fall through
+            } finally {
+                try { mmr.release() } catch (_: Throwable) {}
+            }
+        }
+
+        // 2) Try MediaExtractor (works for some formats where retriever fails)
+        run {
+            val extractor = MediaExtractor()
+            var afd: AssetFileDescriptor? = null
+            try {
+                if (path.startsWith("content://")) {
+                    val uri = Uri.parse(path)
+                    afd = contentResolver.openAssetFileDescriptor(uri, "r")
+                    if (afd != null) {
+                        extractor.setDataSource(afd!!.fileDescriptor, afd!!.startOffset, afd!!.length)
+                    } else {
+                        return@run
+                    }
+                } else if (path.startsWith("file://")) {
+                    extractor.setDataSource(Uri.parse(path).path!!)
+                } else {
+                    extractor.setDataSource(path)
+                }
+
+                for (i in 0 until extractor.trackCount) {
+                    val fmt = extractor.getTrackFormat(i)
+                    val mime = fmt.getString(MediaFormat.KEY_MIME) ?: continue
+                    if (!mime.startsWith("video/"))
+                        continue
+
+                    val w0 = if (fmt.containsKey(MediaFormat.KEY_WIDTH)) fmt.getInteger(MediaFormat.KEY_WIDTH) else -1
+                    val h0 = if (fmt.containsKey(MediaFormat.KEY_HEIGHT)) fmt.getInteger(MediaFormat.KEY_HEIGHT) else -1
+                    val rot = if (fmt.containsKey("rotation-degrees")) fmt.getInteger("rotation-degrees") else 0
+
+                    val res = decide(w0, h0, rot)
+                    if (res != ProbedOrientation.UNKNOWN)
+                        return res
+                }
+            } catch (_: Throwable) {
+                // fall through
+            } finally {
+                try { extractor.release() } catch (_: Throwable) {}
+                try { afd?.close() } catch (_: Throwable) {}
+            }
+        }
+
+        return ProbedOrientation.UNKNOWN
     }
 
-    private fun applyOrientationFromMetadata(path: String, isStartup: Boolean = false) {
+    private fun applyOrientationFromMetadata(path: String, isStartup: Boolean = false) {(path: String, isStartup: Boolean = false) {
         // screen orientation is fixed (Android TV)
         if (!packageManager.hasSystemFeature(PackageManager.FEATURE_SCREEN_PORTRAIT))
             return
