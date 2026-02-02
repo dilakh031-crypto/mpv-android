@@ -100,7 +100,7 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
     private var startupFilePath: String? = null
     private var startupDesiredConfigOrientation: Int = Configuration.ORIENTATION_UNDEFINED
     private var deferPlayerInit: Boolean = false
-    private var uiReadyForPlayback: Boolean = false
+    private var uiInitialized: Boolean = false
 
     // Optional startup preview to avoid a brief black frame while mpv starts
     private var startupPreviewOverlay: ImageView? = null
@@ -366,46 +366,59 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
                 }
             }
 
-            setContentView(binding.root)
-            uiReadyForPlayback = true
-
-            // Init controls to be hidden and view fullscreen
-            hideControls()
-
-            // Initialize listeners for the player view
-            initListeners()
-
-            // Read full settings and update UI
-            readSettings()
-            onConfigurationChanged(resources.configuration)
-
-            // Edge-to-edge / immersive behavior
-            WindowCompat.setDecorFitsSystemWindows(window, false)
-            val insetsController = WindowCompat.getInsetsController(window, window.decorView)
-            insetsController.systemBarsBehavior = WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
-
-            // Hide PiP / lock buttons on devices that don't support them
-            if (!packageManager.hasSystemFeature(PackageManager.FEATURE_PICTURE_IN_PICTURE))
-                binding.topPiPBtn.visibility = View.GONE
-            if (!packageManager.hasSystemFeature(PackageManager.FEATURE_TOUCHSCREEN))
-                binding.topLockBtn.visibility = View.GONE
-
-            if (showMediaTitle)
-                binding.controlsTitleGroup.visibility = View.VISIBLE
-
-            updateOrientation(true)
-
-            // Best-effort: show a preview frame while mpv starts to avoid a brief black flash.
-            try { showStartupPreview(filepath) } catch (_: Throwable) {}
-
             if (deferPlayerInit) {
                 startupFilePath = filepath
-                // If orientation already applied by now, start immediately.
-                maybeStartDeferredPlayback()
-            } else {
-                startPlayback(filepath)
+
+                // Avoid briefly showing the UI in the wrong orientation (portrait -> landscape flash).
+                // Show a simple black placeholder until Android applies the requested orientation.
+                window.decorView.setBackgroundColor(Color.BLACK)
+                setContentView(View(this).apply { setBackgroundColor(Color.BLACK) })
+                return
             }
+
+            setupUiAndStart(filepath)
         }
+
+    private fun setupUiAndStart(filepath: String) {
+        if (uiInitialized)
+            return
+
+        setContentView(binding.root)
+        uiInitialized = true
+
+        // Init controls to be hidden and view fullscreen
+        hideControls()
+
+        // Initialize listeners for the player view
+        initListeners()
+
+        // Read full settings and update UI
+        readSettings()
+        onConfigurationChanged(resources.configuration)
+
+        // Edge-to-edge / immersive behavior
+        WindowCompat.setDecorFitsSystemWindows(window, false)
+        val insetsController = WindowCompat.getInsetsController(window, window.decorView)
+        insetsController.systemBarsBehavior =
+            WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+
+        // Hide PiP / lock buttons on devices that don't support them
+        if (!packageManager.hasSystemFeature(PackageManager.FEATURE_PICTURE_IN_PICTURE))
+            binding.topPiPBtn.visibility = View.GONE
+        if (!packageManager.hasSystemFeature(PackageManager.FEATURE_TOUCHSCREEN))
+            binding.topLockBtn.visibility = View.GONE
+
+        if (showMediaTitle)
+            binding.controlsTitleGroup.visibility = View.VISIBLE
+
+        updateOrientation(true)
+
+        // Best-effort: show a preview frame while mpv starts to avoid a brief black flash.
+        try { showStartupPreview(filepath) } catch (_: Throwable) {}
+
+        startPlayback(filepath)
+    }
+
 
     private var playbackInitialized: Boolean = false
 
@@ -433,18 +446,22 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
     }
 
     private fun maybeStartDeferredPlayback() {
-        if (!uiReadyForPlayback)
-            return
         if (!deferPlayerInit)
             return
 
         val desired = startupDesiredConfigOrientation
         if (desired == Configuration.ORIENTATION_UNDEFINED || resources.configuration.orientation == desired) {
-            deferPlayerInit = false
+            // Clear the deferred state FIRST to avoid re-entrancy if we call onConfigurationChanged() manually.
             val fp = startupFilePath
             startupFilePath = null
-            if (fp != null)
-                startPlayback(fp)
+            deferPlayerInit = false
+
+            if (fp != null) {
+                if (!uiInitialized)
+                    setupUiAndStart(fp)
+                else
+                    startPlayback(fp)
+            }
         }
     }
 
@@ -1316,19 +1333,21 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
             zoomGestures.setMetrics(dm.widthPixels.toFloat(), dm.heightPixels.toFloat())
         }
 
-        // Adjust control margins
-        binding.controls.updateLayoutParams<MarginLayoutParams> {
-            bottomMargin = if (!controlsAtBottom) {
-                Utils.convertDp(this@MPVActivity, 60f)
-            } else {
-                0
+        // Adjust control margins (only after the player UI is attached)
+        if (uiInitialized) {
+            binding.controls.updateLayoutParams<MarginLayoutParams> {
+                bottomMargin = if (!controlsAtBottom) {
+                    Utils.convertDp(this@MPVActivity, 60f)
+                } else {
+                    0
+                }
+                leftMargin = if (!controlsAtBottom) {
+                    Utils.convertDp(this@MPVActivity, if (isLandscape) 60f else 24f)
+                } else {
+                    0
+                }
+                rightMargin = leftMargin
             }
-            leftMargin = if (!controlsAtBottom) {
-                Utils.convertDp(this@MPVActivity, if (isLandscape) 60f else 24f)
-            } else {
-                0
-            }
-            rightMargin = leftMargin
         }
 
         // If we deferred startup playback until the forced orientation is applied, start now.
