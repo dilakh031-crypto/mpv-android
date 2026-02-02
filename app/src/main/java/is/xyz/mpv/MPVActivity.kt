@@ -2443,7 +2443,7 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
         return ProbedOrientation.UNKNOWN
     }
 
-    private fun applyOrientationFromMetadata(path: String, isStartup: Boolean = false) {(path: String, isStartup: Boolean = false) {
+    private fun applyOrientationFromMetadata(path: String, isStartup: Boolean = false) {
         // screen orientation is fixed (Android TV)
         if (!packageManager.hasSystemFeature(PackageManager.FEATURE_SCREEN_PORTRAIT))
             return
