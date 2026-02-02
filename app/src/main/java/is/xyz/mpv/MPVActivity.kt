@@ -2342,7 +2342,7 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
 
             if (ratio <= 0.01)
                 return ProbedOrientation.UNKNOWN
-            if (ratio in (1.0 / ASPECT_RATIO_MIN) .. ASPECT_RATIO_MIN)
+            if (ratio in (1.0 / ASPECT_RATIO_MIN.toDouble()) .. ASPECT_RATIO_MIN.toDouble())
                 return ProbedOrientation.SQUARE
             return if (ratio > 1.0) ProbedOrientation.LANDSCAPE else ProbedOrientation.PORTRAIT
         } catch (_: Throwable) {
@@ -2443,7 +2443,7 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
         return ProbedOrientation.UNKNOWN
     }
 
-    private fun applyOrientationFromMetadata(path: String, isStartup: Boolean = false) {
+    private fun applyOrientationFromMetadata(path: String, isStartup: Boolean = false) {(path: String, isStartup: Boolean = false) {
         // screen orientation is fixed (Android TV)
         if (!packageManager.hasSystemFeature(PackageManager.FEATURE_SCREEN_PORTRAIT))
             return
