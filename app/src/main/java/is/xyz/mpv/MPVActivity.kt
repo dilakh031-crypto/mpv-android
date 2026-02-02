@@ -2342,7 +2342,10 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
 
             if (ratio <= 0.01)
                 return ProbedOrientation.UNKNOWN
-            if (ratio in (1.0 / ASPECT_RATIO_MIN.toDouble()) .. ASPECT_RATIO_MIN.toDouble())
+            // ASPECT_RATIO_MIN is Float (used elsewhere with Float aspect), but ratio here is Double.
+            // Keep the constant as-is and compare in Double space.
+            val minAr = ASPECT_RATIO_MIN.toDouble()
+            if (ratio in (1.0 / minAr) .. minAr)
                 return ProbedOrientation.SQUARE
             return if (ratio > 1.0) ProbedOrientation.LANDSCAPE else ProbedOrientation.PORTRAIT
         } catch (_: Throwable) {
