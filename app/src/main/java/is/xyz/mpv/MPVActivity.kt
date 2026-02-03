@@ -1651,8 +1651,8 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
     val selectedIndex = tracks.indexOfFirst { it.mpvId == selectedMpvId }
     val restore = pauseForDialog()
 
-    var handled = false
-    val dialog = with (AlertDialog.Builder(this)) {
+    lateinit var dialog: AlertDialog
+    dialog = with(AlertDialog.Builder(this)) {
         setSingleChoiceItems(tracks.map { it.name }.toTypedArray(), selectedIndex) { _, item ->
             val trackId = tracks[item].mpvId
 
@@ -1661,21 +1661,27 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
                 try { rememberSubtitleSelectionForCurrentFile() } catch (_: Throwable) {}
             }
             trackSwitchNotification { TrackData(trackId, type) }
-            // Keep dialog open (apply-in-place).
+
+            // Refresh visual checkmark immediately (dialog stays open).
+            dialog.listView.setItemChecked(item, true)
+            dialog.listView.invalidateViews()
         }
-        setNegativeButton(R.string.dialog_cancel) { d, _ -> d.cancel() }
-        setOnCancelListener {
-            handled = true
-            restore()
-        }
-        setOnDismissListener {
-            if (!handled)
-                restore()
-        }
+        setNegativeButton(R.string.dialog_cancel, null)
         create()
     }
+
+    dialog.setCanceledOnTouchOutside(true)
+    installDialogNavigation(
+        dialog,
+        onBack = { restore() },
+        onOutsideTap = { restore() },
+        treatDismissAsBack = true
+    )
+    dialog.setOnShowListener { applyImmersiveForDialog(dialog) }
     dialog.show()
 }
+
+
 
 private fun pickAudio() = selectTrack("audio", { player.aid }, { player.aid = it })
 
@@ -1683,7 +1689,6 @@ private fun pickAudio() = selectTrack("audio", { player.aid }, { player.aid = it
     val restore = pauseForDialog()
     val impl = SubTrackDialog(player)
     lateinit var dialog: AlertDialog
-    var handled = false
 
     impl.listener = { it, secondary ->
         if (secondary)
@@ -1695,24 +1700,29 @@ private fun pickAudio() = selectTrack("audio", { player.aid }, { player.aid = it
             try { rememberSubtitleSelectionForCurrentFile() } catch (_: Throwable) {}
         }
         trackSwitchNotification { TrackData(it.mpvId, SubTrackDialog.TRACK_TYPE) }
-        // Keep dialog open (apply-in-place).
+
+        // Refresh selection UI immediately (dialog stays open).
+        impl.refresh()
     }
 
     dialog = with(AlertDialog.Builder(this)) {
         val inflater = LayoutInflater.from(context)
         setView(impl.buildView(inflater))
-        setOnCancelListener {
-            handled = true
-            restore()
-        }
-        setOnDismissListener {
-            if (!handled)
-                restore()
-        }
         create()
     }
+
+    dialog.setCanceledOnTouchOutside(true)
+    installDialogNavigation(
+        dialog,
+        onBack = { restore() },
+        onOutsideTap = { restore() },
+        treatDismissAsBack = true
+    )
+    dialog.setOnShowListener { applyImmersiveForDialog(dialog) }
     dialog.show()
 }
+
+
 
 private fun openPlaylistMenu(restore: StateRestoreCallback, onBack: (() -> Unit)? = null) {
     val impl = PlaylistDialog(player)
@@ -1720,6 +1730,13 @@ private fun openPlaylistMenu(restore: StateRestoreCallback, onBack: (() -> Unit)
 
     val backAction: () -> Unit = onBack ?: restore
     var handled = false
+
+    fun exitAllToVideo() {
+        if (handled) return
+        handled = true
+        restore()
+        if (::dialog.isInitialized) dialog.dismiss()
+    }
 
     impl.listeners = object : PlaylistDialog.Listeners {
         private fun openFilePicker(skip: Int) {
@@ -1735,13 +1752,27 @@ private fun openPlaylistMenu(restore: StateRestoreCallback, onBack: (() -> Unit)
 
         override fun openUrl() {
             val helper = Utils.OpenUrlDialog(this@MPVActivity)
-            // Apply without closing (stay in the URL dialog so the user can add multiple entries).
-            val urlDialog = with(helper) {
+
+            lateinit var urlDialog: AlertDialog
+            urlDialog = with(helper) {
                 builder.setPositiveButton(R.string.dialog_ok, null)
-                builder.setNegativeButton(R.string.dialog_cancel) { d, _ -> d.cancel() }
+                builder.setNegativeButton(R.string.dialog_cancel, null)
                 create()
             }
+
+            // Back/cancel should return to the playlist (just close this dialog),
+            // but outside-tap must exit directly to video (close everything).
+            urlDialog.setCanceledOnTouchOutside(true)
+            installDialogNavigation(
+                urlDialog,
+                onBack = { /* no-op */ },
+                onOutsideTap = { exitAllToVideo() },
+                treatDismissAsBack = false
+            )
+
             urlDialog.setOnShowListener {
+                applyImmersiveForDialog(urlDialog)
+
                 urlDialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener {
                     val url = helper.text
                     if (url.isNotBlank()) {
@@ -1749,6 +1780,9 @@ private fun openPlaylistMenu(restore: StateRestoreCallback, onBack: (() -> Unit)
                         impl.refresh()
                     }
                     // Keep dialog open.
+                }
+                urlDialog.getButton(AlertDialog.BUTTON_NEGATIVE).setOnClickListener {
+                    urlDialog.dismiss()
                 }
             }
             urlDialog.show()
@@ -1764,19 +1798,40 @@ private fun openPlaylistMenu(restore: StateRestoreCallback, onBack: (() -> Unit)
     dialog = with(AlertDialog.Builder(this)) {
         val inflater = LayoutInflater.from(context)
         setView(impl.buildView(inflater))
+        create()
+    }
 
-        setOnCancelListener {
+    dialog.setCanceledOnTouchOutside(true)
+
+    // Back key navigates up, outside-tap exits to video.
+    dialog.setOnKeyListener { _, keyCode, event ->
+        if (keyCode == KeyEvent.KEYCODE_BACK && event.action == KeyEvent.ACTION_UP) {
+            handled = true
+            runIfActive(backAction)
+            dialog.dismiss()
+            true
+        } else {
+            false
+        }
+    }
+    dialog.setOnCancelListener {
+        if (!handled) {
+            handled = true
+            restore()
+        }
+    }
+    dialog.setOnDismissListener {
+        if (!handled) {
             handled = true
             runIfActive(backAction)
         }
-        setOnDismissListener {
-            if (!handled)
-                runIfActive(backAction)
-        }
-        create()
     }
+
+    dialog.setOnShowListener { applyImmersiveForDialog(dialog) }
     dialog.show()
 }
+
+
 
 private fun pickDecoder() {
     val restore = pauseForDialog()
@@ -1791,25 +1846,30 @@ private fun pickDecoder() {
     val hwdecActive = player.hwdecActive
     val selectedIndex = items.indexOfFirst { it.second == hwdecActive }
 
-    var handled = false
-    val dialog = with(AlertDialog.Builder(this)) {
+    lateinit var dialog: AlertDialog
+    dialog = with(AlertDialog.Builder(this)) {
         setSingleChoiceItems(items.map { it.first }.toTypedArray(), selectedIndex) { _, idx ->
             MPVLib.setPropertyString("hwdec", items[idx].second)
-            // Keep dialog open (apply-in-place).
+            // Refresh visual checkmark immediately (dialog stays open).
+            dialog.listView.setItemChecked(idx, true)
+            dialog.listView.invalidateViews()
         }
-        setNegativeButton(R.string.dialog_cancel) { d, _ -> d.cancel() }
-        setOnCancelListener {
-            handled = true
-            restore()
-        }
-        setOnDismissListener {
-            if (!handled)
-                restore()
-        }
+        setNegativeButton(R.string.dialog_cancel, null)
         create()
     }
+
+    dialog.setCanceledOnTouchOutside(true)
+    installDialogNavigation(
+        dialog,
+        onBack = { restore() },
+        onOutsideTap = { restore() },
+        treatDismissAsBack = true
+    )
+    dialog.setOnShowListener { applyImmersiveForDialog(dialog) }
     dialog.show()
 }
+
+
 
 private fun cycleSpeed() {
         player.cycleSpeed()
@@ -1820,9 +1880,7 @@ private fun cycleSpeed() {
         val picker = SpeedPickerDialog()
 
         val restore = pauseForDialog()
-        genericPickerDialog(picker, R.string.title_speed_dialog, "speed") {
-            restore()
-        }
+        genericPickerDialog(picker, R.string.title_speed_dialog, "speed", onBack = { restore() }, onOutsideTap = { restore() })
     }
 
     private fun goIntoPiP() {
@@ -1856,11 +1914,78 @@ private inline fun runIfActive(block: () -> Unit) {
     if (!isFinishing && !isDestroyed) block()
 }
 
+
+private fun applyImmersiveToWindow(w: Window?) {
+    if (w == null) return
+    WindowCompat.setDecorFitsSystemWindows(w, false)
+    val controller = WindowCompat.getInsetsController(w, w.decorView)
+    controller.systemBarsBehavior =
+        WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+    controller.hide(WindowInsetsCompat.Type.systemBars())
+
+    // Some devices re-show bars when focus changes (e.g., dialogs). Re-apply on next frame.
+    w.decorView.post {
+        val c = WindowCompat.getInsetsController(w, w.decorView)
+        c.systemBarsBehavior =
+            WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+        c.hide(WindowInsetsCompat.Type.systemBars())
+    }
+}
+
+private fun applyImmersiveForDialog(dialog: AlertDialog) {
+    // Keep the activity immersive too, in case Android shows system bars while dialogs are focused.
+    applyImmersiveToWindow(window)
+    applyImmersiveToWindow(dialog.window)
+}
+
+/**
+ * Back key navigates up via [onBack]. Outside-tap always exits straight back to video via [onOutsideTap].
+ *
+ * Note: Negative buttons usually dismiss (not cancel) -> treated as "back/up" when [treatDismissAsBack] is true.
+ */
+private fun installDialogNavigation(
+    dialog: AlertDialog,
+    onBack: () -> Unit,
+    onOutsideTap: () -> Unit,
+    treatDismissAsBack: Boolean = true
+) {
+    var handled = false
+
+    dialog.setOnKeyListener { _, keyCode, event ->
+        if (keyCode == KeyEvent.KEYCODE_BACK && event.action == KeyEvent.ACTION_UP) {
+            handled = true
+            runIfActive(onBack)
+            dialog.dismiss()
+            true
+        } else {
+            false
+        }
+    }
+
+    dialog.setOnCancelListener {
+        // Cancel is triggered by outside-tap (and sometimes other cancel sources).
+        if (!handled) {
+            handled = true
+            runIfActive(onOutsideTap)
+        }
+    }
+
+    if (treatDismissAsBack) {
+        dialog.setOnDismissListener {
+            if (!handled) {
+                handled = true
+                runIfActive(onBack)
+            }
+        }
+    }
+}
+
 private fun genericMenu(
     @LayoutRes layoutRes: Int,
     buttons: List<MenuItem>,
     hiddenButtons: Set<Int>,
-    onBack: () -> Unit
+    onBack: () -> Unit,
+    onOutsideTap: () -> Unit
 ) {
     lateinit var dialog: AlertDialog
 
@@ -1872,7 +1997,6 @@ private fun genericMenu(
         buttonView.setOnClickListener {
             button.handler()
             if (button.dismiss) {
-                if (button.restoreOnDismiss) runIfActive(onBack)
                 dialog.dismiss()
             }
         }
@@ -1888,14 +2012,23 @@ private fun genericMenu(
 
     Utils.handleInsetsAsPadding(dialogView)
 
-    with(builder) {
+    dialog = with(builder) {
         setView(dialogView)
-        // Back/outside-tap should navigate "up" in the menu stack.
-        setOnCancelListener { runIfActive(onBack) }
-        dialog = create()
+        create()
     }
+
+    dialog.setCanceledOnTouchOutside(true)
+    installDialogNavigation(
+        dialog,
+        onBack = onBack,
+        onOutsideTap = onOutsideTap,
+        treatDismissAsBack = false
+    )
+    dialog.setOnShowListener { applyImmersiveForDialog(dialog) }
     dialog.show()
 }
+
+
 
     private fun openTopMenu(existingRestoreState: StateRestoreCallback? = null) {
     val restoreState = existingRestoreState ?: pauseForDialog()
@@ -1918,40 +2051,42 @@ private fun genericMenu(
     }
 
     fun openChapterListDialog() {
-        val chapters = player.loadChapters()
-        if (chapters.isEmpty()) {
-            // Nothing to show; just stay in the top menu.
-            openTopMenu(restoreState)
-            return
-        }
-        val chapterArray = chapters.map {
-            val timecode = Utils.prettyTime(it.time.roundToInt())
-            if (!it.title.isNullOrEmpty())
-                getString(R.string.ui_chapter, it.title, timecode)
-            else
-                getString(R.string.ui_chapter_fallback, it.index + 1, timecode)
-        }.toTypedArray()
-
-        val selectedIndex = MPVLib.getPropertyInt("chapter") ?: 0
-        var handled = false
-        val dialog = with(AlertDialog.Builder(this)) {
-            setTitle(R.string.chapter_button)
-            setSingleChoiceItems(chapterArray, selectedIndex) { _, item ->
-                MPVLib.setPropertyInt("chapter", chapters[item].index)
-            }
-            setNegativeButton(R.string.dialog_cancel) { d, _ -> d.cancel() }
-            setOnCancelListener {
-                handled = true
-                openTopMenu(restoreState)
-            }
-            setOnDismissListener {
-                if (!handled)
-                    openTopMenu(restoreState)
-            }
-            create()
-        }
-        dialog.show()
+    val chapters = player.loadChapters()
+    if (chapters.isEmpty()) {
+        // Nothing to show; just stay in the top menu.
+        openTopMenu(restoreState)
+        return
     }
+    val chapterArray = chapters.map {
+        val timecode = Utils.prettyTime(it.time.roundToInt())
+        if (!it.title.isNullOrEmpty())
+            getString(R.string.ui_chapter, it.title, timecode)
+        else
+            getString(R.string.ui_chapter_fallback, it.index + 1, timecode)
+    }.toTypedArray()
+
+    val selectedIndex = MPVLib.getPropertyInt("chapter") ?: 0
+    val dialog = with(AlertDialog.Builder(this)) {
+        setTitle(R.string.chapter_button)
+        setSingleChoiceItems(chapterArray, selectedIndex) { _, item ->
+            MPVLib.setPropertyInt("chapter", chapters[item].index)
+            // Keep dialog open (apply-in-place).
+        }
+        setNegativeButton(R.string.dialog_cancel, null)
+        create()
+    }
+
+    dialog.setCanceledOnTouchOutside(true)
+    installDialogNavigation(
+        dialog,
+        onBack = { openTopMenu(restoreState) },
+        onOutsideTap = { restoreState() },
+        treatDismissAsBack = true
+    )
+    dialog.setOnShowListener { applyImmersiveForDialog(dialog) }
+    dialog.show()
+}
+
 
     /******/
     val hiddenButtons = mutableSetOf<Int>()
@@ -2002,17 +2137,17 @@ private fun genericMenu(
         hiddenButtons.add(R.id.rowChapter)
     /******/
 
-    genericMenu(R.layout.dialog_top_menu, buttons, hiddenButtons) { restoreState() }
+    genericMenu(R.layout.dialog_top_menu, buttons, hiddenButtons, onBack = { restoreState() }, onOutsideTap = { restoreState() })
 }
 
     private fun genericPickerDialog(
     picker: PickerDialog,
     @StringRes titleRes: Int,
     property: String,
-    onBack: () -> Unit
+    onBack: () -> Unit,
+    onOutsideTap: () -> Unit
 ) {
     lateinit var dialog: AlertDialog
-    var handled = false
 
     dialog = with(AlertDialog.Builder(this)) {
         setTitle(titleRes)
@@ -2021,23 +2156,23 @@ private fun genericMenu(
 
         // Apply without closing: we'll override the click listener after show().
         setPositiveButton(R.string.dialog_ok, null)
-        setNegativeButton(R.string.dialog_cancel) { d, _ -> d.cancel() }
-
-        setOnCancelListener {
-            handled = true
-            runIfActive(onBack)
-        }
-        // Fallback for non-cancel dismissals.
-        setOnDismissListener {
-            if (!handled)
-                runIfActive(onBack)
-        }
+        setNegativeButton(R.string.dialog_cancel, null)
         create()
     }
 
     picker.number = MPVLib.getPropertyDouble(property)
 
+    dialog.setCanceledOnTouchOutside(true)
+    installDialogNavigation(
+        dialog,
+        onBack = onBack,
+        onOutsideTap = onOutsideTap,
+        treatDismissAsBack = true
+    )
+
     dialog.setOnShowListener {
+        applyImmersiveForDialog(dialog)
+
         dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener {
             picker.number?.let {
                 if (picker.isInteger())
@@ -2047,89 +2182,104 @@ private fun genericMenu(
             }
             // Keep dialog open (apply-in-place).
         }
+        dialog.getButton(AlertDialog.BUTTON_NEGATIVE).setOnClickListener {
+            dialog.dismiss() // treated as "back/up"
+        }
     }
 
     dialog.show()
 }
 
+
+
 private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
     fun openAspectRatioDialog() {
-        val ratios = resources.getStringArray(R.array.aspect_ratios)
-        val names = resources.getStringArray(R.array.aspect_ratio_names)
+    val ratios = resources.getStringArray(R.array.aspect_ratios)
+    val names = resources.getStringArray(R.array.aspect_ratio_names)
 
-        val currentPanscan = MPVLib.getPropertyDouble("panscan") ?: 0.0
-        val currentOverride = MPVLib.getPropertyString("video-aspect-override") ?: ""
-        val panscanIndex = ratios.indexOf("panscan")
-        var selectedIndex = if (currentPanscan > 0.0 && panscanIndex >= 0) {
-            panscanIndex
-        } else {
-            ratios.indexOf(currentOverride)
-        }
-        if (selectedIndex < 0) selectedIndex = 0
-
-        var handled = false
-        val dialog = with(AlertDialog.Builder(this)) {
-            setSingleChoiceItems(names, selectedIndex) { _, item ->
-                if (ratios[item] == "panscan") {
-                    MPVLib.setPropertyString("video-aspect-override", "-1")
-                    MPVLib.setPropertyDouble("panscan", 1.0)
-                } else {
-                    MPVLib.setPropertyString("video-aspect-override", ratios[item])
-                    MPVLib.setPropertyDouble("panscan", 0.0)
-                }
-                // Keep dialog open (apply-in-place).
-            }
-            setNegativeButton(R.string.dialog_cancel) { d, _ -> d.cancel() }
-            setOnCancelListener {
-                handled = true
-                openAdvancedMenu(restoreState)
-            }
-            setOnDismissListener {
-                if (!handled)
-                    openAdvancedMenu(restoreState)
-            }
-            create()
-        }
-        dialog.show()
+    val currentPanscan = MPVLib.getPropertyDouble("panscan") ?: 0.0
+    val currentOverride = MPVLib.getPropertyString("video-aspect-override") ?: ""
+    val panscanIndex = ratios.indexOf("panscan")
+    var selectedIndex = if (currentPanscan > 0.0 && panscanIndex >= 0) {
+        panscanIndex
+    } else {
+        ratios.indexOf(currentOverride)
     }
+    if (selectedIndex < 0) selectedIndex = 0
+
+    lateinit var dialog: AlertDialog
+    dialog = with(AlertDialog.Builder(this)) {
+        setSingleChoiceItems(names, selectedIndex) { _, item ->
+            if (ratios[item] == "panscan") {
+                MPVLib.setPropertyString("video-aspect-override", "-1")
+                MPVLib.setPropertyDouble("panscan", 1.0)
+            } else {
+                MPVLib.setPropertyString("video-aspect-override", ratios[item])
+                MPVLib.setPropertyDouble("panscan", 0.0)
+            }
+            // Keep dialog open (apply-in-place).
+            dialog.listView.setItemChecked(item, true)
+            dialog.listView.invalidateViews()
+        }
+        setNegativeButton(R.string.dialog_cancel, null)
+        create()
+    }
+
+    dialog.setCanceledOnTouchOutside(true)
+    installDialogNavigation(
+        dialog,
+        onBack = { openAdvancedMenu(restoreState) },
+        onOutsideTap = { restoreState() },
+        treatDismissAsBack = true
+    )
+    dialog.setOnShowListener { applyImmersiveForDialog(dialog) }
+    dialog.show()
+}
+
+
 
     fun openSubDelayDialog() {
-        val picker = SubDelayDialog(-600.0, 600.0)
-        lateinit var dialog: AlertDialog
-        var handled = false
+    val picker = SubDelayDialog(-600.0, 600.0)
+    lateinit var dialog: AlertDialog
 
-        dialog = with(AlertDialog.Builder(this)) {
-            setTitle(R.string.sub_delay)
-            val inflater = LayoutInflater.from(context)
-            setView(picker.buildView(inflater))
+    dialog = with(AlertDialog.Builder(this)) {
+        setTitle(R.string.sub_delay)
+        val inflater = LayoutInflater.from(context)
+        setView(picker.buildView(inflater))
 
-            setPositiveButton(R.string.dialog_ok, null)
-            setNegativeButton(R.string.dialog_cancel) { d, _ -> d.cancel() }
-
-            setOnCancelListener {
-                handled = true
-                openAdvancedMenu(restoreState)
-            }
-            setOnDismissListener {
-                if (!handled)
-                    openAdvancedMenu(restoreState)
-            }
-            create()
-        }
-
-        picker.delay1 = player.subDelay ?: 0.0
-        picker.delay2 = if (player.secondarySid != -1) player.secondarySubDelay else null
-
-        dialog.setOnShowListener {
-            dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener {
-                picker.delay1?.let { player.subDelay = it }
-                picker.delay2?.let { player.secondarySubDelay = it }
-                // Keep dialog open (apply-in-place).
-            }
-        }
-
-        dialog.show()
+        setPositiveButton(R.string.dialog_ok, null)
+        setNegativeButton(R.string.dialog_cancel, null)
+        create()
     }
+
+    picker.delay1 = player.subDelay ?: 0.0
+    picker.delay2 = if (player.secondarySid != -1) player.secondarySubDelay else null
+
+    dialog.setCanceledOnTouchOutside(true)
+    installDialogNavigation(
+        dialog,
+        onBack = { openAdvancedMenu(restoreState) },
+        onOutsideTap = { restoreState() },
+        treatDismissAsBack = true
+    )
+
+    dialog.setOnShowListener {
+        applyImmersiveForDialog(dialog)
+
+        dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener {
+            picker.delay1?.let { player.subDelay = it }
+            picker.delay2?.let { player.secondarySubDelay = it }
+            // Keep dialog open (apply-in-place).
+        }
+        dialog.getButton(AlertDialog.BUTTON_NEGATIVE).setOnClickListener {
+            dialog.dismiss() // treated as "back/up"
+        }
+    }
+
+    dialog.show()
+}
+
+
 
     /******/
     val hiddenButtons = mutableSetOf<Int>()
@@ -2162,18 +2312,14 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
     basicIds.forEachIndexed { index, id ->
         buttons.add(MenuItem(id, dismiss = true) {
             val slider = SliderPickerDialog(-100.0, 100.0, 1, R.string.format_fixed_number)
-            genericPickerDialog(slider, basicTitles[index], basicProps[index]) {
-                openAdvancedMenu(restoreState)
-            }
+            genericPickerDialog(slider, basicTitles[index], basicProps[index], onBack = { openAdvancedMenu(restoreState) }, onOutsideTap = { restoreState() })
         })
     }
 
     // audio delay get a decimal picker
     buttons.add(MenuItem(R.id.audioDelayBtn, dismiss = true) {
         val picker = DecimalPickerDialog(-600.0, 600.0)
-        genericPickerDialog(picker, R.string.audio_delay, "audio-delay") {
-            openAdvancedMenu(restoreState)
-        }
+        genericPickerDialog(picker, R.string.audio_delay, "audio-delay", onBack = { openAdvancedMenu(restoreState) }, onOutsideTap = { restoreState() })
     })
 
     // sub delay (primary/secondary) dialog
@@ -2189,9 +2335,13 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
         hiddenButtons.addAll(arrayOf(R.id.subDelayBtn, R.id.rowSubSeek))
     /******/
 
-    genericMenu(R.layout.dialog_advanced_menu, buttons, hiddenButtons) {
-        openTopMenu(restoreState)
-    }
+    genericMenu(
+        R.layout.dialog_advanced_menu,
+        buttons,
+        hiddenButtons,
+        onBack = { openTopMenu(restoreState) },
+        onOutsideTap = { restoreState() }
+    )
 }
 
     private fun cycleOrientation() {
