@@ -1317,9 +1317,8 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
         if (lockedUI)
             return showUnlockControls()
 
-
-        if (dialogNav.isActive()) {
-            dialogNav.navigateBack()
+        if (menuDialogNav.isActive()) {
+            menuDialogNav.handleBackPressed()
             return
         }
 
@@ -1652,160 +1651,155 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
         TrackData(player.sid, "sub")
     }
 
-        private fun selectTrack(type: String, get: () -> Int, set: (Int) -> Unit) {
-            val tracks = player.tracks.getValue(type)
-            val selectedMpvId = get()
-            val selectedIndex = tracks.indexOfFirst { it.mpvId == selectedMpvId }
-    
-            showDialog {
-                AlertDialog.Builder(this)
-                    .setSingleChoiceItems(tracks.map { it.name }.toTypedArray(), selectedIndex) { _, item ->
-                        val trackId = tracks[item].mpvId
-    
-                        set(trackId)
-                        if (type == "sub") {
-                            try { rememberSubtitleSelectionForCurrentFile() } catch (_: Throwable) {}
-                        }
-    
-                        trackSwitchNotification { TrackData(trackId, type) }
-    
-                        // If this dialog was opened from another menu, go back to it.
-                        if (dialogNav.canGoBack())
-                            dialogNav.navigateBack()
-                    }
-                    .create()
+    private fun selectTrack(type: String, get: () -> Int, set: (Int) -> Unit) {
+        val tracks = player.tracks.getValue(type)
+        val selectedMpvId = get()
+        val selectedIndex = tracks.indexOfFirst { it.mpvId == selectedMpvId }
+        val restore = pauseForDialog()
+
+        with (AlertDialog.Builder(this)) {
+            setSingleChoiceItems(tracks.map { it.name }.toTypedArray(), selectedIndex) { dialog, item ->
+                val trackId = tracks[item].mpvId
+
+                set(trackId)
+                if (type == "sub") {
+                    try { rememberSubtitleSelectionForCurrentFile() } catch (_: Throwable) {}
+                }
+                dialog.dismiss()
+                trackSwitchNotification { TrackData(trackId, type) }
             }
+            setOnDismissListener { restore() }
+            create().show()
         }
+    }
 
     private fun pickAudio() = selectTrack("audio", { player.aid }, { player.aid = it })
 
-        private fun pickSub() {
-            val impl = SubTrackDialog(player)
-    
-            showDialog {
-                val inflater = LayoutInflater.from(this)
-    
-                val dialog = AlertDialog.Builder(this)
-                    .setView(impl.buildView(inflater))
-                    .create()
-    
-                impl.listener = { track, secondary ->
-                    if (secondary)
-                        player.secondarySid = track.mpvId
-                    else
-                        player.sid = track.mpvId
-    
-                    if (!secondary) {
-                        try { rememberSubtitleSelectionForCurrentFile() } catch (_: Throwable) {}
-                    }
-    
-                    trackSwitchNotification { TrackData(track.mpvId, SubTrackDialog.TRACK_TYPE) }
-    
-                    // Nested: return to previous menu. Root: stay in this dialog.
-                    if (dialogNav.canGoBack())
-                        dialogNav.navigateBack()
-                    else
-                        impl.refresh()
-                }
-    
-                dialog
+    private fun pickSub() {
+        val restore = pauseForDialog()
+        val impl = SubTrackDialog(player)
+        lateinit var dialog: AlertDialog
+        impl.listener = { it, secondary ->
+            if (secondary)
+                player.secondarySid = it.mpvId
+            else
+                player.sid = it.mpvId
+
+            if (!secondary) {
+                try { rememberSubtitleSelectionForCurrentFile() } catch (_: Throwable) {}
             }
+            dialog.dismiss()
+            trackSwitchNotification { TrackData(it.mpvId, SubTrackDialog.TRACK_TYPE) }
         }
+
+        dialog = with (AlertDialog.Builder(this)) {
+            val inflater = LayoutInflater.from(context)
+            setView(impl.buildView(inflater))
+            setOnDismissListener { restore() }
+            create()
+        }
+        dialog.show()
+    }
 
         private fun openPlaylistMenu() {
-            val impl = PlaylistDialog(player)
-    
-            showDialog {
-                val inflater = LayoutInflater.from(this)
-                val dialog = AlertDialog.Builder(this)
-                    .setView(impl.buildView(inflater))
-                    .create()
-    
-                impl.listeners = object : PlaylistDialog.Listeners {
-                    private fun openFilePicker(skip: Int) {
-                        openFilePickerFor(RCODE_LOAD_FILE, "", skip) { result, data ->
-                            if (result == RESULT_OK) {
-                                val path = data!!.getStringExtra("path")!!
-                                MPVLib.command(arrayOf("loadfile", path, "append"))
-                                impl.refresh()
-                            }
-                        }
-                    }
-    
-                    override fun pickFile() = openFilePicker(FilePickerActivity.FILE_PICKER)
-    
-                    override fun openUrl() {
-                        showDialog {
-                            val helper = Utils.OpenUrlDialog(this@MPVActivity)
-                            helper.builder.setPositiveButton(R.string.dialog_ok, null)
-                            helper.builder.setNegativeButton(R.string.dialog_cancel, null)
-                            val urlDialog = helper.create()
-    
-                            urlDialog.setOnShowListener {
-                                urlDialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener {
-                                    MPVLib.command(arrayOf("loadfile", helper.text, "append"))
-                                    impl.refresh()
-    
-                                    // Return to playlist menu if this is nested.
-                                    if (dialogNav.canGoBack())
-                                        dialogNav.navigateBack()
-                                }
-                                urlDialog.getButton(AlertDialog.BUTTON_NEGATIVE).setOnClickListener {
-                                    dialogNav.navigateBack()
-                                }
-                            }
-    
-                            urlDialog
-                        }
-                    }
-    
-                    override fun onItemPicked(item: MPVView.PlaylistItem) {
-                        MPVLib.setPropertyInt("playlist-pos", item.index)
-    
-                        // Nested: return to previous menu. Root: stay in playlist.
-                        if (dialogNav.canGoBack())
-                            dialogNav.navigateBack()
-                        else
-                            impl.refresh()
+        if (menuDialogNav.isActive()) {
+            menuDialogNav.push { buildPlaylistMenuDialog() }
+            return
+        }
+
+        val restore = pauseForDialog()
+        menuDialogNav.showRoot(restore as Any) { buildPlaylistMenuDialog() }
+    }
+
+    private fun buildOpenUrlDialogForPlaylist(): AlertDialog {
+        val helper = Utils.OpenUrlDialog(this)
+
+        helper.builder.setPositiveButton(R.string.dialog_ok, null)
+        helper.builder.setNegativeButton(R.string.dialog_cancel, null)
+
+        val dialog = helper.create()
+        dialog.setOnShowListener {
+            dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener {
+                MPVLib.command(arrayOf("loadfile", helper.text, "append"))
+                // Return to playlist dialog (or close if something went wrong).
+                menuDialogNav.navigateBackOrCloseAll()
+            }
+            dialog.getButton(AlertDialog.BUTTON_NEGATIVE).setOnClickListener {
+                menuDialogNav.navigateBackOrCloseAll()
+            }
+        }
+        return dialog
+    }
+
+    private fun buildPlaylistMenuDialog(): AlertDialog {
+        val impl = PlaylistDialog(player)
+
+        impl.listeners = object : PlaylistDialog.Listeners {
+            private fun openFilePicker(skip: Int) {
+                openFilePickerFor(RCODE_LOAD_FILE, "", skip) { result, data ->
+                    if (result == RESULT_OK) {
+                        val path = data!!.getStringExtra("path")!!
+                        MPVLib.command(arrayOf("loadfile", path, "append"))
+                        impl.refresh()
                     }
                 }
-    
-                dialog
+            }
+
+            override fun pickFile() = openFilePicker(FilePickerActivity.FILE_PICKER)
+
+            override fun openUrl() {
+                // In our menu navigation model, pushing a new dialog dismisses the current one.
+                // This makes "tap outside" close everything and return to video.
+                menuDialogNav.push { buildOpenUrlDialogForPlaylist() }
+            }
+
+            override fun onItemPicked(item: MPVView.PlaylistItem) {
+                MPVLib.setPropertyInt("playlist-pos", item.index)
+                // Selecting a playlist item is a playback action -> return to the video.
+                menuDialogNav.closeAll()
             }
         }
 
-        private fun pickDecoder() {
-            val items = mutableListOf(
-                Pair("HW (mediacodec-copy)", "mediacodec-copy"),
-                Pair("SW", "no")
-            )
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O)
-                items.add(0, Pair("HW+ (mediacodec)", "mediacodec"))
-    
-            val hwdecActive = player.hwdecActive
-            val selectedIndex = items.indexOfFirst { it.second == hwdecActive }
-    
-            showDialog {
-                AlertDialog.Builder(this)
-                    .setSingleChoiceItems(items.map { it.first }.toTypedArray(), selectedIndex) { _, idx ->
-                        MPVLib.setPropertyString("hwdec", items[idx].second)
-    
-                        if (dialogNav.canGoBack())
-                            dialogNav.navigateBack()
-                    }
-                    .create()
+        return AlertDialog.Builder(this).apply {
+            val inflater = LayoutInflater.from(context)
+            setView(impl.buildView(inflater))
+        }.create()
+    }
+
+    private fun pickDecoder() {) {
+        val restore = pauseForDialog()
+
+        val items = mutableListOf(
+            Pair("HW (mediacodec-copy)", "mediacodec-copy"),
+            Pair("SW", "no")
+        )
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O)
+            items.add(0, Pair("HW+ (mediacodec)", "mediacodec"))
+        val hwdecActive = player.hwdecActive
+        val selectedIndex = items.indexOfFirst { it.second == hwdecActive }
+        with (AlertDialog.Builder(this)) {
+            setSingleChoiceItems(items.map { it.first }.toTypedArray(), selectedIndex ) { dialog, idx ->
+                MPVLib.setPropertyString("hwdec", items[idx].second)
+                dialog.dismiss()
             }
+            setOnDismissListener { restore() }
+            create().show()
         }
+    }
 
     private fun cycleSpeed() {
         player.cycleSpeed()
     }
 
-        private fun pickSpeed() {
-            // TODO: replace this with SliderPickerDialog
-            val picker = SpeedPickerDialog()
-            showPropertyPickerDialog(picker, R.string.title_speed_dialog, "speed")
+    private fun pickSpeed() {
+        // TODO: replace this with SliderPickerDialog
+        val picker = SpeedPickerDialog()
+
+        val restore = pauseForDialog()
+        genericPickerDialog(picker, R.string.title_speed_dialog, "speed") {
+            restore()
         }
+    }
 
     private fun goIntoPiP() {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.N)
@@ -1825,43 +1819,47 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
         showControls()
     }
 
-    // Dialog navigation stack for all in-player menus/dialogs.
-    private val dialogNav = DialogNavigator()
+    data class MenuItem(@IdRes val idRes: Int, val handler: () -> Unit)
 
-    private inner class DialogNavigator {
-        private val stack = ArrayDeque<() -> AlertDialog>()
-        private var current: AlertDialog? = null
-        private var restoreState: StateRestoreCallback? = null
-        private var internalNav = false
+    /**
+     * A simple dialog "navigator" for the in-player menus (top/advanced and all their sub-dialogs).
+     *
+     * المطلوب:
+     * - زر الرجوع: يرجع للنافذة السابقة داخل القوائم
+     * - الضغط خارج النافذة: يرجع مباشرة للفيديو (يغلق كل النوافذ)
+     */
+    private val menuDialogNav = MenuDialogNavigator()
 
-        fun isActive(): Boolean = current != null
-        fun canGoBack(): Boolean = stack.size > 1
+    private inner class MenuDialogNavigator {
+        private val stack: ArrayDeque<() -> AlertDialog?> = ArrayDeque()
+        private var activeDialog: AlertDialog? = null
+        private var restoreToken: Any? = null
+        private var internalDismiss = false
 
-        fun openRoot(restore: StateRestoreCallback, factory: () -> AlertDialog) {
-            // If another flow is open, close it first (restoring playback once).
-            if (isActive())
-                closeAll()
+        fun isActive(): Boolean = activeDialog != null
 
-            restoreState = restore
+        fun showRoot(restore: Any, builder: () -> AlertDialog?) {
+            closeAllInternal(restore = false)
+            restoreToken = restore
             stack.clear()
-            stack.addLast(factory)
+            stack.addLast(builder)
             showTop()
         }
 
-        fun push(factory: () -> AlertDialog) {
-            if (!isActive()) {
-                // Failsafe: start a new flow if someone pushed without a root.
-                openRoot(pauseForDialog(), factory)
+        fun push(builder: () -> AlertDialog?) {
+            if (stack.isEmpty()) {
+                // If somehow called without a root, treat as root.
+                showRoot(pauseForDialog(), builder)
                 return
             }
-            stack.addLast(factory)
+            stack.addLast(builder)
             showTop()
         }
 
+        fun canGoBack(): Boolean = stack.size > 1
+
         fun navigateBack() {
-            if (!isActive())
-                return
-            if (stack.size > 1) {
+            if (canGoBack()) {
                 stack.removeLast()
                 showTop()
             } else {
@@ -1869,68 +1867,87 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
             }
         }
 
-        fun closeAll() {
-            val restore = restoreState
-            closeAllNoRestore()
-            restore?.invoke()
+        fun navigateBackOrCloseAll() {
+            if (canGoBack()) navigateBack() else closeAll()
         }
 
-        fun closeAllNoRestore(): StateRestoreCallback? {
-            val restore = restoreState
-            restoreState = null
+        fun handleBackPressed() {
+            // When the activity receives back while a menu dialog is open.
+            navigateBackOrCloseAll()
+        }
+
+        fun closeAll() {
+            closeAllInternal(restore = true)
+        }
+
+        private fun closeAllInternal(restore: Boolean) {
+            internalDismiss = true
+            try { activeDialog?.dismiss() } catch (_: Throwable) {}
+            activeDialog = null
             stack.clear()
+            internalDismiss = false
 
-            internalNav = true
-            current?.dismiss()
-            current = null
-            internalNav = false
-
-            return restore
+            if (restore) {
+                runRestoreToken(restoreToken)
+                restoreToken = null
+            }
         }
 
         private fun showTop() {
-            internalNav = true
-            current?.dismiss()
-            current = null
-            internalNav = false
+            internalDismiss = true
+            try { activeDialog?.dismiss() } catch (_: Throwable) {}
+            internalDismiss = false
+            activeDialog = null
 
-            val dialog = stack.last().invoke()
-            configure(dialog)
-            current = dialog
-            dialog.show()
-        }
-
-        private fun configure(dialog: AlertDialog) {
-            dialog.setCanceledOnTouchOutside(true)
-            dialog.setCancelable(true)
-
-            // Outside tap should always return to video (close all).
-            dialog.setOnCancelListener {
-                if (!internalNav)
-                    closeAll()
+            val builder = if (stack.isEmpty()) null else stack.peekLast()
+            val dialog = builder?.invoke()
+            if (dialog == null) {
+                // Nothing to show -> just close everything.
+                closeAllInternal(restore = true)
+                return
             }
 
-            // Back should navigate inside the dialog stack.
+            // Ensure back + outside tap behavior is consistent for every dialog we show.
+            try { dialog.setCanceledOnTouchOutside(true) } catch (_: Throwable) {}
+            dialog.setOnCancelListener {
+                if (!internalDismiss) closeAllInternal(restore = true)
+            }
+            dialog.setOnDismissListener {
+                // If the dialog was dismissed "normally" (e.g. by setItems auto-dismiss),
+                // treat it as leaving menus entirely unless we explicitly navigated.
+                if (!internalDismiss && activeDialog != null) {
+                    closeAllInternal(restore = true)
+                }
+            }
             dialog.setOnKeyListener { _, keyCode, event ->
-                if (keyCode == KeyEvent.KEYCODE_BACK) {
-                    if (event.action == KeyEvent.ACTION_UP && !internalNav)
-                        navigateBack()
+                if (keyCode == KeyEvent.KEYCODE_BACK && event.action == KeyEvent.ACTION_UP) {
+                    navigateBackOrCloseAll()
                     true
                 } else {
                     false
                 }
             }
+
+            activeDialog = dialog
+            dialog.show()
+        }
+
+        private fun runRestoreToken(token: Any?) {
+            if (token == null) return
+            try {
+                when (token) {
+                    is Function0<*> -> (token as Function0<Unit>).invoke()
+                    is Runnable -> token.run()
+                    else -> {
+                        // Fallback (should not happen): try reflection.
+                        token.javaClass.methods.firstOrNull { it.name == "invoke" && it.parameterCount == 0 }?.invoke(token)
+                    }
+                }
+            } catch (_: Throwable) {
+                // Ignore restore errors - never crash UI for this.
+            }
         }
     }
-
-    private fun showDialog(factory: () -> AlertDialog) {
-        if (dialogNav.isActive())
-            dialogNav.push(factory)
-        else
-            dialogNav.openRoot(pauseForDialog(), factory)
-    }
-
-    data class MenuItem(@IdRes val idRes: Int, val handler: () -> Unit)
 
     private fun buildMenuDialog(
         @LayoutRes layoutRes: Int,
@@ -1940,6 +1957,13 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
         val builder = AlertDialog.Builder(this)
         val dialogView = LayoutInflater.from(builder.context).inflate(layoutRes, null)
 
+        // Wire up click handlers. Do NOT dismiss by default: most actions should keep the user
+        // داخل القوائم. الانتقال بين القوائم يتم عبر menuDialogNav.push()/navigateBack().
+        for (button in buttons) {
+            val buttonView = dialogView.findViewById<Button>(button.idRes)
+            buttonView.setOnClickListener { button.handler() }
+        }
+
         hiddenButtons.forEach { dialogView.findViewById<View>(it).isVisible = false }
 
         if (Utils.visibleChildren(dialogView) == 0) {
@@ -1947,24 +1971,21 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
             return null
         }
 
-        for (button in buttons) {
-            val buttonView = dialogView.findViewById<Button>(button.idRes)
-            buttonView.setOnClickListener { button.handler() }
-        }
-
         Utils.handleInsetsAsPadding(dialogView)
+
         return builder.setView(dialogView).create()
     }
 
     private fun openTopMenu() {
-        val restoreState = pauseForDialog()
-        dialogNav.openRoot(restoreState) { buildTopMenuDialog() }
-    }
+        if (menuDialogNav.isActive()) {
+            menuDialogNav.closeAll()
+            return
+        }
 
-    private fun buildTopMenuDialog(): AlertDialog {
+        val restoreToken = pauseForDialog() as Any
+
         fun addExternalThing(cmd: String, result: Int, data: Intent?) {
-            if (result != RESULT_OK)
-                return
+            if (result != RESULT_OK) return
             // file picker may return a content URI or a bare file path
             val path = data!!.getStringExtra("path")!!
             val path2 = if (path.startsWith("content://"))
@@ -1979,64 +2000,64 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
             }
         }
 
-        val hiddenButtons = mutableSetOf<Int>()
-        val buttons: MutableList<MenuItem> = mutableListOf(
-            MenuItem(R.id.audioBtn) {
-                val restore = dialogNav.closeAllNoRestore()
-                openFilePickerFor(RCODE_EXTERNAL_AUDIO, R.string.open_external_audio) { result, data ->
-                    addExternalThing("audio-add", result, data)
-                    restore?.invoke()
+        menuDialogNav.showRoot(restoreToken) {
+            val hiddenButtons = mutableSetOf<Int>()
+            val buttons: MutableList<MenuItem> = mutableListOf(
+                MenuItem(R.id.audioBtn) {
+                    // Avoid keeping dialogs open while switching activities.
+                    menuDialogNav.closeAll()
+                    openFilePickerFor(RCODE_EXTERNAL_AUDIO, R.string.open_external_audio) { result, data ->
+                        addExternalThing("audio-add", result, data)
+                    }
+                },
+                MenuItem(R.id.subBtn) {
+                    menuDialogNav.closeAll()
+                    openFilePickerFor(RCODE_EXTERNAL_SUB, R.string.open_external_sub) { result, data ->
+                        addExternalThing("sub-add", result, data)
+                    }
+                },
+                MenuItem(R.id.playlistBtn) {
+                    openPlaylistMenu()
+                },
+                MenuItem(R.id.backgroundBtn) {
+                    // restoring state may (un)pause so do that first
+                    menuDialogNav.closeAll()
+                    backgroundPlayMode = "always"
+                    player.paused = false
+                    moveTaskToBack(true)
+                },
+                MenuItem(R.id.chapterBtn) {
+                    menuDialogNav.push { buildChapterPickerDialog() }
+                },
+                MenuItem(R.id.chapterPrev) {
+                    MPVLib.command(arrayOf("add", "chapter", "-1"))
+                },
+                MenuItem(R.id.chapterNext) {
+                    MPVLib.command(arrayOf("add", "chapter", "1"))
+                },
+                MenuItem(R.id.advancedBtn) {
+                    menuDialogNav.push { buildAdvancedMenuDialog() }
+                },
+                MenuItem(R.id.orientationBtn) {
+                    autoRotationMode = "manual"
+                    cycleOrientation()
                 }
-            },
-            MenuItem(R.id.subBtn) {
-                val restore = dialogNav.closeAllNoRestore()
-                openFilePickerFor(RCODE_EXTERNAL_SUB, R.string.open_external_sub) { result, data ->
-                    addExternalThing("sub-add", result, data)
-                    restore?.invoke()
-                }
-            },
-            MenuItem(R.id.playlistBtn) { openPlaylistMenu() },
-            MenuItem(R.id.backgroundBtn) {
-                // Restoring state may (un)pause so do that first.
-                dialogNav.closeAll()
-                backgroundPlayMode = "always"
-                player.paused = false
-                moveTaskToBack(true)
-            },
-            MenuItem(R.id.chapterBtn) {
-                val chapters = player.loadChapters()
-                if (chapters.isEmpty()) {
-                    dialogNav.closeAll()
-                    return@MenuItem
-                }
-                showDialog { buildChapterDialog(chapters) }
-            },
-            MenuItem(R.id.chapterPrev) {
-                MPVLib.command(arrayOf("add", "chapter", "-1"))
-                dialogNav.closeAll()
-            },
-            MenuItem(R.id.chapterNext) {
-                MPVLib.command(arrayOf("add", "chapter", "1"))
-                dialogNav.closeAll()
-            },
-            MenuItem(R.id.advancedBtn) { openAdvancedMenu() },
-            MenuItem(R.id.orientationBtn) {
-                autoRotationMode = "manual"
-                cycleOrientation()
-                dialogNav.closeAll()
-            }
-        )
+            )
 
-        if (!isPlayingAudio)
-            hiddenButtons.add(R.id.backgroundBtn)
-        if ((MPVLib.getPropertyInt("chapter-list/count") ?: 0) == 0)
-            hiddenButtons.add(R.id.rowChapter)
+            if (!isPlayingAudio)
+                hiddenButtons.add(R.id.backgroundBtn)
+            if ((MPVLib.getPropertyInt("chapter-list/count") ?: 0) == 0)
+                hiddenButtons.add(R.id.rowChapter)
 
-        return buildMenuDialog(R.layout.dialog_top_menu, buttons, hiddenButtons)
-            ?: AlertDialog.Builder(this).create()
+            buildMenuDialog(R.layout.dialog_top_menu, buttons, hiddenButtons)
+        }
     }
 
-    private fun buildChapterDialog(chapters: List<MPVView.Chapter>): AlertDialog {
+    private fun buildChapterPickerDialog(): AlertDialog? {
+        val chapters = player.loadChapters()
+        if (chapters.isEmpty())
+            return null
+
         val chapterArray = chapters.map {
             val timecode = Utils.prettyTime(it.time.roundToInt())
             if (!it.title.isNullOrEmpty())
@@ -2044,46 +2065,109 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
             else
                 getString(R.string.ui_chapter_fallback, it.index + 1, timecode)
         }.toTypedArray()
+
         val selectedIndex = MPVLib.getPropertyInt("chapter") ?: 0
 
-        return AlertDialog.Builder(this)
-            .setSingleChoiceItems(chapterArray, selectedIndex) { _, item ->
+        return AlertDialog.Builder(this).apply {
+            setSingleChoiceItems(chapterArray, selectedIndex) { _, item ->
                 MPVLib.setPropertyInt("chapter", chapters[item].index)
-                if (dialogNav.canGoBack())
-                    dialogNav.navigateBack()
+                // Return to the previous menu instead of العودة للفيديو.
+                menuDialogNav.navigateBackOrCloseAll()
             }
-            .create()
+        }.create()
     }
 
-    private fun openAdvancedMenu() {
-        showDialog { buildAdvancedMenuDialog() }
+    private fun buildPickerDialogInMenus(
+        picker: PickerDialog,
+        @StringRes titleRes: Int,
+        property: String
+    ): AlertDialog {
+        val dialog = AlertDialog.Builder(this).apply {
+            setTitle(titleRes)
+            val inflater = LayoutInflater.from(context)
+            setView(picker.buildView(inflater))
+
+            // We'll override click listeners in onShow so we can control navigation.
+            setPositiveButton(R.string.dialog_ok, null)
+            setNegativeButton(R.string.dialog_cancel, null)
+        }.create()
+
+        picker.number = MPVLib.getPropertyDouble(property)
+
+        dialog.setOnShowListener {
+            dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener {
+                picker.number?.let {
+                    if (picker.isInteger())
+                        MPVLib.setPropertyInt(property, it.toInt())
+                    else
+                        MPVLib.setPropertyDouble(property, it)
+                }
+                // Stay inside menus: go back to previous dialog (usually Advanced).
+                menuDialogNav.navigateBackOrCloseAll()
+            }
+            dialog.getButton(AlertDialog.BUTTON_NEGATIVE).setOnClickListener {
+                menuDialogNav.navigateBackOrCloseAll()
+            }
+        }
+        return dialog
     }
 
-    private fun buildAdvancedMenuDialog(): AlertDialog {
+    private fun buildSubDelayDialogInMenus(picker: SubDelayDialog): AlertDialog {
+        val dialog = AlertDialog.Builder(this).apply {
+            setTitle(R.string.sub_delay)
+            val inflater = LayoutInflater.from(context)
+            setView(picker.buildView(inflater))
+            setPositiveButton(R.string.dialog_ok, null)
+            setNegativeButton(R.string.dialog_cancel, null)
+        }.create()
+
+        picker.delay1 = player.subDelay ?: 0.0
+        picker.delay2 = if (player.secondarySid != -1) player.secondarySubDelay else null
+
+        dialog.setOnShowListener {
+            dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener {
+                picker.delay1?.let { player.subDelay = it }
+                picker.delay2?.let { player.secondarySubDelay = it }
+                menuDialogNav.navigateBackOrCloseAll()
+            }
+            dialog.getButton(AlertDialog.BUTTON_NEGATIVE).setOnClickListener {
+                menuDialogNav.navigateBackOrCloseAll()
+            }
+        }
+        return dialog
+    }
+
+    private fun buildAspectDialogInMenus(): AlertDialog {
+        val ratios = resources.getStringArray(R.array.aspect_ratios)
+
+        return AlertDialog.Builder(this).apply {
+            setTitle(R.string.aspect_ratio)
+            setSingleChoiceItems(R.array.aspect_ratio_names, -1) { _, item ->
+                if (ratios[item] == "panscan") {
+                    MPVLib.setPropertyString("video-aspect-override", "-1")
+                    MPVLib.setPropertyDouble("panscan", 1.0)
+                } else {
+                    MPVLib.setPropertyString("video-aspect-override", ratios[item])
+                    MPVLib.setPropertyDouble("panscan", 0.0)
+                }
+                menuDialogNav.navigateBackOrCloseAll()
+            }
+        }.create()
+    }
+
+    private fun buildAdvancedMenuDialog(): AlertDialog? {
         val hiddenButtons = mutableSetOf<Int>()
         val buttons: MutableList<MenuItem> = mutableListOf(
-            MenuItem(R.id.subSeekPrev) {
-                MPVLib.command(arrayOf("sub-seek", "-1"))
-                dialogNav.closeAll()
-            },
-            MenuItem(R.id.subSeekNext) {
-                MPVLib.command(arrayOf("sub-seek", "1"))
-                dialogNav.closeAll()
-            },
-            MenuItem(R.id.statsBtn) {
-                MPVLib.command(arrayOf("script-binding", "stats/display-stats-toggle"))
-                dialogNav.closeAll()
-            },
-            MenuItem(R.id.aspectBtn) {
-                showDialog { buildAspectDialog() }
-            }
+            MenuItem(R.id.subSeekPrev) { MPVLib.command(arrayOf("sub-seek", "-1")) },
+            MenuItem(R.id.subSeekNext) { MPVLib.command(arrayOf("sub-seek", "1")) },
+            MenuItem(R.id.statsBtn) { MPVLib.command(arrayOf("script-binding", "stats/display-stats-toggle")) },
+            MenuItem(R.id.aspectBtn) { menuDialogNav.push { buildAspectDialogInMenus() } }
         )
 
         val statsButtons = arrayOf(R.id.statsBtn1, R.id.statsBtn2, R.id.statsBtn3)
         for (i in 1..3) {
             buttons.add(MenuItem(statsButtons[i - 1]) {
                 MPVLib.command(arrayOf("script-binding", "stats/display-page-$i"))
-                dialogNav.closeAll()
             })
         }
 
@@ -2094,125 +2178,29 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
         basicIds.forEachIndexed { index, id ->
             buttons.add(MenuItem(id) {
                 val slider = SliderPickerDialog(-100.0, 100.0, 1, R.string.format_fixed_number)
-                showPropertyPickerDialog(slider, basicTitles[index], basicProps[index])
+                menuDialogNav.push { buildPickerDialogInMenus(slider, basicTitles[index], basicProps[index]) }
             })
         }
 
         // audio / sub delay get a decimal picker
         buttons.add(MenuItem(R.id.audioDelayBtn) {
             val picker = DecimalPickerDialog(-600.0, 600.0)
-            showPropertyPickerDialog(picker, R.string.audio_delay, "audio-delay")
+            menuDialogNav.push { buildPickerDialogInMenus(picker, R.string.audio_delay, "audio-delay") }
         })
         buttons.add(MenuItem(R.id.subDelayBtn) {
-            showDialog { buildSubDelayDialog() }
+            val picker = SubDelayDialog(-600.0, 600.0)
+            menuDialogNav.push { buildSubDelayDialogInMenus(picker) }
         })
 
         if (player.vid == -1)
-            hiddenButtons.addAll(arrayOf(R.id.rowVideo1, R.id.rowVideo2, R.id.aspectBtn))
+            hiddenButtons.addAll(listOf(R.id.rowVideo1, R.id.rowVideo2, R.id.aspectBtn))
         if (player.aid == -1 || player.vid == -1)
             hiddenButtons.add(R.id.audioDelayBtn)
         if (player.sid == -1)
-            hiddenButtons.addAll(arrayOf(R.id.subDelayBtn, R.id.rowSubSeek))
+            hiddenButtons.addAll(listOf(R.id.subDelayBtn, R.id.rowSubSeek))
 
         return buildMenuDialog(R.layout.dialog_advanced_menu, buttons, hiddenButtons)
-            ?: AlertDialog.Builder(this).create()
     }
-
-        private fun buildAspectDialog(): AlertDialog {
-            val ratios = resources.getStringArray(R.array.aspect_ratios)
-    
-            val currentPanscan = MPVLib.getPropertyDouble("panscan") ?: 0.0
-            val currentOverride = MPVLib.getPropertyString("video-aspect-override") ?: "-1"
-            val currentKey = if (currentPanscan >= 0.5) "panscan" else currentOverride
-            val selectedIndex = ratios.indexOfFirst { it == currentKey }
-    
-            return AlertDialog.Builder(this)
-                .setSingleChoiceItems(R.array.aspect_ratio_names, selectedIndex) { _, item ->
-                    if (ratios[item] == "panscan") {
-                        MPVLib.setPropertyString("video-aspect-override", "-1")
-                        MPVLib.setPropertyDouble("panscan", 1.0)
-                    } else {
-                        MPVLib.setPropertyString("video-aspect-override", ratios[item])
-                        MPVLib.setPropertyDouble("panscan", 0.0)
-                    }
-    
-                    if (dialogNav.canGoBack())
-                        dialogNav.navigateBack()
-                }
-                .create()
-        }
-
-    private fun showPropertyPickerDialog(
-        picker: PickerDialog,
-        @StringRes titleRes: Int,
-        property: String
-    ) {
-        showDialog {
-            val inflater = LayoutInflater.from(this)
-            val view = picker.buildView(inflater)
-
-            picker.number = MPVLib.getPropertyDouble(property)
-
-            val dialog = AlertDialog.Builder(this)
-                .setTitle(titleRes)
-                .setView(view)
-                .setPositiveButton(R.string.dialog_ok, null)
-                .setNegativeButton(R.string.dialog_cancel, null)
-                .create()
-
-            dialog.setOnShowListener {
-                dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener {
-                    picker.number?.let {
-                        if (picker.isInteger())
-                            MPVLib.setPropertyInt(property, it.toInt())
-                        else
-                            MPVLib.setPropertyDouble(property, it)
-                    }
-
-                    if (dialogNav.canGoBack())
-                        dialogNav.navigateBack()
-                }
-                dialog.getButton(AlertDialog.BUTTON_NEGATIVE).setOnClickListener {
-                    dialogNav.navigateBack()
-                }
-            }
-
-            dialog
-        }
-    }
-
-    private fun buildSubDelayDialog(): AlertDialog {
-        val picker = SubDelayDialog(-600.0, 600.0)
-
-        val inflater = LayoutInflater.from(this)
-        val view = picker.buildView(inflater)
-
-        picker.delay1 = player.subDelay ?: 0.0
-        picker.delay2 = if (player.secondarySid != -1) player.secondarySubDelay else null
-
-        val dialog = AlertDialog.Builder(this)
-            .setTitle(R.string.sub_delay)
-            .setView(view)
-            .setPositiveButton(R.string.dialog_ok, null)
-            .setNegativeButton(R.string.dialog_cancel, null)
-            .create()
-
-        dialog.setOnShowListener {
-            dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener {
-                picker.delay1?.let { player.subDelay = it }
-                picker.delay2?.let { player.secondarySubDelay = it }
-
-                if (dialogNav.canGoBack())
-                    dialogNav.navigateBack()
-            }
-            dialog.getButton(AlertDialog.BUTTON_NEGATIVE).setOnClickListener {
-                dialogNav.navigateBack()
-            }
-        }
-
-        return dialog
-    }
-
     private fun cycleOrientation() {
         requestedOrientation = if (requestedOrientation == ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE)
             ActivityInfo.SCREEN_ORIENTATION_SENSOR_PORTRAIT
