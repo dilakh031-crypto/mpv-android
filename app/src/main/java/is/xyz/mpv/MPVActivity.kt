@@ -1794,7 +1794,10 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
     data class MenuItem(@IdRes val idRes: Int, val handler: () -> Boolean)
     private fun genericMenu(
             @LayoutRes layoutRes: Int, buttons: List<MenuItem>, hiddenButtons: Set<Int>,
-            restoreState: StateRestoreCallback) {
+            restoreState: StateRestoreCallback,
+            // If non-null, intercept the system back button to navigate within the
+            // menu stack instead of cancelling the dialog (which would return to video).
+            onBack: (() -> Unit)? = null) {
         lateinit var dialog: AlertDialog
 
         val builder = AlertDialog.Builder(this)
@@ -1825,11 +1828,36 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
             setOnCancelListener { restoreState() }
             dialog = create()
         }
+
+        // Make sure tapping outside closes the menu (returns to video).
+        dialog.setCanceledOnTouchOutside(true)
+
+        // Distinguish back-press from outside-tap: back should optionally navigate to a
+        // previous menu, while outside-tap should cancel (handled by setOnCancelListener).
+        if (onBack != null) {
+            dialog.setOnKeyListener { _, keyCode, event ->
+                if (keyCode == KeyEvent.KEYCODE_BACK) {
+                    if (event.action == KeyEvent.ACTION_UP) {
+                        dialog.dismiss()
+                        onBack()
+                    }
+                    true
+                } else {
+                    false
+                }
+            }
+        }
         dialog.show()
     }
 
     private fun openTopMenu() {
         val restoreState = pauseForDialog()
+        showTopMenu(restoreState)
+    }
+
+    // Same as openTopMenu(), but reuses an existing restore callback so nested menus can
+    // navigate back without changing playback state.
+    private fun showTopMenu(restoreState: StateRestoreCallback) {
 
         fun addExternalThing(cmd: String, result: Int, data: Intent?) {
             if (result != RESULT_OK)
@@ -1901,7 +1929,7 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
                 MenuItem(R.id.chapterNext) {
                     MPVLib.command(arrayOf("add", "chapter", "1")); true
                 },
-                MenuItem(R.id.advancedBtn) { openAdvancedMenu(restoreState); false },
+                MenuItem(R.id.advancedBtn) { openAdvancedMenu(restoreState) { showTopMenu(restoreState) }; false },
                 MenuItem(R.id.orientationBtn) {
                     autoRotationMode = "manual"
                     cycleOrientation()
@@ -1943,7 +1971,7 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
         dialog.show()
     }
 
-    private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
+    private fun openAdvancedMenu(restoreState: StateRestoreCallback, onBack: (() -> Unit)? = null) {
         /******/
         val hiddenButtons = mutableSetOf<Int>()
         val buttons: MutableList<MenuItem> = mutableListOf(
@@ -2029,7 +2057,7 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
             hiddenButtons.addAll(arrayOf(R.id.subDelayBtn, R.id.rowSubSeek))
         /******/
 
-        genericMenu(R.layout.dialog_advanced_menu, buttons, hiddenButtons, restoreState)
+        genericMenu(R.layout.dialog_advanced_menu, buttons, hiddenButtons, restoreState, onBack)
     }
 
     private fun cycleOrientation() {
