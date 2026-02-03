@@ -134,7 +134,6 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
     private var mediaSession: MediaSessionCompat? = null
 
     private lateinit var binding: PlayerBinding
-    private var bindingReady: Boolean = false
     private lateinit var gestures: TouchGestures
     private lateinit var zoomGestures: VideoZoomGestures
 
@@ -326,7 +325,6 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
 
             // Prepare binding/gestures early so onConfigurationChanged is safe even if we change orientation immediately.
             binding = PlayerBinding.inflate(layoutInflater)
-            bindingReady = true
             gestures = TouchGestures(this)
             zoomGestures = VideoZoomGestures(binding.player)
 
@@ -951,7 +949,7 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
     private fun isInTopSystemGestureDeadzone(y: Float): Boolean {
         // Use the gesture layer height if available (covers edge-to-edge/immersive scenarios).
         val h = when {
-            bindingReady && binding.gestureLayer.height > 0 -> binding.gestureLayer.height
+            ::binding.isInitialized && binding.gestureLayer.height > 0 -> binding.gestureLayer.height
             (window?.decorView?.height ?: 0) > 0 -> window.decorView.height
             else -> 0
         }
@@ -1767,16 +1765,33 @@ private fun openPlaylistMenu(restore: StateRestoreCallback, onBack: (() -> Unit)
         val inflater = LayoutInflater.from(context)
         setView(impl.buildView(inflater))
 
+        // Tapping outside exits directly to video.
         setOnCancelListener {
             handled = true
-            runIfActive(backAction)
+            runIfActive(restore)
         }
+        // Fallback for non-cancel dismissals.
         setOnDismissListener {
             if (!handled)
-                runIfActive(backAction)
+                runIfActive(restore)
         }
         create()
     }
+
+    dialog.setCanceledOnTouchOutside(true)
+    dialog.setOnKeyListener { _, keyCode, event ->
+        if (keyCode == KeyEvent.KEYCODE_BACK) {
+            if (event.action == KeyEvent.ACTION_UP) {
+                handled = true
+                runIfActive(backAction)
+                dialog.dismiss()
+            }
+            true
+        } else {
+            false
+        }
+    }
+
     dialog.show()
 }
 
@@ -1822,9 +1837,7 @@ private fun cycleSpeed() {
         val picker = SpeedPickerDialog()
 
         val restore = pauseForDialog()
-        genericPickerDialog(picker, R.string.title_speed_dialog, "speed") {
-            restore()
-        }
+        genericPickerDialog(picker, R.string.title_speed_dialog, "speed", onBack = { restore() }, onExit = { restore() })
     }
 
     private fun goIntoPiP() {
@@ -1862,7 +1875,8 @@ private fun genericMenu(
     @LayoutRes layoutRes: Int,
     buttons: List<MenuItem>,
     hiddenButtons: Set<Int>,
-    onBack: () -> Unit
+    onBack: () -> Unit,
+    onExit: () -> Unit
 ) {
     lateinit var dialog: AlertDialog
 
@@ -1892,14 +1906,28 @@ private fun genericMenu(
 
     with(builder) {
         setView(dialogView)
-        // Back/outside-tap should navigate "up" in the menu stack.
-        setOnCancelListener { runIfActive(onBack) }
+        // Tapping outside should exit directly to video; Back should navigate "up" in the menu stack.
+        setOnCancelListener { runIfActive(onExit) }
         dialog = create()
     }
+
+    dialog.setCanceledOnTouchOutside(true)
+    dialog.setOnKeyListener { _, keyCode, event ->
+        if (keyCode == KeyEvent.KEYCODE_BACK) {
+            if (event.action == KeyEvent.ACTION_UP) {
+                runIfActive(onBack)
+                dialog.dismiss()
+            }
+            true
+        } else {
+            false
+        }
+    }
+
     dialog.show()
 }
 
-    private fun openTopMenu(existingRestoreState: StateRestoreCallback? = null) {
+private fun openTopMenu(existingRestoreState: StateRestoreCallback? = null) {
     val restoreState = existingRestoreState ?: pauseForDialog()
 
     fun addExternalThing(cmd: String, result: Int, data: Intent?) {
@@ -1941,17 +1969,37 @@ private fun genericMenu(
             setSingleChoiceItems(chapterArray, selectedIndex) { _, item ->
                 MPVLib.setPropertyInt("chapter", chapters[item].index)
             }
-            setNegativeButton(R.string.dialog_cancel) { d, _ -> d.cancel() }
-            setOnCancelListener {
+            // "Cancel" behaves like Back (up to the top menu).
+            setNegativeButton(R.string.dialog_cancel) { _, _ ->
                 handled = true
                 openTopMenu(restoreState)
             }
+            // Tapping outside exits directly to video.
+            setOnCancelListener {
+                handled = true
+                restoreState()
+            }
             setOnDismissListener {
                 if (!handled)
-                    openTopMenu(restoreState)
+                    restoreState()
             }
             create()
         }
+
+        dialog.setCanceledOnTouchOutside(true)
+        dialog.setOnKeyListener { _, keyCode, event ->
+            if (keyCode == KeyEvent.KEYCODE_BACK) {
+                if (event.action == KeyEvent.ACTION_UP) {
+                    handled = true
+                    openTopMenu(restoreState)
+                    dialog.dismiss()
+                }
+                true
+            } else {
+                false
+            }
+        }
+
         dialog.show()
     }
 
@@ -2004,14 +2052,15 @@ private fun genericMenu(
         hiddenButtons.add(R.id.rowChapter)
     /******/
 
-    genericMenu(R.layout.dialog_top_menu, buttons, hiddenButtons) { restoreState() }
+    genericMenu(R.layout.dialog_top_menu, buttons, hiddenButtons, onBack = { restoreState() }, onExit = { restoreState() })
 }
 
     private fun genericPickerDialog(
     picker: PickerDialog,
     @StringRes titleRes: Int,
     property: String,
-    onBack: () -> Unit
+    onBack: () -> Unit,
+    onExit: () -> Unit
 ) {
     lateinit var dialog: AlertDialog
     var handled = false
@@ -2023,21 +2072,40 @@ private fun genericMenu(
 
         // Apply without closing: we'll override the click listener after show().
         setPositiveButton(R.string.dialog_ok, null)
-        setNegativeButton(R.string.dialog_cancel) { d, _ -> d.cancel() }
-
-        setOnCancelListener {
+        // "Cancel" behaves like Back (up one menu level).
+        setNegativeButton(R.string.dialog_cancel) { _, _ ->
             handled = true
             runIfActive(onBack)
+        }
+
+        // Tapping outside exits directly to video.
+        setOnCancelListener {
+            handled = true
+            runIfActive(onExit)
         }
         // Fallback for non-cancel dismissals.
         setOnDismissListener {
             if (!handled)
-                runIfActive(onBack)
+                runIfActive(onExit)
         }
         create()
     }
 
     picker.number = MPVLib.getPropertyDouble(property)
+
+    dialog.setCanceledOnTouchOutside(true)
+    dialog.setOnKeyListener { _, keyCode, event ->
+        if (keyCode == KeyEvent.KEYCODE_BACK) {
+            if (event.action == KeyEvent.ACTION_UP) {
+                handled = true
+                runIfActive(onBack)
+                dialog.dismiss()
+            }
+            true
+        } else {
+            false
+        }
+    }
 
     dialog.setOnShowListener {
         dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener {
@@ -2081,17 +2149,37 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
                 }
                 // Keep dialog open (apply-in-place).
             }
-            setNegativeButton(R.string.dialog_cancel) { d, _ -> d.cancel() }
-            setOnCancelListener {
+            // "Cancel" behaves like Back (up to the advanced menu).
+            setNegativeButton(R.string.dialog_cancel) { _, _ ->
                 handled = true
                 openAdvancedMenu(restoreState)
             }
+            // Tapping outside exits directly to video.
+            setOnCancelListener {
+                handled = true
+                restoreState()
+            }
             setOnDismissListener {
                 if (!handled)
-                    openAdvancedMenu(restoreState)
+                    restoreState()
             }
             create()
         }
+
+        dialog.setCanceledOnTouchOutside(true)
+        dialog.setOnKeyListener { _, keyCode, event ->
+            if (keyCode == KeyEvent.KEYCODE_BACK) {
+                if (event.action == KeyEvent.ACTION_UP) {
+                    handled = true
+                    openAdvancedMenu(restoreState)
+                    dialog.dismiss()
+                }
+                true
+            } else {
+                false
+            }
+        }
+
         dialog.show()
     }
 
@@ -2106,17 +2194,36 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
             setView(picker.buildView(inflater))
 
             setPositiveButton(R.string.dialog_ok, null)
-            setNegativeButton(R.string.dialog_cancel) { d, _ -> d.cancel() }
-
-            setOnCancelListener {
+            // "Cancel" behaves like Back (up to the advanced menu).
+            setNegativeButton(R.string.dialog_cancel) { _, _ ->
                 handled = true
                 openAdvancedMenu(restoreState)
             }
+
+            // Tapping outside exits directly to video.
+            setOnCancelListener {
+                handled = true
+                restoreState()
+            }
             setOnDismissListener {
                 if (!handled)
-                    openAdvancedMenu(restoreState)
+                    restoreState()
             }
             create()
+        }
+
+        dialog.setCanceledOnTouchOutside(true)
+        dialog.setOnKeyListener { _, keyCode, event ->
+            if (keyCode == KeyEvent.KEYCODE_BACK) {
+                if (event.action == KeyEvent.ACTION_UP) {
+                    handled = true
+                    openAdvancedMenu(restoreState)
+                    dialog.dismiss()
+                }
+                true
+            } else {
+                false
+            }
         }
 
         picker.delay1 = player.subDelay ?: 0.0
@@ -2164,18 +2271,14 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
     basicIds.forEachIndexed { index, id ->
         buttons.add(MenuItem(id, dismiss = true) {
             val slider = SliderPickerDialog(-100.0, 100.0, 1, R.string.format_fixed_number)
-            genericPickerDialog(slider, basicTitles[index], basicProps[index]) {
-                openAdvancedMenu(restoreState)
-            }
+            genericPickerDialog(slider, basicTitles[index], basicProps[index], onBack = { openAdvancedMenu(restoreState) }, onExit = { restoreState() })
         })
     }
 
     // audio delay get a decimal picker
     buttons.add(MenuItem(R.id.audioDelayBtn, dismiss = true) {
         val picker = DecimalPickerDialog(-600.0, 600.0)
-        genericPickerDialog(picker, R.string.audio_delay, "audio-delay") {
-            openAdvancedMenu(restoreState)
-        }
+        genericPickerDialog(picker, R.string.audio_delay, "audio-delay", onBack = { openAdvancedMenu(restoreState) }, onExit = { restoreState() })
     })
 
     // sub delay (primary/secondary) dialog
@@ -2191,9 +2294,7 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
         hiddenButtons.addAll(arrayOf(R.id.subDelayBtn, R.id.rowSubSeek))
     /******/
 
-    genericMenu(R.layout.dialog_advanced_menu, buttons, hiddenButtons) {
-        openTopMenu(restoreState)
-    }
+    genericMenu(R.layout.dialog_advanced_menu, buttons, hiddenButtons, onBack = { openTopMenu(restoreState) }, onExit = { restoreState() })
 }
 
     private fun cycleOrientation() {
