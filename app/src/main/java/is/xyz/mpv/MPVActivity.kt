@@ -72,7 +72,12 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
     // For short-lived bookkeeping around tap-to-toggle (used to revert if a double-tap gesture fires).
     private val tapToggleHandler = Handler(Looper.getMainLooper())
 
-    private data class TapToggleSnapshot(val atMs: Long, val wasVisible: Boolean)
+    private data class TapToggleSnapshot(
+        val atMs: Long,
+        val wasVisible: Boolean,
+        val tapX: Float,
+        val tapY: Float,
+    )
     private var lastTapToggleSnapshot: TapToggleSnapshot? = null
     private var clearTapToggleSnapshotRunnable: Runnable? = null
 
@@ -1211,8 +1216,19 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
             // (play/pause/seek/custom) will fire via TouchGestures and revert the first toggle,
             // leaving the control UI unchanged.
             val snap = lastTapToggleSnapshot
+            val now = SystemClock.uptimeMillis()
             suppressTapToggleForCurrentGesture =
-                snap != null && SystemClock.uptimeMillis() - snap.atMs <= TAP_TOGGLE_REVERT_WINDOW_MS
+                snap != null &&
+                now - snap.atMs <= TAP_TOGGLE_REVERT_WINDOW_MS &&
+                isWithinDoubleTapSlop(ev.x, ev.y, snap)
+
+            // If this is the second tap of a double-tap, revert the first tap's toggle ASAP.
+            // This avoids a visible "flash" of controls between the first tap and the
+            // double-tap action firing (which only happens on the second ACTION_UP).
+            if (suppressTapToggleForCurrentGesture) {
+                revertTapToggleIfRecent()
+                cancelPendingTapToggle()
+            }
 
             mightWantToToggleControls = !suppressTapToggleForCurrentGesture
 
@@ -1243,8 +1259,12 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
                 statusBarSwipeCandidate = false
                 statusBarSwipeCanceledToggle = false
             }
-            if (ev.action == MotionEvent.ACTION_UP)
+            if (ev.action == MotionEvent.ACTION_UP) {
+                // Child handled the tap (e.g. a double-tap gesture); never toggle controls here.
+                suppressTapToggleForCurrentGesture = false
+                mightWantToToggleControls = false
                 return true
+            }
         }
 
         if (ev.actionMasked == MotionEvent.ACTION_UP) {
@@ -1264,7 +1284,7 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
                 return true
 
             // Defer toggling so a second tap (double-tap play/pause) can cancel it.
-            scheduleSingleTapToggle()
+            scheduleSingleTapToggle(ev.x, ev.y)
             mightWantToToggleControls = false
         }
         if (ev.actionMasked == MotionEvent.ACTION_CANCEL) {
@@ -1276,6 +1296,14 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
         }
         return true
     }
+
+    private fun isWithinDoubleTapSlop(x: Float, y: Float, snap: TapToggleSnapshot): Boolean {
+        val slop = ViewConfiguration.get(this).scaledDoubleTapSlop.toFloat()
+        val dx = x - snap.tapX
+        val dy = y - snap.tapY
+        return (dx * dx + dy * dy) <= (slop * slop)
+    }
+
     private fun cancelPendingTapToggle() {
         // We no longer defer single-tap toggling, but we still use this hook to cancel
         // any delayed bookkeeping tasks (snapshot clearing).
@@ -1306,12 +1334,14 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
         }
     }
 
-    private fun scheduleSingleTapToggle() {
+    private fun scheduleSingleTapToggle(tapX: Float, tapY: Float) {
         // Toggle immediately for zero perceived latency.
         // We keep a short-lived snapshot so double-tap gestures can revert the toggle.
         lastTapToggleSnapshot = TapToggleSnapshot(
             SystemClock.uptimeMillis(),
-            binding.controls.visibility == View.VISIBLE && !fadeRunnable.hasStarted
+            binding.controls.visibility == View.VISIBLE && !fadeRunnable.hasStarted,
+            tapX,
+            tapY,
         )
 
         // Clear the snapshot after the double-tap window.
