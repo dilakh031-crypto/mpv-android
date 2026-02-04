@@ -32,6 +32,13 @@
         <item name="android:windowTranslucentStatus">true</item>
         <item name="android:windowLayoutInDisplayCutoutMode">shortEdges</item>
         <item name="android:windowBackground">#000000</item>
+        <item name="alertDialogTheme">@style/AppTheme.Player.AlertDialog</item>
+    </style>
+
+    <!-- fullscreen dialog overlay for player (prevents status bar from appearing when menus/dialogs open) -->
+    <style name="AppTheme.Player.AlertDialog" parent="Theme.AppCompat.Dialog.Alert">
+        <item name="android:windowFullscreen">true</item>
+        <item name="android:windowLayoutInDisplayCutoutMode">shortEdges</item>
     </style>
 
     <!-- theme for preferences -->
