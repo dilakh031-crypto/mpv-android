@@ -74,12 +74,10 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
     private val tapToggleHandler = Handler(Looper.getMainLooper())
     private var pendingTapToggleRunnable: Runnable? = null
 
-    // Remember last tap location/time to identify the 2nd tap of a double-tap.
-    private var lastTapUpAtMs = 0L
-    private var lastTapUpX = 0f
-    private var lastTapUpY = 0f
-    private var suppressToggleOnNextUp = false
-    private val doubleTapSlopPx by lazy { ViewConfiguration.get(this).scaledDoubleTapSlop.toFloat() }
+    // We intentionally do *not* try to predict a double-tap here. Instead, we only cancel the
+    // pending single-tap toggle if TouchGestures actually confirms and handles a double-tap
+    // (PlayPause / SeekFixed / Custom). This avoids a "dead zone" where two quick taps that do
+    // not qualify as a double-tap would otherwise cancel the single-tap toggle and do nothing.
 
     /**
      * DO NOT USE THIS
@@ -1200,18 +1198,9 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
         }
 
         // For tap-to-toggle, we delay the single-tap action slightly.
-        // If the user performs a fast double-tap (play/pause/seek/custom), we cancel the pending toggle.
+        // We DO NOT cancel on the 2nd tap preemptively. Instead, we cancel only if TouchGestures
+        // actually confirms and handles a double-tap (see onPropertyChange for PlayPause/SeekFixed/Custom).
         if (ev.actionMasked == MotionEvent.ACTION_DOWN) {
-            val now = SystemClock.uptimeMillis()
-            if (pendingTapToggleRunnable != null &&
-                now - lastTapUpAtMs <= DOUBLE_TAP_TIMEOUT_MS &&
-                isWithinDoubleTapSlop(ev.x, ev.y)
-            ) {
-                // Likely 2nd tap of a double-tap gesture: cancel the pending single-tap toggle,
-                // and don't schedule another toggle on ACTION_UP.
-                suppressToggleOnNextUp = true
-                cancelPendingTapToggle()
-            }
             mightWantToToggleControls = true
 
             // If the gesture starts from the very top, treat it as a possible status-bar swipe.
@@ -1253,35 +1242,19 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
             if (!mightWantToToggleControls)
                 return true
 
-            // Delay the single-tap toggle slightly so we can cancel it if this turns into a double-tap.
-            if (suppressToggleOnNextUp) {
-                suppressToggleOnNextUp = false
-                mightWantToToggleControls = false
-                return true
-            }
-
-            lastTapUpAtMs = SystemClock.uptimeMillis()
-            lastTapUpX = ev.x
-            lastTapUpY = ev.y
-
+            // Delay the single-tap toggle slightly so TouchGestures can recognize and handle
+            // a possible double-tap. If a double-tap *is* handled, onPropertyChange will cancel.
             scheduleSingleTapToggle()
             mightWantToToggleControls = false
         }
         if (ev.actionMasked == MotionEvent.ACTION_CANCEL) {
             cancelPendingTapToggle()
-            suppressToggleOnNextUp = false
             mightWantToToggleControls = false
             statusBarSwipeCandidate = false
             statusBarSwipeCanceledToggle = false
         }
         return true
     }
-    private fun isWithinDoubleTapSlop(x: Float, y: Float): Boolean {
-        val dx = x - lastTapUpX
-        val dy = y - lastTapUpY
-        return dx * dx + dy * dy <= doubleTapSlopPx * doubleTapSlopPx
-    }
-
     private fun cancelPendingTapToggle() {
         pendingTapToggleRunnable?.let { tapToggleHandler.removeCallbacks(it) }
         pendingTapToggleRunnable = null
