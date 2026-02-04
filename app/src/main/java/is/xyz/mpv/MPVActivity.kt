@@ -1058,33 +1058,6 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
             fadeHandler.postDelayed(fadeRunnable, CONTROLS_DISPLAY_TIMEOUT)
     }
 
-        // remove all callbacks that were to be run for fading
-        fadeHandler.removeCallbacks(fadeRunnable)
-        binding.controls.animate().cancel()
-        binding.topControls.animate().cancel()
-
-        // reset controls alpha to be visible
-        binding.controls.alpha = 1f
-        binding.topControls.alpha = 1f
-
-        if (binding.controls.visibility != View.VISIBLE) {
-            binding.controls.visibility = View.VISIBLE
-            binding.topControls.visibility = View.VISIBLE
-
-            if (this.statsFPS) {
-                updateStats()
-                binding.statsTextView.visibility = View.VISIBLE
-            }
-
-            val insetsController = WindowCompat.getInsetsController(window, window.decorView)
-            insetsController.show(WindowInsetsCompat.Type.navigationBars())
-        }
-
-        // add a new callback to hide the controls once again
-        if (!controlsShouldBeVisible())
-            fadeHandler.postDelayed(fadeRunnable, CONTROLS_DISPLAY_TIMEOUT)
-    }
-
     /** Hide controls instantly */
     fun hideControls() {
         if (controlsShouldBeVisible())
