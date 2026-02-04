@@ -1052,6 +1052,21 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
         insetsController.hide(WindowInsetsCompat.Type.systemBars())
     }
 
+    /**
+     * Some devices/OEMs temporarily show the status bar when a dialog/menu window gains focus.
+     * We want the player to stay immersive, and only allow revealing system bars via swipe.
+     */
+    private fun applyImmersiveToDialog(dialog: AlertDialog) {
+        val w = dialog.window ?: return
+        WindowCompat.setDecorFitsSystemWindows(w, false)
+        val controller = WindowCompat.getInsetsController(w, w.decorView)
+        controller.systemBarsBehavior =
+            WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+        // Keep the top status bar hidden; navigation behavior is handled elsewhere.
+        controller.hide(WindowInsetsCompat.Type.statusBars())
+    }
+
+
     /** Start fading out the controls */
     private fun hideControlsFade() {
         fadeHandler.removeCallbacks(fadeRunnable)
@@ -1333,7 +1348,9 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
                 dialog.dismiss()
                 restore()
             }
-            create().show()
+            val dialog = create()
+            dialog.show()
+            this@MPVActivity.applyImmersiveToDialog(dialog)
         }
     }
 
@@ -1675,6 +1692,7 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
         create()
     }
     dialog.show()
+    applyImmersiveToDialog(dialog)
 }
 
 private fun pickAudio() = selectTrack("audio", { player.aid }, { player.aid = it })
@@ -1712,6 +1730,7 @@ private fun pickAudio() = selectTrack("audio", { player.aid }, { player.aid = it
         create()
     }
     dialog.show()
+    applyImmersiveToDialog(dialog)
 }
 
 private fun openPlaylistMenu(restore: StateRestoreCallback, onBack: (() -> Unit)? = null) {
@@ -1742,6 +1761,7 @@ private fun openPlaylistMenu(restore: StateRestoreCallback, onBack: (() -> Unit)
                 create()
             }
             urlDialog.setOnShowListener {
+                this@MPVActivity.applyImmersiveToDialog(urlDialog)
                 urlDialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener {
                     val url = helper.text
                     if (url.isNotBlank()) {
@@ -1793,6 +1813,8 @@ private fun openPlaylistMenu(restore: StateRestoreCallback, onBack: (() -> Unit)
     }
 
     dialog.show()
+
+    applyImmersiveToDialog(dialog)
 }
 
 private fun pickDecoder() {
@@ -1826,6 +1848,7 @@ private fun pickDecoder() {
         create()
     }
     dialog.show()
+    applyImmersiveToDialog(dialog)
 }
 
 private fun cycleSpeed() {
@@ -1925,6 +1948,8 @@ private fun genericMenu(
     }
 
     dialog.show()
+
+    applyImmersiveToDialog(dialog)
 }
 
 private fun openTopMenu(existingRestoreState: StateRestoreCallback? = null) {
@@ -2001,6 +2026,8 @@ private fun openTopMenu(existingRestoreState: StateRestoreCallback? = null) {
         }
 
         dialog.show()
+
+        applyImmersiveToDialog(dialog)
     }
 
     /******/
@@ -2108,6 +2135,8 @@ private fun openTopMenu(existingRestoreState: StateRestoreCallback? = null) {
     }
 
     dialog.setOnShowListener {
+
+        applyImmersiveToDialog(dialog)
         dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener {
             picker.number?.let {
                 if (picker.isInteger())
@@ -2120,6 +2149,8 @@ private fun openTopMenu(existingRestoreState: StateRestoreCallback? = null) {
     }
 
     dialog.show()
+
+    applyImmersiveToDialog(dialog)
 }
 
 private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
@@ -2181,6 +2212,8 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
         }
 
         dialog.show()
+
+        applyImmersiveToDialog(dialog)
     }
 
     fun openSubDelayDialog() {
@@ -2230,6 +2263,8 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
         picker.delay2 = if (player.secondarySid != -1) player.secondarySubDelay else null
 
         dialog.setOnShowListener {
+
+            applyImmersiveToDialog(dialog)
             dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener {
                 picker.delay1?.let { player.subDelay = it }
                 picker.delay2?.let { player.secondarySubDelay = it }
@@ -2238,6 +2273,8 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
         }
 
         dialog.show()
+
+        applyImmersiveToDialog(dialog)
     }
 
     /******/
