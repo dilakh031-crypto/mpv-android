@@ -156,21 +156,39 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
                 return
             lastSeekbarProgress = progress
 
-            val target = progress.toDouble() / SEEK_BAR_PRECISION
-            MPVLib.commandAsync(arrayOf("seek", target.toString(), "absolute+exact"), asyncSeekUserdataCounter++)
+            // Throttle + coalesce: keep exact seek, but don't flood libmpv with thousands
+            // of seek requests when the user drags quickly.
+            pendingSeekbarTarget = progress.toDouble() / SEEK_BAR_PRECISION
+
+            val now = SystemClock.uptimeMillis()
+            val elapsed = now - lastSeekbarSeekSentMs
+            seekbarSeekHandler.removeCallbacks(seekbarSeekRunnable)
+            if (elapsed >= SEEK_BAR_SEEK_MIN_INTERVAL_MS) {
+                lastSeekbarSeekSentMs = now
+                issueExactSeekAsync(pendingSeekbarTarget!!)
+            } else {
+                seekbarSeekHandler.postDelayed(seekbarSeekRunnable, SEEK_BAR_SEEK_MIN_INTERVAL_MS - elapsed)
+            }
+
             // Note: don't call updatePlaybackPos() here either
         }
 
         override fun onStartTrackingTouch(seekBar: SeekBar) {
             userIsOperatingSeekbar = true
             lastSeekbarProgress = Int.MIN_VALUE
+            pendingSeekbarTarget = null
+            lastSeekbarSeekSentMs = 0L
+            seekbarSeekHandler.removeCallbacks(seekbarSeekRunnable)
         }
 
         override fun onStopTrackingTouch(seekBar: SeekBar) {
             userIsOperatingSeekbar = false
-            // Ensure final position is applied (exact seek) even if the last movement didn't trigger onProgressChanged.
+
+            // Ensure final position is applied immediately (exact seek), and cancel any pending delayed request.
+            seekbarSeekHandler.removeCallbacks(seekbarSeekRunnable)
             val target = seekBar.progress.toDouble() / SEEK_BAR_PRECISION
-            MPVLib.commandAsync(arrayOf("seek", target.toString(), "absolute+exact"), asyncSeekUserdataCounter++)
+            pendingSeekbarTarget = target
+            issueExactSeekAsync(target)
             showControls() // re-trigger display timeout
         }
     }
@@ -254,7 +272,21 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
     // Smooth seeking performance: avoid spamming repeated exact seeks and avoid blocking UI thread.
     private var lastSmoothSeekPosSec: Int = Int.MIN_VALUE
     private var lastSeekbarProgress: Int = Int.MIN_VALUE
-    private var asyncSeekUserdataCounter: Long = 1L
+    private var pendingSeekbarTarget: Double? = null
+    private var lastSeekbarSeekSentMs: Long = 0L
+    private val seekbarSeekHandler = Handler(Looper.getMainLooper())
+    private val seekbarSeekRunnable = Runnable {
+        val target = pendingSeekbarTarget ?: return@Runnable
+        lastSeekbarSeekSentMs = SystemClock.uptimeMillis()
+        issueExactSeekAsync(target)
+    }
+
+    private fun issueExactSeekAsync(targetSeconds: Double) {
+        // Key point: when the user scrubs quickly we MUST cancel any older async seek requests,
+        // otherwise mpv may spend time seeking to intermediate positions first.
+        MPVLib.abortAsyncCommand(ASYNC_SEEK_USERDATA)
+        MPVLib.commandAsync(arrayOf("seek", targetSeconds.toString(), "absolute+exact"), ASYNC_SEEK_USERDATA)
+    }
     /* * */
 
     @SuppressLint("ClickableViewAccessibility")
@@ -3024,10 +3056,7 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
                     // 2) use async command to avoid blocking the UI thread.
                     if (newPos != lastSmoothSeekPosSec) {
                         lastSmoothSeekPosSec = newPos
-                        MPVLib.commandAsync(
-                            arrayOf("seek", newPosExact.toString(), "absolute+exact"),
-                            asyncSeekUserdataCounter++
-                        )
+                        issueExactSeekAsync(newPosExact)
                     }
                 } else {
                     // seek faster than assigning to timePos but less precise
@@ -3129,6 +3158,12 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
         private const val STREAM_TYPE = AudioManager.STREAM_MUSIC
         // precision used by seekbar (1/s)
         private const val SEEK_BAR_PRECISION = 2
+
+        // Smooth seek tuning:
+        // - throttle seekbar scrubbing to avoid flooding async seeks
+        // - reuse a fixed async userdata so we can cancel older seeks instantly
+        private const val SEEK_BAR_SEEK_MIN_INTERVAL_MS = 50L
+        private const val ASYNC_SEEK_USERDATA: Long = 0x5345454BL // 'SEEK'
 
         // Per-file subtitle persistence keys
         private const val PREF_SUB_KIND = "sub_kind"
