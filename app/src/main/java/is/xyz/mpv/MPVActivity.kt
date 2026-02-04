@@ -992,60 +992,6 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
         }
     }
 
-
-    /**
-     * Show an AlertDialog without letting it break immersive mode.
-     *
-     * Some OEM ROMs (notably Samsung) will temporarily show the status bar when a dialog window
-     * gains focus. We prevent that by making the dialog window NOT_FOCUSABLE before show(),
-     * applying the same system-bars policy as the activity, then clearing NOT_FOCUSABLE.
-     *
-     * This is intentionally "preemptive" (not hide-after) to avoid any visible status-bar flash.
-     */
-    private fun showImmersiveDialog(dialog: AlertDialog) {
-        fun applyToWindow() {
-            val w = dialog.window ?: return
-
-            // Hide the status bar for the dialog window at the framework level (prevents flashes on some devices).
-            @Suppress("DEPRECATION")
-            w.addFlags(WindowManager.LayoutParams.FLAG_FULLSCREEN)
-
-            WindowCompat.setDecorFitsSystemWindows(w, false)
-
-            val decor = w.decorView
-            val controller = WindowCompat.getInsetsController(w, decor)
-            controller.systemBarsBehavior =
-                WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
-
-            // Keep nav behavior consistent with the activity; just ensure the status bar stays hidden.
-            controller.hide(WindowInsetsCompat.Type.statusBars())
-
-            // Extra safety for older devices / OEM bugs: mirror the activity's legacy UI flags.
-            @Suppress("DEPRECATION")
-            decor.systemUiVisibility = (
-                window.decorView.systemUiVisibility or
-                    View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN or
-                    View.SYSTEM_UI_FLAG_FULLSCREEN or
-                    View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY
-            )
-        }
-
-        // Prevent the dialog window from taking focus (and triggering system bar changes) until
-        // we've applied immersive flags.
-        dialog.window?.addFlags(WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE)
-
-        dialog.setOnShowListener {
-            applyToWindow()
-            dialog.window?.clearFlags(WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE)
-        }
-
-        showImmersiveDialog(dialog)
-        // In case the window didn't exist before show() or the OEM re-applied flags, enforce again.
-        applyToWindow()
-        dialog.window?.clearFlags(WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE)
-    }
-
-
     private fun updateStats() {
         if (!statsFPS)
             return
@@ -1105,6 +1051,56 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
         val insetsController = WindowCompat.getInsetsController(window, window.decorView)
         insetsController.hide(WindowInsetsCompat.Type.systemBars())
     }
+
+    /**
+     * Some devices/OEMs temporarily show the status bar when a dialog/menu window gains focus.
+     * We want the player to stay immersive, and only allow revealing system bars via swipe.
+     *
+     * IMPORTANT: to prevent even a brief "flash" of the status bar, we must apply immersive
+     * flags BEFORE the dialog becomes focusable (Samsung/OEM behavior).
+     */
+    private fun applyImmersiveToWindow(w: Window) {
+        WindowCompat.setDecorFitsSystemWindows(w, false)
+        val controller = WindowCompat.getInsetsController(w, w.decorView)
+        controller.systemBarsBehavior =
+            WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+        controller.hide(WindowInsetsCompat.Type.systemBars())
+    }
+
+    /**
+     * Show an AlertDialog in true immersive mode (prevents the status bar from appearing at all).
+     * This uses FLAG_NOT_FOCUSABLE to keep the dialog from taking focus until after we apply
+     * the same immersive flags as the activity window.
+     */
+    private fun showImmersiveDialog(dialog: AlertDialog) {
+        // Prevent the dialog window from taking focus first (avoids system bars flashing in).
+        dialog.window?.setFlags(
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE,
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
+        )
+
+        dialog.show()
+
+        val w = dialog.window ?: return
+        // Copy the current immersive flags from the activity.
+        @Suppress("DEPRECATION")
+        w.decorView.systemUiVisibility = window.decorView.systemUiVisibility
+
+        applyImmersiveToWindow(w)
+
+        // Now allow focus/input again.
+        w.clearFlags(WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE)
+
+        // Re-apply once after focus is restored (extra safety on some ROMs).
+        applyImmersiveToWindow(w)
+    }
+
+    // Backwards-compatible helper for any existing onShow listeners.
+    private fun applyImmersiveToDialog(dialog: AlertDialog) {
+        dialog.window?.let { applyImmersiveToWindow(it) }
+    }
+
+
 
     /** Start fading out the controls */
     private fun hideControlsFade() {
@@ -1387,8 +1383,8 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
                 dialog.dismiss()
                 restore()
             }
-            val alert = create()
-            showImmersiveDialog(alert)
+            val dialog = create()
+            this@MPVActivity.showImmersiveDialog(dialog)
         }
     }
 
@@ -1797,6 +1793,7 @@ private fun openPlaylistMenu(restore: StateRestoreCallback, onBack: (() -> Unit)
                 create()
             }
             urlDialog.setOnShowListener {
+                this@MPVActivity.applyImmersiveToDialog(urlDialog)
                 urlDialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener {
                     val url = helper.text
                     if (url.isNotBlank()) {
@@ -1806,7 +1803,7 @@ private fun openPlaylistMenu(restore: StateRestoreCallback, onBack: (() -> Unit)
                     // Keep dialog open.
                 }
             }
-            showImmersiveDialog(urlDialog)
+            urlDialog.show()
         }
 
         override fun onItemPicked(item: MPVView.PlaylistItem) {
@@ -2163,6 +2160,8 @@ private fun openTopMenu(existingRestoreState: StateRestoreCallback? = null) {
     }
 
     dialog.setOnShowListener {
+
+        applyImmersiveToDialog(dialog)
         dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener {
             picker.number?.let {
                 if (picker.isInteger())
@@ -2285,6 +2284,8 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
         picker.delay2 = if (player.secondarySid != -1) player.secondarySubDelay else null
 
         dialog.setOnShowListener {
+
+            applyImmersiveToDialog(dialog)
             dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener {
                 picker.delay1?.let { player.subDelay = it }
                 picker.delay2?.let { player.secondarySubDelay = it }
