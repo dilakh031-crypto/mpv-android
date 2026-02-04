@@ -6,9 +6,9 @@ import android.util.Log
 import android.view.SurfaceHolder
 import android.view.SurfaceView
 
-// ontains only the essential code needed to get a picture on the screen
+// Contains only the essential code needed to get a picture on the screen
 
-abtract class BaseMPVView(context: Context, attrs: AttributeSet) : SurfaceView(context, attrs), SurfaceHolder.Callback {
+abstract class BaseMPVView(context: Context, attrs: AttributeSet) : SurfaceView(context, attrs), SurfaceHolder.Callback {
     /**
      * Initialize libmpv.
      *
