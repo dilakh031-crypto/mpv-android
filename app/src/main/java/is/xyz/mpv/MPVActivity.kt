@@ -3100,7 +3100,7 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
         // Tap timing (must match TouchGestures.TAP_DURATION).
         // - Double-tap gestures: fast window (ms)
         // - Single-tap control toggle: delayed slightly longer so double-tap can cancel it (ms)
-        private const val DOUBLE_TAP_TIMEOUT_MS = 150L
+        private const val DOUBLE_TAP_TIMEOUT_MS = 225L
         private const val SINGLE_TAP_TOGGLE_DELAY_MS = DOUBLE_TAP_TIMEOUT_MS + 20L
 
         // Reserve the very top portion of the screen for Android system gestures (notification
