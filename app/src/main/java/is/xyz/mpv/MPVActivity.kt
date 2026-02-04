@@ -69,9 +69,12 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
     private val fadeHandler = Handler(Looper.getMainLooper())
     // for use with stopServiceRunnable
     private val stopServiceHandler = Handler(Looper.getMainLooper())
-    // for deferring single-tap control toggling (so double-tap play/pause doesn't flash controls)
+    // For short-lived bookkeeping around tap-to-toggle (used to revert if a double-tap gesture fires).
     private val tapToggleHandler = Handler(Looper.getMainLooper())
-    private var pendingTapToggle: Runnable? = null
+
+    private data class TapToggleSnapshot(val atMs: Long, val wasVisible: Boolean)
+    private var lastTapToggleSnapshot: TapToggleSnapshot? = null
+    private var clearTapToggleSnapshotRunnable: Runnable? = null
 
     /**
      * DO NOT USE THIS
@@ -183,8 +186,8 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
         }
 
         override fun run() {
-            binding.topControls.animate().alpha(0f).setDuration(CONTROLS_FADE_DURATION)
-            binding.controls.animate().alpha(0f).setDuration(CONTROLS_FADE_DURATION).setListener(listener)
+            binding.topControls.animate().alpha(0f).setDuration(CONTROLS_FADE_OUT_DURATION)
+            binding.controls.animate().alpha(0f).setDuration(CONTROLS_FADE_OUT_DURATION).setListener(listener)
         }
     }
 
@@ -197,7 +200,7 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
         }
 
         override fun run() {
-            binding.unlockBtn.animate().alpha(0f).setDuration(CONTROLS_FADE_DURATION).setListener(listener)
+            binding.unlockBtn.animate().alpha(0f).setDuration(CONTROLS_FADE_OUT_DURATION).setListener(listener)
         }
     }
 
@@ -1011,26 +1014,44 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
             return
         }
 
-        // remove all callbacks that were to be run for fading
+        // Cancel any pending fade-out.
         fadeHandler.removeCallbacks(fadeRunnable)
-        binding.controls.animate().cancel()
-        binding.topControls.animate().cancel()
+        binding.controls.animate().setListener(null).cancel()
+        binding.topControls.animate().setListener(null).cancel()
+        binding.statsTextView.animate().setListener(null).cancel()
 
-        // reset controls alpha to be visible
-        binding.controls.alpha = 1f
-        binding.topControls.alpha = 1f
+        val wasHidden = binding.controls.visibility != View.VISIBLE
+        val wasDimmed = binding.controls.alpha < 1f || binding.topControls.alpha < 1f
 
-        if (binding.controls.visibility != View.VISIBLE) {
+        if (wasHidden) {
+            // Start from transparent so we can fade-in quickly (Samsung-like feel).
+            binding.controls.alpha = 0f
+            binding.topControls.alpha = 0f
+
             binding.controls.visibility = View.VISIBLE
             binding.topControls.visibility = View.VISIBLE
 
             if (this.statsFPS) {
                 updateStats()
+                binding.statsTextView.alpha = 0f
                 binding.statsTextView.visibility = View.VISIBLE
             }
 
             val insetsController = WindowCompat.getInsetsController(window, window.decorView)
             insetsController.show(WindowInsetsCompat.Type.navigationBars())
+        }
+
+        if (wasHidden || wasDimmed) {
+            binding.controls.animate().alpha(1f).setDuration(CONTROLS_FADE_IN_DURATION)
+            binding.topControls.animate().alpha(1f).setDuration(CONTROLS_FADE_IN_DURATION)
+            if (this.statsFPS)
+                binding.statsTextView.animate().alpha(1f).setDuration(CONTROLS_FADE_IN_DURATION)
+        } else {
+            // Ensure fully visible in case we were interrupted mid-animation.
+            binding.controls.alpha = 1f
+            binding.topControls.alpha = 1f
+            if (this.statsFPS)
+                binding.statsTextView.alpha = 1f
         }
 
         // add a new callback to hide the controls once again
@@ -1229,20 +1250,54 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
         }
         return true
     }
-
     private fun cancelPendingTapToggle() {
-        pendingTapToggle?.let { tapToggleHandler.removeCallbacks(it) }
-        pendingTapToggle = null
+        // We no longer defer single-tap toggling, but we still use this hook to cancel
+        // any delayed bookkeeping tasks (snapshot clearing).
+        clearTapToggleSnapshotRunnable?.let { tapToggleHandler.removeCallbacks(it) }
+        clearTapToggleSnapshotRunnable = null
+    }
+
+    
+
+    private fun revertTapToggleIfRecent() {
+        val snap = lastTapToggleSnapshot ?: return
+        lastTapToggleSnapshot = null
+        clearTapToggleSnapshotRunnable?.let { tapToggleHandler.removeCallbacks(it) }
+        clearTapToggleSnapshotRunnable = null
+
+        if (SystemClock.uptimeMillis() - snap.atMs > TAP_TOGGLE_REVERT_WINDOW_MS)
+            return
+
+        // Restore previous state to avoid double-tap actions flashing the control UI.
+        if (snap.wasVisible) {
+            showControls()
+        } else {
+            fadeHandler.removeCallbacks(fadeRunnable)
+            binding.controls.animate().setListener(null).cancel()
+            binding.topControls.animate().setListener(null).cancel()
+            binding.statsTextView.animate().setListener(null).cancel()
+            hideControls()
+        }
     }
 
     private fun scheduleSingleTapToggle() {
+        // Toggle immediately for zero perceived latency.
+        // We keep a short-lived snapshot so double-tap gestures can revert the toggle.
+        lastTapToggleSnapshot = TapToggleSnapshot(
+            SystemClock.uptimeMillis(),
+            binding.controls.visibility == View.VISIBLE && !fadeRunnable.hasStarted
+        )
+
+        // Clear the snapshot after the double-tap window.
         cancelPendingTapToggle()
-        val r = Runnable {
-            pendingTapToggle = null
-            toggleControls()
+        val clear = Runnable {
+            lastTapToggleSnapshot = null
+            clearTapToggleSnapshotRunnable = null
         }
-        pendingTapToggle = r
-        tapToggleHandler.postDelayed(r, TAP_TOGGLE_DELAY_MS)
+        clearTapToggleSnapshotRunnable = clear
+        tapToggleHandler.postDelayed(clear, TAP_TOGGLE_REVERT_WINDOW_MS)
+
+        toggleControls()
     }
 
     /**
@@ -3009,6 +3064,11 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
 
             /* Tap gestures */
             PropertyChange.SeekFixed -> {
+                // Double-tap seek should not toggle the control UI.
+                revertTapToggleIfRecent()
+                cancelPendingTapToggle()
+                mightWantToToggleControls = false
+
                 val seekTime = diff * 10f
                 val newPos = psc.positionSec + seekTime.toInt() // only for display
                 MPVLib.command(arrayOf("seek", seekTime.toString(), "relative"))
@@ -3019,11 +3079,17 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
             }
             PropertyChange.PlayPause -> {
                 // Double-tap play/pause should not trigger control UI.
+                revertTapToggleIfRecent()
                 cancelPendingTapToggle()
                 mightWantToToggleControls = false
                 player.cyclePause()
             }
             PropertyChange.Custom -> {
+                // Double-tap custom action should not toggle the control UI.
+                revertTapToggleIfRecent()
+                cancelPendingTapToggle()
+                mightWantToToggleControls = false
+
                 val keycode = 0x10002 + diff.toInt()
                 MPVLib.command(arrayOf("keypress", "0x%x".format(keycode)))
             }
@@ -3034,10 +3100,12 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
         private const val TAG = "mpv"
         // how long should controls be displayed on screen (ms)
         private const val CONTROLS_DISPLAY_TIMEOUT = 1500L
-        // how long controls fade to disappear (ms)
-        private const val CONTROLS_FADE_DURATION = 500L
-        // Delay single-tap UI toggling so double-tap play/pause won't show the controls.
-        private const val TAP_TOGGLE_DELAY_MS = 300L
+        // Controls fade-in/out durations (ms). Keep them very fast but non-zero to avoid a harsh pop.
+        private const val CONTROLS_FADE_IN_DURATION = 80L
+        private const val CONTROLS_FADE_OUT_DURATION = 80L
+        // If a double-tap gesture is recognized shortly after a single-tap toggle,
+        // revert the toggle so double-tap actions don't flash the control UI.
+        private const val TAP_TOGGLE_REVERT_WINDOW_MS = 320L
 
         // Reserve the very top portion of the screen for Android system gestures (notification
         // shade/status bar). We only suppress the tap-to-toggle if the finger *moves down*
