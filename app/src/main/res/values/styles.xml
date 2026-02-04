@@ -32,14 +32,7 @@
         <item name="android:windowTranslucentStatus">true</item>
         <item name="android:windowLayoutInDisplayCutoutMode">shortEdges</item>
         <item name="android:windowBackground">#000000</item>
-        <item name="alertDialogTheme">@style/AppTheme.Player.AlertDialog</item>
-    </style>
-
-    <!-- fullscreen dialog overlay for player (prevents status bar from appearing when menus/dialogs open) -->
-    <style name="AppTheme.Player.AlertDialog" parent="Theme.AppCompat.Dialog.Alert">
-        <item name="android:windowFullscreen">true</item>
-        <item name="android:windowLayoutInDisplayCutoutMode">shortEdges</item>
-    </style>
+</style>
 
     <!-- theme for preferences -->
     <style name="AppTheme.Preference" parent="Theme.Material3.DayNight">
@@ -56,7 +49,6 @@
         <item name="cornerFamily">rounded</item>
         <item name="android:colorBackground">?attr/colorSurface</item>
     </style>
-
 
     <!-- Material3 Switches -->
     <style name="Preference.SwitchPreferenceCompat" parent="Preference.SwitchPreferenceCompat.Material" tools:override="true">
