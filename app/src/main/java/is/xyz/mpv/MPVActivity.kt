@@ -150,16 +150,27 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
         override fun onProgressChanged(seekBar: SeekBar, progress: Int, fromUser: Boolean) {
             if (!fromUser)
                 return
-            player.timePos = progress.toDouble() / SEEK_BAR_PRECISION
+
+            // Deduplicate progress updates to avoid spamming exact seeks while dragging.
+            if (progress == lastSeekbarProgress)
+                return
+            lastSeekbarProgress = progress
+
+            val target = progress.toDouble() / SEEK_BAR_PRECISION
+            MPVLib.commandAsync(arrayOf("seek", target.toString(), "absolute+exact"), asyncSeekUserdataCounter++)
             // Note: don't call updatePlaybackPos() here either
         }
 
         override fun onStartTrackingTouch(seekBar: SeekBar) {
             userIsOperatingSeekbar = true
+            lastSeekbarProgress = Int.MIN_VALUE
         }
 
         override fun onStopTrackingTouch(seekBar: SeekBar) {
             userIsOperatingSeekbar = false
+            // Ensure final position is applied (exact seek) even if the last movement didn't trigger onProgressChanged.
+            val target = seekBar.progress.toDouble() / SEEK_BAR_PRECISION
+            MPVLib.commandAsync(arrayOf("seek", target.toString(), "absolute+exact"), asyncSeekUserdataCounter++)
             showControls() // re-trigger display timeout
         }
     }
@@ -239,6 +250,11 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
     private var playlistExitWarning = true
 
     private var smoothSeekGesture = false
+
+    // Smooth seeking performance: avoid spamming repeated exact seeks and avoid blocking UI thread.
+    private var lastSmoothSeekPosSec: Int = Int.MIN_VALUE
+    private var lastSeekbarProgress: Int = Int.MIN_VALUE
+    private var asyncSeekUserdataCounter: Long = 1L
     /* * */
 
     @SuppressLint("ClickableViewAccessibility")
@@ -2976,6 +2992,7 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
                 if (!isPlayingAudio)
                     maxVolume = 0 // disallow volume gesture if no audio
                 pausedForSeek = 0
+                lastSmoothSeekPosSec = Int.MIN_VALUE
 
                 fadeHandler.removeCallbacks(fadeRunnable3)
                 gestureTextView.visibility = View.VISIBLE
@@ -3002,7 +3019,16 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
                 val newPosExact = newPos.toDouble()
 
                 if (smoothSeekGesture) {
-                    player.timePos = newPosExact // (exact seek)
+                    // Exact seek while dragging, but:
+                    // 1) deduplicate to avoid repeating the same target over and over, and
+                    // 2) use async command to avoid blocking the UI thread.
+                    if (newPos != lastSmoothSeekPosSec) {
+                        lastSmoothSeekPosSec = newPos
+                        MPVLib.commandAsync(
+                            arrayOf("seek", newPosExact.toString(), "absolute+exact"),
+                            asyncSeekUserdataCounter++
+                        )
+                    }
                 } else {
                     // seek faster than assigning to timePos but less precise
                     MPVLib.command(arrayOf("seek", newPosExact.toString(), "absolute+keyframes"))
@@ -3032,6 +3058,7 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
                 gestureTextView.text = getString(R.string.ui_brightness, (newBright * 100).roundToInt())
             }
             PropertyChange.Finalize -> {
+                lastSmoothSeekPosSec = Int.MIN_VALUE
                 if (pausedForSeek == 1)
                     player.paused = false
                 gestureTextView.visibility = View.GONE

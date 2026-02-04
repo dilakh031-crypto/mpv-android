@@ -23,6 +23,9 @@ object MPVLib {
 
     external fun command(cmd: Array<out String>)
 
+    // Non-blocking variant; returns mpv error code (0 == success)
+    external fun commandAsync(cmd: Array<out String>, userdata: Long): Int
+
     external fun setOptionString(name: String, value: String): Int
 
     external fun grabThumbnail(dimension: Int): Bitmap?
