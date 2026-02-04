@@ -75,7 +75,6 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
     private data class TapToggleSnapshot(val atMs: Long, val wasVisible: Boolean)
     private var lastTapToggleSnapshot: TapToggleSnapshot? = null
     private var clearTapToggleSnapshotRunnable: Runnable? = null
-    private var pendingTapToggle: Runnable? = null
 
     /**
      * DO NOT USE THIS
@@ -768,19 +767,6 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
 
         gestures.syncSettings(prefs, resources)
 
-        // Cache double-tap (tap gesture) settings so we can avoid toggling the control UI
-        // on the first tap of a configured double-tap gesture (e.g. play/pause).
-        val tapLeft = prefs.getString("gesture_tap_left", resources.getString(R.string.pref_gesture_tap_left_default))
-            ?: resources.getString(R.string.pref_gesture_tap_left_default)
-        val tapCenter = prefs.getString("gesture_tap_center", resources.getString(R.string.pref_gesture_tap_center_default))
-            ?: resources.getString(R.string.pref_gesture_tap_center_default)
-        val tapRight = prefs.getString("gesture_tap_right", resources.getString(R.string.pref_gesture_tap_right_default))
-            ?: resources.getString(R.string.pref_gesture_tap_right_default)
-
-        doubleTapLeftEnabled = tapLeft != "none"
-        doubleTapCenterEnabled = tapCenter != "none"
-        doubleTapRightEnabled = tapRight != "none"
-
         val statsMode = prefs.getString("stats_mode", "") ?: ""
         this.statsFPS = statsMode == "native_fps"
         this.statsLuaMode = if (statsMode.startsWith("lua"))
@@ -957,11 +943,9 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
 
     private var mightWantToToggleControls = false
 
-    // Whether a double-tap gesture is configured for each screen region (used to avoid
-    // showing controls on the first tap of a double-tap, e.g. play/pause).
-    private var doubleTapLeftEnabled = false
-    private var doubleTapCenterEnabled = false
-    private var doubleTapRightEnabled = false
+    // True while processing the second tap of a double-tap gesture: we must not toggle
+    // the control UI, and we may need to undo an immediate single-tap toggle.
+    private var suppressTapToggleForCurrentGesture = false
 
     // Prevent accidental single-tap UI toggle while user swipes from the very top to open
     // Android's notification shade / status bar.
@@ -1214,10 +1198,23 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
             return super.dispatchTouchEvent(ev)
         }
 
-        // Any new touch down cancels a pending single-tap toggle (so double-tap won't flash controls).
+        // Tap-to-toggle controls is handled here (instead of inside the gesture view) so we can keep
+        // single-tap latency at ~0ms, while ensuring double-tap gestures (play/pause/seek/custom)
+        // do NOT change the control UI.
         if (ev.actionMasked == MotionEvent.ACTION_DOWN) {
+            // Always keep the "revert snapshot" alive while another gesture is starting,
+            // otherwise a slow-ish double-tap could miss the revert window.
             cancelPendingTapToggle()
-            mightWantToToggleControls = true
+
+            // If we *just* toggled controls from a single tap and a second tap begins within the
+            // double-tap window, suppress tap-to-toggle for this gesture. The double-tap action
+            // (play/pause/seek/custom) will fire via TouchGestures and revert the first toggle,
+            // leaving the control UI unchanged.
+            val snap = lastTapToggleSnapshot
+            suppressTapToggleForCurrentGesture =
+                snap != null && SystemClock.uptimeMillis() - snap.atMs <= TAP_TOGGLE_REVERT_WINDOW_MS
+
+            mightWantToToggleControls = !suppressTapToggleForCurrentGesture
 
             // If the gesture starts from the very top, treat it as a possible status-bar swipe.
             // We'll only cancel the tap-to-toggle if the finger moves down noticeably.
@@ -1255,25 +1252,33 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
             statusBarSwipeCandidate = false
             statusBarSwipeCanceledToggle = false
 
+            // If we were suppressing a toggle because this tap is part of a double-tap gesture,
+            // do nothing here (TouchGestures will fire the double-tap action separately).
+            if (suppressTapToggleForCurrentGesture) {
+                suppressTapToggleForCurrentGesture = false
+                mightWantToToggleControls = false
+                return true
+            }
+
             if (!mightWantToToggleControls)
                 return true
 
             // Defer toggling so a second tap (double-tap play/pause) can cancel it.
-            scheduleSingleTapToggle(ev.x)
+            scheduleSingleTapToggle()
             mightWantToToggleControls = false
         }
         if (ev.actionMasked == MotionEvent.ACTION_CANCEL) {
             cancelPendingTapToggle()
             mightWantToToggleControls = false
+            suppressTapToggleForCurrentGesture = false
             statusBarSwipeCandidate = false
             statusBarSwipeCanceledToggle = false
         }
         return true
     }
     private fun cancelPendingTapToggle() {
-        pendingTapToggle?.let { tapToggleHandler.removeCallbacks(it) }
-        pendingTapToggle = null
-
+        // We no longer defer single-tap toggling, but we still use this hook to cancel
+        // any delayed bookkeeping tasks (snapshot clearing).
         clearTapToggleSnapshotRunnable?.let { tapToggleHandler.removeCallbacks(it) }
         clearTapToggleSnapshotRunnable = null
     }
@@ -1301,36 +1306,9 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
         }
     }
 
-    private fun tapRegionHasDoubleTapAction(tapX: Float): Boolean {
-        // Mirror TouchGestures' regions:
-        // [ Left 28% ] [    Center    ] [ Right 28% ]
-        val w = when {
-            ::binding.isInitialized && binding.gestureLayer.width > 0 -> binding.gestureLayer.width.toFloat()
-            (window?.decorView?.width ?: 0) > 0 -> window.decorView.width.toFloat()
-            else -> 0f
-        }
-        if (w <= 0f) return false
-
-        return when {
-            tapX <= w * 0.28f -> doubleTapLeftEnabled
-            tapX >= w * 0.72f -> doubleTapRightEnabled
-            else -> doubleTapCenterEnabled
-        }
-    }
-
-    private fun scheduleDeferredTapToggle() {
-        cancelPendingTapToggle()
-        val r = Runnable {
-            pendingTapToggle = null
-            toggleControls()
-        }
-        pendingTapToggle = r
-        tapToggleHandler.postDelayed(r, TAP_TOGGLE_DELAY_MS)
-    }
-
-    private fun scheduleImmediateTapToggle() {
-        // Toggle immediately for near-zero perceived latency.
-        // Keep a short-lived snapshot so recognized double-taps can revert any accidental toggle.
+    private fun scheduleSingleTapToggle() {
+        // Toggle immediately for zero perceived latency.
+        // We keep a short-lived snapshot so double-tap gestures can revert the toggle.
         lastTapToggleSnapshot = TapToggleSnapshot(
             SystemClock.uptimeMillis(),
             binding.controls.visibility == View.VISIBLE && !fadeRunnable.hasStarted
@@ -1346,19 +1324,6 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
         tapToggleHandler.postDelayed(clear, TAP_TOGGLE_REVERT_WINDOW_MS)
 
         toggleControls()
-    }
-
-    private fun scheduleSingleTapToggle(tapX: Float) {
-        val controlsVisible = binding.controls.visibility == View.VISIBLE && !fadeRunnable.hasStarted
-
-        // If controls are currently hidden AND the tap happened in a region where a double-tap
-        // gesture is configured (e.g. play/pause), defer the UI toggle so double-tap won't
-        // make the controls appear. This restores the original behavior for double-tap pause.
-        if (!controlsVisible && tapRegionHasDoubleTapAction(tapX)) {
-            scheduleDeferredTapToggle()
-        } else {
-            scheduleImmediateTapToggle()
-        }
     }
 
     /**
@@ -3164,11 +3129,8 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
         // Controls fade-in/out durations (ms). Keep them very fast but non-zero to avoid a harsh pop.
         private const val CONTROLS_FADE_IN_DURATION = 80L
         private const val CONTROLS_FADE_OUT_DURATION = 80L
-        // Delay before toggling controls when a double-tap gesture might occur (ms).
-        // Kept equal to TouchGestures' double-tap window so the UI doesn't appear on double-tap pause.
-        private const val TAP_TOGGLE_DELAY_MS = 300L
-        // If a double-tap gesture is recognized shortly after an immediate single-tap toggle,
-        // revert the toggle so double-tap actions don't leave the control UI in the wrong state.
+        // If a double-tap gesture is recognized shortly after a single-tap toggle,
+        // revert the toggle so double-tap actions don't flash the control UI.
         private const val TAP_TOGGLE_REVERT_WINDOW_MS = 320L
 
         // Reserve the very top portion of the screen for Android system gestures (notification
