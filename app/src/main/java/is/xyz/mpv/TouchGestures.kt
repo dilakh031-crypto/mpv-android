@@ -83,12 +83,9 @@ internal class TouchGestures(private val observer: TouchGesturesObserver) {
         // ratio for trigger, 1/Xth of minimum dimension
         // for tap gestures this is the distance that must *not* be moved for it to trigger
         private const val TRIGGER_RATE = 30
-        // maximum duration between taps (ms) for a double tap to count
-        private const val DOUBLE_TAP_WINDOW_MS = 225L
 
-        // maximum press duration (ACTION_DOWN -> ACTION_UP) (ms) to still count as a tap
-        // (used for single-tap UI toggle as well as the first tap in a double-tap)
-        private const val SINGLE_TAP_MAX_DOWN_MS = 245L
+        // maximum duration between taps (ms) for a double tap to count
+        private const val TAP_DURATION = 225L
 
         // full sweep from left side to right side is 2:30
         private const val CONTROL_SEEK_MAX = 150f
@@ -130,11 +127,11 @@ internal class TouchGestures(private val observer: TouchGesturesObserver) {
             return false
 
         val now = SystemClock.uptimeMillis()
-        if (now - lastDownTime >= SINGLE_TAP_MAX_DOWN_MS) {
+        if (now - lastDownTime >= TAP_DURATION) {
             lastTapTime = 0 // finger was held too long, reset
             return false
         }
-        if (now - lastTapTime < DOUBLE_TAP_WINDOW_MS) {
+        if (now - lastTapTime < TAP_DURATION) {
             // [ Left 28% ] [    Center    ] [ Right 28% ]
             if (p.x <= width * 0.28f)
                 tapGestureLeft?.let { sendPropertyChange(it, -1f); return true }
