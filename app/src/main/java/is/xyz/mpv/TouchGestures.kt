@@ -85,7 +85,7 @@ internal class TouchGestures(private val observer: TouchGesturesObserver) {
         private const val TRIGGER_RATE = 30
 
         // maximum duration between taps (ms) for a double tap to count
-        private const val TAP_DURATION = 300L
+        private const val TAP_DURATION = 150L
 
         // full sweep from left side to right side is 2:30
         private const val CONTROL_SEEK_MAX = 150f
