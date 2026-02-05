@@ -22,7 +22,11 @@ object MPVLib {
     external fun detachSurface()
 
     external fun command(cmd: Array<out String>)
+
+    // Non-blocking commands (used for scrub-seek)
     external fun commandAsync(cmd: Array<out String>, userdata: Long): Int
+
+    // Abort an async request (e.g. cancel an in-flight seek)
     external fun abortAsyncCommand(userdata: Long)
 
     external fun setOptionString(name: String, value: String): Int
