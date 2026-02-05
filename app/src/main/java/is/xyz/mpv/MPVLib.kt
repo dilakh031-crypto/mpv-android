@@ -22,8 +22,6 @@ object MPVLib {
     external fun detachSurface()
 
     external fun command(cmd: Array<out String>)
-
-    // Non-blocking commands for fast scrubbing seeks
     external fun commandAsync(cmd: Array<out String>, userdata: Long): Int
     external fun abortAsyncCommand(userdata: Long)
 

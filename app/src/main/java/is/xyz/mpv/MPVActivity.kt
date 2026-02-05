@@ -88,6 +88,30 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
     private var didResumeBackgroundPlayback = false
     private var userIsOperatingSeekbar = false
 
+
+    // Fast live scrubbing seeks (show frames while dragging).
+    // Strategy:
+    // - Never block the UI thread.
+    // - Keep at most 1 seek truly in-flight.
+    // - If the user keeps moving, remember only the latest target.
+    // - Abort only when it is very likely cheaper than finishing the current seek.
+    private var scrubSeekInFlight = false
+    private var scrubInFlightTargetSec = Double.NaN
+    private var scrubInFlightIssuedAtMs = 0L
+
+    private var scrubPendingTargetSec = Double.NaN
+    private var scrubPendingExact = true
+
+    private var gestureScrubActive = false
+    private var seekbarScrubActive = false
+    private var resumeAfterScrubSeek = false
+
+    private var scrubAsyncCounter = 1L
+    private var lastScrubAsyncUserdata = 0L
+
+    private var lastGestureReportedSec = Int.MIN_VALUE
+    private var lastSeekbarReportedSec = Int.MIN_VALUE
+
     private var toast: Toast? = null
 
     private var audioManager: AudioManager? = null
@@ -146,39 +170,47 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
     // convenience alias
     private val player get() = binding.player
 
-    // Async seek (used for very fast smooth scrubbing without blocking UI)
-    private var scrubAsyncCounter: Long = 1L
-    private var lastScrubAsyncUserdata: Long = 0L
-    private var lastSeekbarTarget: Double = Double.NaN
-    private var lastGestureTargetSec: Int = Int.MIN_VALUE
-    /** 0 = initial, 1 = paused, 2 = was already paused */
-    private var pausedForSeekbar: Int = 0
-
     private val seekBarChangeListener = object : SeekBar.OnSeekBarChangeListener {
         override fun onProgressChanged(seekBar: SeekBar, progress: Int, fromUser: Boolean) {
-            if (!fromUser)
-                return
-            val target = progress.toDouble() / SEEK_BAR_PRECISION
-            if (target == lastSeekbarTarget)
-                return
-            lastSeekbarTarget = target
-            asyncSeekExact(target)
-            // Note: don't call updatePlaybackPos() here either
+            if (!fromUser) return
+
+            // Quantize to 1-second steps for a stable, fast preview.
+            val targetSec = (progress.toDouble() / SEEK_BAR_PRECISION).roundToInt()
+            if (targetSec == lastSeekbarReportedSec) return
+            lastSeekbarReportedSec = targetSec
+
+            seekbarScrubActive = true
+            requestScrubSeek(targetSec.toDouble(), exact = true, forceNow = false)
         }
 
         override fun onStartTrackingTouch(seekBar: SeekBar) {
             userIsOperatingSeekbar = true
-            lastSeekbarTarget = Double.NaN
-            pausedForSeekbar = if (psc.pause) 2 else 1
-            if (pausedForSeekbar == 1)
+            seekbarScrubActive = true
+            lastSeekbarReportedSec = Int.MIN_VALUE
+
+            // Pause while scrubbing (keep paused if it already was).
+            val wasPaused = psc.pause
+            if (!wasPaused) {
                 player.paused = true
+                resumeAfterScrubSeek = true
+            }
         }
 
         override fun onStopTrackingTouch(seekBar: SeekBar) {
             userIsOperatingSeekbar = false
-            if (pausedForSeekbar == 1)
+            seekbarScrubActive = false
+
+            // Force the latest target to win immediately on release.
+            if (lastSeekbarReportedSec != Int.MIN_VALUE) {
+                requestScrubSeek(lastSeekbarReportedSec.toDouble(), exact = true, forceNow = true)
+            }
+
+            // If nothing is in-flight, resume immediately.
+            if (resumeAfterScrubSeek && !scrubSeekInFlight) {
+                resumeAfterScrubSeek = false
                 player.paused = false
-            pausedForSeekbar = 0
+            }
+
             showControls() // re-trigger display timeout
         }
     }
@@ -2919,6 +2951,11 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
         if (eventId == MpvEvent.MPV_EVENT_SHUTDOWN)
             finishWithResult(if (playbackHasStarted) RESULT_OK else RESULT_CANCELED)
 
+        if (eventId == MpvEvent.MPV_EVENT_PLAYBACK_RESTART) {
+            // A seek completed (including our async scrub seeks).
+            onScrubSeekPlaybackRestart()
+        }
+
         if (eventId == MpvEvent.MPV_EVENT_VIDEO_RECONFIG || eventId == MpvEvent.MPV_EVENT_FILE_LOADED) {
             eventUiHandler.post { hideStartupPreview() }
         }
@@ -2959,24 +2996,80 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
         eventUiHandler.post { eventUi(eventId) }
     }
 
-    private fun abortLastAsyncSeek() {
+
+    private fun abortInFlightScrubSeek() {
         val ud = lastScrubAsyncUserdata
         if (ud != 0L) {
             try { MPVLib.abortAsyncCommand(ud) } catch (_: Throwable) {}
-            lastScrubAsyncUserdata = 0L
         }
+        lastScrubAsyncUserdata = 0L
+        scrubSeekInFlight = false
+        scrubInFlightTargetSec = Double.NaN
+        scrubInFlightIssuedAtMs = 0L
     }
 
-    private fun asyncSeekExact(targetSec: Double) {
-        // Always keep the latest target: cancel previous seek and issue a new one.
-        abortLastAsyncSeek()
+    private fun issueScrubSeek(targetSec: Double, exact: Boolean) {
+        // Always send this through mpv_command_async so the UI never blocks.
         val ud = scrubAsyncCounter++
         lastScrubAsyncUserdata = ud
+        val mode = if (exact) "absolute+exact" else "absolute+keyframes"
         try {
-            MPVLib.commandAsync(arrayOf("seek", targetSec.toString(), "absolute+exact"), ud)
+            MPVLib.commandAsync(arrayOf("seek", targetSec.toString(), mode), ud)
         } catch (_: Throwable) {
-            // Fallback (older builds): property set may block, but at least works.
-            player.timePos = targetSec
+            // Fallback (should be rare). This might block, but keeps functionality.
+            MPVLib.command(arrayOf("seek", targetSec.toString(), mode))
+            lastScrubAsyncUserdata = 0L
+        }
+        scrubSeekInFlight = true
+        scrubInFlightTargetSec = targetSec
+        scrubInFlightIssuedAtMs = SystemClock.uptimeMillis()
+    }
+
+    private fun shouldAbortInFlightSeekFor(newTargetSec: Double): Boolean {
+        if (!scrubSeekInFlight || scrubInFlightTargetSec.isNaN()) return true
+        val age = SystemClock.uptimeMillis() - scrubInFlightIssuedAtMs
+        val dist = kotlin.math.abs(newTargetSec - scrubInFlightTargetSec)
+        // If the user changes target very quickly, abort early (cheap). If they jump far, abort too.
+        return (age < SCRUB_ABORT_WINDOW_MS) || (dist >= SCRUB_ABORT_DISTANCE_SEC)
+    }
+
+    private fun requestScrubSeek(targetSec: Double, exact: Boolean, forceNow: Boolean) {
+        scrubPendingTargetSec = targetSec
+        scrubPendingExact = exact
+
+        if (!scrubSeekInFlight) {
+            issueScrubSeek(scrubPendingTargetSec, scrubPendingExact)
+            return
+        }
+
+        if (forceNow || shouldAbortInFlightSeekFor(scrubPendingTargetSec)) {
+            abortInFlightScrubSeek()
+            issueScrubSeek(scrubPendingTargetSec, scrubPendingExact)
+        }
+        // else: let current seek finish; we will immediately seek to the latest pending target on PLAYBACK_RESTART.
+    }
+
+    private fun onScrubSeekPlaybackRestart() {
+        if (!scrubSeekInFlight && lastScrubAsyncUserdata == 0L) return
+
+        val completedTarget = scrubInFlightTargetSec
+        scrubSeekInFlight = false
+        scrubInFlightTargetSec = Double.NaN
+        scrubInFlightIssuedAtMs = 0L
+        lastScrubAsyncUserdata = 0L
+
+        // If still scrubbing and a newer target exists, go there next.
+        if ((gestureScrubActive || seekbarScrubActive) && !scrubPendingTargetSec.isNaN()) {
+            if (completedTarget.isNaN() || kotlin.math.abs(scrubPendingTargetSec - completedTarget) > 1e-6) {
+                issueScrubSeek(scrubPendingTargetSec, scrubPendingExact)
+                return
+            }
+        }
+
+        // If finger is released and we paused only for scrubbing, resume now.
+        if (resumeAfterScrubSeek && !gestureScrubActive && !seekbarScrubActive) {
+            resumeAfterScrubSeek = false
+            player.paused = false
         }
     }
 
@@ -3016,7 +3109,8 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
                 if (!isPlayingAudio)
                     maxVolume = 0 // disallow volume gesture if no audio
                 pausedForSeek = 0
-                lastGestureTargetSec = Int.MIN_VALUE
+                gestureScrubActive = false
+                lastGestureReportedSec = Int.MIN_VALUE
 
                 fadeHandler.removeCallbacks(fadeRunnable3)
                 gestureTextView.visibility = View.VISIBLE
@@ -3027,27 +3121,27 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
                 val duration = (psc.duration / 1000f)
                 if (duration == 0f || initialSeek < 0)
                     return
+
                 // Pause while seeking (finger still on screen) and only resume on release.
                 // If playback was already paused, keep it paused.
                 if (pausedForSeek == 0) {
                     pausedForSeek = if (psc.pause) 2 else 1
                     if (pausedForSeek == 1)
                         player.paused = true
+                    gestureScrubActive = true
+                    lastGestureReportedSec = Int.MIN_VALUE
                 }
 
-                // Quantize to 1 second steps (Samsung-like feel on slow drags).
+                // Quantize to 1 second steps.
                 val startPos = initialSeek.roundToInt()
                 val deltaSec = diff.roundToInt()
                 val newPos = (startPos + deltaSec).coerceIn(0, duration.roundToInt())
                 val newDiff = newPos - startPos
-                val newPosExact = newPos.toDouble()
 
-                if (newPos != lastGestureTargetSec) {
-                    lastGestureTargetSec = newPos
-                    asyncSeekExact(newPosExact)
+                if (newPos != lastGestureReportedSec) {
+                    lastGestureReportedSec = newPos
+                    requestScrubSeek(newPos.toDouble(), exact = true, forceNow = false)
                 }
-                // Note: don't call updatePlaybackPos() here because mpv will seek a timestamp
-                // actually present in the file, and not the exact one we specified.
 
                 val posText = Utils.prettyTime(newPos)
                 val diffText = Utils.prettyTime(newDiff, true)
@@ -3071,8 +3165,23 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
                 gestureTextView.text = getString(R.string.ui_brightness, (newBright * 100).roundToInt())
             }
             PropertyChange.Finalize -> {
-                if (pausedForSeek == 1)
+                gestureScrubActive = false
+
+                val shouldResume = (pausedForSeek == 1)
+                if (shouldResume)
+                    resumeAfterScrubSeek = true
+
+                // Force the latest target to win immediately on release.
+                if (lastGestureReportedSec != Int.MIN_VALUE) {
+                    requestScrubSeek(lastGestureReportedSec.toDouble(), exact = true, forceNow = true)
+                }
+
+                // If nothing is in-flight, resume immediately.
+                if (shouldResume && !scrubSeekInFlight) {
+                    resumeAfterScrubSeek = false
                     player.paused = false
+                }
+
                 gestureTextView.visibility = View.GONE
             }
 
@@ -3141,6 +3250,10 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
         private const val STREAM_TYPE = AudioManager.STREAM_MUSIC
         // precision used by seekbar (1/s)
         private const val SEEK_BAR_PRECISION = 2
+
+        // Scrub seek heuristics
+        private const val SCRUB_ABORT_WINDOW_MS = 70L
+        private const val SCRUB_ABORT_DISTANCE_SEC = 2.0
 
         // Per-file subtitle persistence keys
         private const val PREF_SUB_KIND = "sub_kind"
