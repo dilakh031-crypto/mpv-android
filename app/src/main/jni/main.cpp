@@ -110,7 +110,6 @@ jni_func(void, command, jobjectArray jarray) {
         env->ReleaseStringUTFChars((jstring)env->GetObjectArrayElement(jarray, i), arguments[i]);
 }
 
-
 jni_func(jint, commandAsync, jobjectArray jarray, jlong userdata) {
     CHECK_MPV_INIT();
 
