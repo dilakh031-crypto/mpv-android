@@ -27,7 +27,6 @@ extern "C" {
 
     jni_func(void, command, jobjectArray jarray);
     jni_func(jint, commandAsync, jobjectArray jarray, jlong userdata);
-    jni_func(void, abortAsyncCommand, jlong userdata);
 };
 
 JavaVM *g_vm;
@@ -132,10 +131,5 @@ jni_func(jint, commandAsync, jobjectArray jarray, jlong userdata) {
     }
 
     return err;
-}
-
-jni_func(void, abortAsyncCommand, jlong userdata) {
-    CHECK_MPV_INIT();
-    mpv_abort_async_command(g_mpv, (uint64_t)userdata);
 }
 
