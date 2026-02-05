@@ -146,31 +146,39 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
     // convenience alias
     private val player get() = binding.player
 
+    // Async seek (used for very fast smooth scrubbing without blocking UI)
+    private var scrubAsyncCounter: Long = 1L
+    private var lastScrubAsyncUserdata: Long = 0L
+    private var lastSeekbarTarget: Double = Double.NaN
+    private var lastGestureTargetSec: Int = Int.MIN_VALUE
+    /** 0 = initial, 1 = paused, 2 = was already paused */
+    private var pausedForSeekbar: Int = 0
+
     private val seekBarChangeListener = object : SeekBar.OnSeekBarChangeListener {
         override fun onProgressChanged(seekBar: SeekBar, progress: Int, fromUser: Boolean) {
             if (!fromUser)
                 return
-
-            // Deduplicate progress updates to avoid spamming exact seeks while dragging.
-            if (progress == lastSeekbarProgress)
-                return
-            lastSeekbarProgress = progress
-
             val target = progress.toDouble() / SEEK_BAR_PRECISION
-            MPVLib.commandAsync(arrayOf("seek", target.toString(), "absolute+exact"), asyncSeekUserdataCounter++)
+            if (target == lastSeekbarTarget)
+                return
+            lastSeekbarTarget = target
+            asyncSeekExact(target)
             // Note: don't call updatePlaybackPos() here either
         }
 
         override fun onStartTrackingTouch(seekBar: SeekBar) {
             userIsOperatingSeekbar = true
-            lastSeekbarProgress = Int.MIN_VALUE
+            lastSeekbarTarget = Double.NaN
+            pausedForSeekbar = if (psc.pause) 2 else 1
+            if (pausedForSeekbar == 1)
+                player.paused = true
         }
 
         override fun onStopTrackingTouch(seekBar: SeekBar) {
             userIsOperatingSeekbar = false
-            // Ensure final position is applied (exact seek) even if the last movement didn't trigger onProgressChanged.
-            val target = seekBar.progress.toDouble() / SEEK_BAR_PRECISION
-            MPVLib.commandAsync(arrayOf("seek", target.toString(), "absolute+exact"), asyncSeekUserdataCounter++)
+            if (pausedForSeekbar == 1)
+                player.paused = false
+            pausedForSeekbar = 0
             showControls() // re-trigger display timeout
         }
     }
@@ -250,11 +258,6 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
     private var playlistExitWarning = true
 
     private var smoothSeekGesture = false
-
-    // Smooth seeking performance: avoid spamming repeated exact seeks and avoid blocking UI thread.
-    private var lastSmoothSeekPosSec: Int = Int.MIN_VALUE
-    private var lastSeekbarProgress: Int = Int.MIN_VALUE
-    private var asyncSeekUserdataCounter: Long = 1L
     /* * */
 
     @SuppressLint("ClickableViewAccessibility")
@@ -2956,6 +2959,27 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
         eventUiHandler.post { eventUi(eventId) }
     }
 
+    private fun abortLastAsyncSeek() {
+        val ud = lastScrubAsyncUserdata
+        if (ud != 0L) {
+            try { MPVLib.abortAsyncCommand(ud) } catch (_: Throwable) {}
+            lastScrubAsyncUserdata = 0L
+        }
+    }
+
+    private fun asyncSeekExact(targetSec: Double) {
+        // Always keep the latest target: cancel previous seek and issue a new one.
+        abortLastAsyncSeek()
+        val ud = scrubAsyncCounter++
+        lastScrubAsyncUserdata = ud
+        try {
+            MPVLib.commandAsync(arrayOf("seek", targetSec.toString(), "absolute+exact"), ud)
+        } catch (_: Throwable) {
+            // Fallback (older builds): property set may block, but at least works.
+            player.timePos = targetSec
+        }
+    }
+
     // Gesture handler
 
     private var initialSeek = 0f
@@ -2992,7 +3016,7 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
                 if (!isPlayingAudio)
                     maxVolume = 0 // disallow volume gesture if no audio
                 pausedForSeek = 0
-                lastSmoothSeekPosSec = Int.MIN_VALUE
+                lastGestureTargetSec = Int.MIN_VALUE
 
                 fadeHandler.removeCallbacks(fadeRunnable3)
                 gestureTextView.visibility = View.VISIBLE
@@ -3018,20 +3042,9 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
                 val newDiff = newPos - startPos
                 val newPosExact = newPos.toDouble()
 
-                if (smoothSeekGesture) {
-                    // Exact seek while dragging, but:
-                    // 1) deduplicate to avoid repeating the same target over and over, and
-                    // 2) use async command to avoid blocking the UI thread.
-                    if (newPos != lastSmoothSeekPosSec) {
-                        lastSmoothSeekPosSec = newPos
-                        MPVLib.commandAsync(
-                            arrayOf("seek", newPosExact.toString(), "absolute+exact"),
-                            asyncSeekUserdataCounter++
-                        )
-                    }
-                } else {
-                    // seek faster than assigning to timePos but less precise
-                    MPVLib.command(arrayOf("seek", newPosExact.toString(), "absolute+keyframes"))
+                if (newPos != lastGestureTargetSec) {
+                    lastGestureTargetSec = newPos
+                    asyncSeekExact(newPosExact)
                 }
                 // Note: don't call updatePlaybackPos() here because mpv will seek a timestamp
                 // actually present in the file, and not the exact one we specified.
@@ -3058,7 +3071,6 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
                 gestureTextView.text = getString(R.string.ui_brightness, (newBright * 100).roundToInt())
             }
             PropertyChange.Finalize -> {
-                lastSmoothSeekPosSec = Int.MIN_VALUE
                 if (pausedForSeek == 1)
                     player.paused = false
                 gestureTextView.visibility = View.GONE
