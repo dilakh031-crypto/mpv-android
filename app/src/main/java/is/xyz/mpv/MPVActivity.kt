@@ -88,8 +88,7 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
     private var didResumeBackgroundPlayback = false
     private var userIsOperatingSeekbar = false
 
-    // Scrub seeking: freeze frame while moving, seek only on idle/release.
-    // Uses async mpv commands to avoid UI stalls.
+    // Scrub seeking: freeze video while moving; commit one exact seek on idle / release.
     private val scrubSeekHandler = Handler(Looper.getMainLooper())
     private var scrubSeekInFlight = false
     private var resumeAfterScrubSeek = false
@@ -98,10 +97,14 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
 
     private var gestureScrubActive = false
     private var pendingGestureSeekSec: Int? = null
+    private var lastGestureStableTargetSec: Int? = null
+    private var gestureStableTicks = 0
     private var lastIssuedGestureSeekSec: Int? = null
 
     private var seekbarScrubActive = false
     private var pendingSeekbarSeekPos: Double? = null
+    private var lastSeekbarStableTargetPos: Double? = null
+    private var seekbarStableTicks = 0
     private var lastIssuedSeekbarSeekPos: Double? = null
 
     /** 0 = initial, 1 = paused, 2 = was already paused */
@@ -170,53 +173,49 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
 
     private val seekBarChangeListener = object : SeekBar.OnSeekBarChangeListener {
         override fun onProgressChanged(seekBar: SeekBar, progress: Int, fromUser: Boolean) {
-            if (!fromUser)
-                return
+            if (!fromUser) return
 
-            // Freeze the current frame while the user is dragging.
-            // Only do a single exact seek when the finger stops moving briefly (idle), or on release.
+            // Freeze the current frame while dragging; do not seek on every movement.
+            // Commit a single exact seek when the finger stops moving briefly (idle) or on release.
             pendingSeekbarSeekPos = progress.toDouble() / SEEK_BAR_PRECISION
 
-            // If an earlier idle-seek is still running, abort it so we don't update frames while moving.
+            // If an idle seek is in-flight, cancel it so no new frame appears while still moving.
             if (scrubSeekInFlight) {
                 abortLastScrubSeek()
                 scrubSeekInFlight = false
             }
 
-            // lightweight feedback only (no frame update)
-            binding.gestureTextView.visibility = View.VISIBLE
-            binding.gestureTextView.text = Utils.prettyTime(pendingSeekbarSeekPos!!.toInt())
-
+            // Reset stability tracking and schedule idle seek.
+            seekbarStableTicks = 0
             scrubSeekHandler.removeCallbacks(seekbarIdleSeekRunnable)
             scrubSeekHandler.postDelayed(seekbarIdleSeekRunnable, SCRUB_IDLE_SEEK_DELAY_MS)
         }
 
         override fun onStartTrackingTouch(seekBar: SeekBar) {
             userIsOperatingSeekbar = true
+
             seekbarScrubActive = true
             pendingSeekbarSeekPos = null
             lastIssuedSeekbarSeekPos = null
+            lastSeekbarStableTargetPos = null
+            seekbarStableTicks = 0
 
-            // Pause while scrubbing (keep paused if it already was).
+            // Pause while scrubbing; resume only on release (if we paused it).
             pausedForSeekbar = if (psc.pause) 2 else 1
-            if (pausedForSeekbar == 1)
-                player.paused = true
-
-            fadeHandler.removeCallbacks(fadeRunnable3)
-            binding.gestureTextView.visibility = View.VISIBLE
-            binding.gestureTextView.text = ""
+            if (pausedForSeekbar == 1) player.paused = true
         }
 
         override fun onStopTrackingTouch(seekBar: SeekBar) {
             userIsOperatingSeekbar = false
-            seekbarScrubActive = false
 
+            seekbarScrubActive = false
             scrubSeekHandler.removeCallbacks(seekbarIdleSeekRunnable)
 
-            val target = pendingSeekbarSeekPos
             val shouldResume = (pausedForSeekbar == 1)
             if (shouldResume) resumeAfterScrubSeek = true
 
+            // Final commit seek on release.
+            val target = pendingSeekbarSeekPos
             if (target != null && lastIssuedSeekbarSeekPos != target) {
                 lastIssuedSeekbarSeekPos = target
                 sendScrubExactSeek(target)
@@ -228,7 +227,6 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
                 player.paused = false
             }
 
-            binding.gestureTextView.visibility = View.GONE
             showControls() // re-trigger display timeout
         }
     }
@@ -2970,11 +2968,11 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
             finishWithResult(if (playbackHasStarted) RESULT_OK else RESULT_CANCELED)
 
         if (eventId == MpvEvent.MPV_EVENT_PLAYBACK_RESTART) {
-            // A seek completed. If the user has released the finger, resume playback now.
+            // A seek finished decoding. If the user has released, resume now.
             scrubSeekInFlight = false
             if (resumeAfterScrubSeek && !gestureScrubActive && !seekbarScrubActive) {
                 resumeAfterScrubSeek = false
-                eventUiHandler.post { player.paused = false }
+                eventUiHandler.post { try { player.paused = false } catch (_: Throwable) {} }
             }
         }
 
@@ -2984,6 +2982,22 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
 
         if (eventId == MpvEvent.MPV_EVENT_START_FILE) {
             // Reset any view-level zoom/pan when a new file starts.
+
+            // Reset scrub-seek state for the new file.
+            resumeAfterScrubSeek = false
+            scrubSeekInFlight = false
+            gestureScrubActive = false
+            seekbarScrubActive = false
+            pendingGestureSeekSec = null
+            pendingSeekbarSeekPos = null
+            lastIssuedGestureSeekSec = null
+            lastIssuedSeekbarSeekPos = null
+            lastGestureStableTargetSec = null
+            lastSeekbarStableTargetPos = null
+            gestureStableTicks = 0
+            seekbarStableTicks = 0
+            scrubSeekHandler.removeCallbacks(gestureIdleSeekRunnable)
+            scrubSeekHandler.removeCallbacks(seekbarIdleSeekRunnable)
 
             // Apply orientation as early as possible for playlist items, so we don't show the wrong orientation first.
             // Must run on the UI thread.
@@ -3019,6 +3033,7 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
     }
 
     // --- Scrub seek helpers ---
+    // Freeze the frame while the finger is moving, then do a single exact seek on idle/release.
     private fun abortLastScrubSeek() {
         val ud = lastScrubAsyncUserdata
         if (ud != 0L) {
@@ -3027,7 +3042,7 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
     }
 
     private fun sendScrubExactSeek(targetSec: Double) {
-        // Cancel the previous async seek so the latest target wins.
+        // Cancel any previous async seek so the latest target wins.
         abortLastScrubSeek()
         val ud = scrubAsyncCounter++
         lastScrubAsyncUserdata = ud
@@ -3038,6 +3053,19 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
     private fun performGestureIdleSeek() {
         if (!gestureScrubActive) return
         val target = pendingGestureSeekSec ?: return
+
+        if (lastGestureStableTargetSec == target) {
+            gestureStableTicks += 1
+        } else {
+            lastGestureStableTargetSec = target
+            gestureStableTicks = 1
+        }
+
+        if (gestureStableTicks < SCRUB_IDLE_STABILITY_TICKS) {
+            scrubSeekHandler.postDelayed(gestureIdleSeekRunnable, SCRUB_IDLE_SEEK_DELAY_MS)
+            return
+        }
+
         if (lastIssuedGestureSeekSec == target) return
         lastIssuedGestureSeekSec = target
         sendScrubExactSeek(target.toDouble())
@@ -3046,6 +3074,19 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
     private fun performSeekbarIdleSeek() {
         if (!seekbarScrubActive) return
         val target = pendingSeekbarSeekPos ?: return
+
+        if (lastSeekbarStableTargetPos == target) {
+            seekbarStableTicks += 1
+        } else {
+            lastSeekbarStableTargetPos = target
+            seekbarStableTicks = 1
+        }
+
+        if (seekbarStableTicks < SCRUB_IDLE_STABILITY_TICKS) {
+            scrubSeekHandler.postDelayed(seekbarIdleSeekRunnable, SCRUB_IDLE_SEEK_DELAY_MS)
+            return
+        }
+
         if (lastIssuedSeekbarSeekPos == target) return
         lastIssuedSeekbarSeekPos = target
         sendScrubExactSeek(target)
@@ -3088,9 +3129,11 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
                     maxVolume = 0 // disallow volume gesture if no audio
                 pausedForSeek = 0
 
-                // Reset scrub-seek state for gestures
+                // Reset scrub-seek gesture state
                 gestureScrubActive = false
                 pendingGestureSeekSec = null
+                lastGestureStableTargetSec = null
+                gestureStableTicks = 0
                 lastIssuedGestureSeekSec = null
                 scrubSeekHandler.removeCallbacks(gestureIdleSeekRunnable)
 
@@ -3112,6 +3155,8 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
 
                     gestureScrubActive = true
                     pendingGestureSeekSec = null
+                    lastGestureStableTargetSec = null
+                    gestureStableTicks = 0
                     lastIssuedGestureSeekSec = null
                     scrubSeekHandler.removeCallbacks(gestureIdleSeekRunnable)
                 }
@@ -3122,14 +3167,18 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
                 val newPos = (startPos + deltaSec).coerceIn(0, duration.roundToInt())
                 val newDiff = newPos - startPos
 
-                // Freeze frame while moving: do not seek on every move.
-                // Only commit an exact seek when the finger stops moving briefly (idle) or on release.
+                // IMPORTANT: Do NOT seek while the finger is moving.
+                // We only do a single seek when the finger stops moving briefly (idle) or on release.
+                pendingGestureSeekSec = newPos
+
+                // If an idle seek is in-flight, cancel it so no new frame appears while still moving.
                 if (scrubSeekInFlight) {
                     abortLastScrubSeek()
                     scrubSeekInFlight = false
                 }
 
-                pendingGestureSeekSec = newPos
+                // Reset stability tracking and schedule idle seek.
+                gestureStableTicks = 0
                 scrubSeekHandler.removeCallbacks(gestureIdleSeekRunnable)
                 scrubSeekHandler.postDelayed(gestureIdleSeekRunnable, SCRUB_IDLE_SEEK_DELAY_MS)
 
@@ -3155,12 +3204,12 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
                 gestureTextView.text = getString(R.string.ui_brightness, (newBright * 100).roundToInt())
             }
             PropertyChange.Finalize -> {
-                gestureScrubActive = false
+                // End of gesture scrub. Commit one final exact seek and then resume if needed.
                 scrubSeekHandler.removeCallbacks(gestureIdleSeekRunnable)
+                gestureScrubActive = false
 
                 val shouldResume = (pausedForSeek == 1)
-                if (shouldResume)
-                    resumeAfterScrubSeek = true
+                if (shouldResume) resumeAfterScrubSeek = true
 
                 val target = pendingGestureSeekSec
                 if (target != null && lastIssuedGestureSeekSec != target) {
@@ -3174,8 +3223,8 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
                     player.paused = false
                 }
 
-                pendingGestureSeekSec = null
                 pausedForSeek = 0
+                pendingGestureSeekSec = null
                 gestureTextView.visibility = View.GONE
             }
 
@@ -3245,8 +3294,10 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
         // precision used by seekbar (1/s)
         private const val SEEK_BAR_PRECISION = 2
 
-        // Scrub-seek: if the finger stops moving for this long, we commit one exact seek.
+        // Scrub seek: consider the finger "idle" after this many ms without movement.
+        // NOTE: Even with a very low delay, we require multiple stable ticks to avoid seeking mid-move.
         private const val SCRUB_IDLE_SEEK_DELAY_MS = 10L
+        private const val SCRUB_IDLE_STABILITY_TICKS = 2
 
         // Per-file subtitle persistence keys
         private const val PREF_SUB_KIND = "sub_kind"
