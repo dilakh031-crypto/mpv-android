@@ -23,7 +23,7 @@ object MPVLib {
 
     external fun command(cmd: Array<out String>)
 
-    // Async commands (used for non-blocking scrub seeking)
+    // Non-blocking commands (used for very fast scrubbing seeks)
     external fun commandAsync(cmd: Array<out String>, userdata: Long): Int
     external fun abortAsyncCommand(userdata: Long)
 
