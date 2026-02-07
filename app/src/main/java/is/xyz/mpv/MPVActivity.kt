@@ -57,6 +57,9 @@ import androidx.media.AudioFocusRequestCompat
 import androidx.media.AudioManagerCompat
 import java.io.File
 import java.lang.IllegalArgumentException
+import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.TimeoutException
 import kotlin.math.roundToInt
 
 typealias ActivityResultCallback = (Int, Intent?) -> Unit
@@ -111,6 +114,10 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
     private val gestureIdleSeekRunnable = Runnable { performGestureIdleSeek() }
     private val seekbarIdleSeekRunnable = Runnable { performSeekbarIdleSeek() }
 
+
+    private val scrubSeekTimeoutRunnable = Runnable { handleScrubSeekTimeout() }
+    private var scrubSeekTimeoutAtMs: Long = 0L
+
     private var toast: Toast? = null
 
     private var audioManager: AudioManager? = null
@@ -124,6 +131,23 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
     private var pendingFinishAfterRotate: Boolean = false
     private var exitRequestedOrientation: Int = ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
     private var lastOrientationProbePath: String? = null
+
+
+    // Background metadata probing (avoids UI thread stalls) + small LRU cache.
+    private val orientationProbeLock = Any()
+    private val orientationProbeCache =
+        object : LinkedHashMap<String, ProbedOrientation>(64, 0.75f, true) {
+            override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, ProbedOrientation>): Boolean {
+                return size > 64
+            }
+        }
+
+    private val metadataProbeExecutor = Executors.newFixedThreadPool(2) { r ->
+        Thread(r, "metadata_probe").apply { isDaemon = true }
+    }
+
+    // Monotonic token to ignore stale async probe results.
+    private var orientationProbeToken: Long = 0L
 
     // When auto-rotation is enabled, mpv can briefly report an unknown/square aspect ratio
     // (especially during startup / demuxer init). If we immediately react to that by setting
@@ -433,7 +457,7 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
             if (autoRotationMode == "auto" &&
                 packageManager.hasSystemFeature(PackageManager.FEATURE_SCREEN_PORTRAIT)
             ) {
-                val probed = probeOrientationFromMetadata(filepath)
+                val probed = probeOrientationFromMetadataFast(filepath)
                 val desired = when (probed) {
                     ProbedOrientation.LANDSCAPE -> ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
                     ProbedOrientation.PORTRAIT -> ActivityInfo.SCREEN_ORIENTATION_SENSOR_PORTRAIT
@@ -697,6 +721,14 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
         // Suppress any further callbacks
         activityIsForeground = false
 
+        eventUiHandler.removeCallbacksAndMessages(null)
+        scrubSeekHandler.removeCallbacksAndMessages(null)
+        fadeHandler.removeCallbacksAndMessages(null)
+        tapToggleHandler.removeCallbacksAndMessages(null)
+        try { abortLastScrubSeek() } catch (_: Throwable) {}
+        pendingTapToggleRunnable = null
+        try { metadataProbeExecutor.shutdownNow() } catch (_: Throwable) {}
+
         BackgroundPlaybackService.mediaToken = null
         mediaSession?.let {
             it.isActive = false
@@ -803,6 +835,14 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
         activityIsForeground = false
         eventUiHandler.removeCallbacksAndMessages(null)
         cancelPendingTapToggle()
+        // Ensure no delayed seek/gesture callbacks run after the UI is paused.
+        scrubSeekHandler.removeCallbacksAndMessages(null)
+        fadeHandler.removeCallbacksAndMessages(null)
+        try { abortLastScrubSeek() } catch (_: Throwable) {}
+        gestureScrubActive = false
+        seekbarScrubActive = false
+        pendingGestureSeekSec = null
+        pendingSeekbarSeekPos = null
         if (isFinishing) {
             savePosition()
             // tell mpv to shut down so that any other property changes or such are ignored,
@@ -1045,12 +1085,27 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
     private var lockedUI = false
 
     private fun pauseForDialog(): StateRestoreCallback {
-        // Keep playback running while UI dialogs/menus are open.
-        // We still set keep-open so mpv doesn't exit at EOF while the user is interacting with UI.
-        val oldValue = MPVLib.getPropertyString("keep-open")
+        // Control whether playback pauses while UI dialogs/menus are open.
+        // Always set keep-open so mpv doesn't exit at EOF while the user is interacting with UI.
+        val oldKeepOpen = MPVLib.getPropertyString("keep-open")
         MPVLib.setPropertyBoolean("keep-open", true)
+
+        val wasPaused = psc.pause
+        val shouldPauseNow = when (noUIPauseMode) {
+            "never" -> true
+            "audio-only" -> !isPlayingAudioOnly()
+            else -> false // "always"
+        }
+
+        if (shouldPauseNow && !wasPaused) {
+            try { player.paused = true } catch (_: Throwable) {}
+        }
+
         return {
-            oldValue?.also { MPVLib.setPropertyString("keep-open", it) }
+            oldKeepOpen?.also { MPVLib.setPropertyString("keep-open", it) }
+            if (shouldPauseNow && !wasPaused && activityIsForeground) {
+                try { player.paused = false } catch (_: Throwable) {}
+            }
         }
     }
 
@@ -2662,6 +2717,64 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
 
     private enum class ProbedOrientation { LANDSCAPE, PORTRAIT, SQUARE, UNKNOWN }
 
+
+    private fun getCachedProbedOrientation(path: String): ProbedOrientation? {
+        synchronized(orientationProbeLock) {
+            return orientationProbeCache[path]
+        }
+    }
+
+    private fun putCachedProbedOrientation(path: String, value: ProbedOrientation) {
+        synchronized(orientationProbeLock) {
+            orientationProbeCache[path] = value
+        }
+    }
+
+    /**
+     * Fast best-effort probe:
+     * - Returns cached result immediately when available.
+     * - Otherwise tries a background probe but only waits a short time to avoid UI jank.
+     *   The probe continues in the background and will populate the cache when finished.
+     */
+    private fun probeOrientationFromMetadataFast(path: String, timeoutMs: Long = 120L): ProbedOrientation {
+        getCachedProbedOrientation(path)?.let { return it }
+
+        return try {
+            val fut = metadataProbeExecutor.submit<ProbedOrientation> {
+                val r = probeOrientationFromMetadata(path)
+                putCachedProbedOrientation(path, r)
+                r
+            }
+            val r = fut.get(timeoutMs, TimeUnit.MILLISECONDS)
+            r
+        } catch (_: TimeoutException) {
+            ProbedOrientation.UNKNOWN
+        } catch (_: Throwable) {
+            ProbedOrientation.UNKNOWN
+        }
+    }
+
+    private fun probeOrientationFromMetadataAsync(path: String, token: Long, callback: (ProbedOrientation) -> Unit) {
+        getCachedProbedOrientation(path)?.let { cached ->
+            callback(cached)
+            return
+        }
+
+        metadataProbeExecutor.execute {
+            val r = try { probeOrientationFromMetadata(path) } catch (_: Throwable) { ProbedOrientation.UNKNOWN }
+            putCachedProbedOrientation(path, r)
+
+            eventUiHandler.post {
+                // Ignore stale results if a newer probe was started.
+                if (token != orientationProbeToken)
+                    return@post
+                if (isFinishing || finishPending)
+                    return@post
+                callback(r)
+            }
+        }
+    }
+
     private fun probeOrientationFromMetadata(path: String): ProbedOrientation {
         // Skip unsupported / remote schemes (mpv will update orientation later from video-params).
         if (path.startsWith("http://") || path.startsWith("https://") ||
@@ -2712,29 +2825,31 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
             return
         lastOrientationProbePath = path
 
-        val probed = probeOrientationFromMetadata(path)
-        val desired = when (probed) {
-            ProbedOrientation.LANDSCAPE -> ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
-            ProbedOrientation.PORTRAIT -> ActivityInfo.SCREEN_ORIENTATION_SENSOR_PORTRAIT
-            ProbedOrientation.SQUARE -> ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
-            ProbedOrientation.UNKNOWN -> return
+        // Start (or use cached) probe off the UI thread.
+        val token = ++orientationProbeToken
+        probeOrientationFromMetadataAsync(path, token) { probed ->
+            val desired = when (probed) {
+                ProbedOrientation.LANDSCAPE -> ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
+                ProbedOrientation.PORTRAIT -> ActivityInfo.SCREEN_ORIENTATION_SENSOR_PORTRAIT
+                ProbedOrientation.SQUARE -> ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
+                ProbedOrientation.UNKNOWN -> return@probeOrientationFromMetadataAsync
+            }
+
+            // If we're already in portrait with an unspecified orientation, don't force-lock it.
+            // This avoids unnecessary churn when everything is already portrait.
+            if (desired == ActivityInfo.SCREEN_ORIENTATION_SENSOR_PORTRAIT &&
+                resources.configuration.orientation == Configuration.ORIENTATION_PORTRAIT &&
+                requestedOrientation == ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
+            ) return@probeOrientationFromMetadataAsync
+
+            // Only change if needed to prevent redundant config churn.
+            if (requestedOrientation != desired)
+                requestedOrientation = desired
+
+            // Hold the chosen orientation briefly so transient "square/unknown" aspect updates
+            // from mpv won't bounce us back to portrait during startup/reconfig.
+            lockOrientationStability(desired, if (isStartup) 2200L else 1600L)
         }
-
-
-        // If we're already in portrait with an unspecified orientation, don't force-lock it.
-        // This avoids unnecessary churn when everything is already portrait.
-        if (desired == ActivityInfo.SCREEN_ORIENTATION_SENSOR_PORTRAIT &&
-            resources.configuration.orientation == Configuration.ORIENTATION_PORTRAIT &&
-            requestedOrientation == ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
-        ) return
-
-        // Only change if needed to prevent redundant config churn.
-        if (requestedOrientation != desired)
-            requestedOrientation = desired
-
-        // Hold the chosen orientation briefly so transient "square/unknown" aspect updates
-        // from mpv won't bounce us back to portrait during startup/reconfig.
-        lockOrientationStability(desired, if (isStartup) 2200L else 1600L)
     }
 
 
@@ -2959,9 +3074,10 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
 
         if (eventId == MpvEvent.MPV_EVENT_PLAYBACK_RESTART) {
             // A seek completed. If the user has released the finger, resume playback now.
+            scrubSeekHandler.removeCallbacks(scrubSeekTimeoutRunnable)
             scrubSeekInFlight = false
             lastScrubAsyncUserdata = 0L
-            if (resumeAfterScrubSeek && !gestureScrubActive && !seekbarScrubActive) {
+            if (resumeAfterScrubSeek && !gestureScrubActive && !seekbarScrubActive && activityIsForeground) {
                 resumeAfterScrubSeek = false
                 eventUiHandler.post { player.paused = false }
             }
@@ -3014,9 +3130,10 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
         val ud = lastScrubAsyncUserdata
         if (ud != 0L) {
             try { MPVLib.abortAsyncCommand(ud) } catch (_: Throwable) {}
-            lastScrubAsyncUserdata = 0L
-            scrubSeekInFlight = false
         }
+        lastScrubAsyncUserdata = 0L
+        scrubSeekInFlight = false
+        scrubSeekHandler.removeCallbacks(scrubSeekTimeoutRunnable)
     }
 
     private fun sendScrubSeek(targetSec: Double, exact: Boolean) {
@@ -3025,8 +3142,46 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
         val ud = scrubAsyncCounter++
         lastScrubAsyncUserdata = ud
         val mode = if (exact) "absolute+exact" else "absolute+keyframes"
-        MPVLib.commandAsync(arrayOf("seek", targetSec.toString(), mode), ud)
+
+        val err = try {
+            MPVLib.commandAsync(arrayOf("seek", targetSec.toString(), mode), ud)
+        } catch (_: Throwable) {
+            -1
+        }
+
+        if (err < 0) {
+            Log.w(TAG, "mpv_command_async(seek) failed: $err")
+            lastScrubAsyncUserdata = 0L
+            scrubSeekInFlight = false
+            scrubSeekHandler.removeCallbacks(scrubSeekTimeoutRunnable)
+
+            // If the user already released the finger, don't get stuck paused.
+            if (resumeAfterScrubSeek && !gestureScrubActive && !seekbarScrubActive && activityIsForeground) {
+                resumeAfterScrubSeek = false
+                player.paused = false
+            }
+            return
+        }
+
         scrubSeekInFlight = true
+        scrubSeekTimeoutAtMs = SystemClock.uptimeMillis() + SCRUB_SEEK_TIMEOUT_MS
+        scrubSeekHandler.removeCallbacks(scrubSeekTimeoutRunnable)
+        scrubSeekHandler.postDelayed(scrubSeekTimeoutRunnable, SCRUB_SEEK_TIMEOUT_MS)
+    }
+
+    private fun handleScrubSeekTimeout() {
+        if (!scrubSeekInFlight)
+            return
+        if (SystemClock.uptimeMillis() < scrubSeekTimeoutAtMs)
+            return
+
+        Log.w(TAG, "Scrub seek timeout: clearing in-flight state")
+        abortLastScrubSeek()
+
+        if (resumeAfterScrubSeek && !gestureScrubActive && !seekbarScrubActive && activityIsForeground) {
+            resumeAfterScrubSeek = false
+            player.paused = false
+        }
     }
 
     private fun performGestureIdleSeek() {
@@ -3239,6 +3394,9 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
 
         // When scrubbing, wait briefly for the finger to stop moving before doing an exact seek.
         private const val SCRUB_IDLE_SEEK_DELAY_MS = 140L
+
+        // If mpv never reports completion, don't get stuck paused.
+        private const val SCRUB_SEEK_TIMEOUT_MS = 1500L
 
         // Per-file subtitle persistence keys
         private const val PREF_SUB_KIND = "sub_kind"

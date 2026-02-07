@@ -322,7 +322,6 @@ internal class VideoZoomGestures(
     companion object {
         private const val EPS = 0.001f
         private const val MIN_SCALE = 1f
-        // Increased maximum zoom from 6x to 20x.
         private const val MAX_SCALE = 20f
         private const val DOUBLE_TAP_TIMEOUT = 300L
     }
