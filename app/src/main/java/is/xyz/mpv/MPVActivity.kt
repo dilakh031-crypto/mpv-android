@@ -1653,20 +1653,25 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
 
     private fun perFileKey(suffix: String, path: String): String = "perfile_${suffix}_${sha1Hex(path)}"
 
-    private fun rememberSubtitleSelectionForCurrentFile() {
+    private fun rememberSubtitleSelectionForCurrentFile(secondary: Boolean = false) {
         val mediaPath = MPVLib.getPropertyString("path") ?: return
         val prefs = getDefaultSharedPreferences(applicationContext)
 
-        val sid = MPVLib.getPropertyInt("sid") ?: -1
+        val sidProp = if (secondary) "secondary-sid" else "sid"
+        val kindKey = if (secondary) PREF_SUB2_KIND else PREF_SUB_KIND
+        val extKey = if (secondary) PREF_SUB2_EXTERNAL else PREF_SUB_EXTERNAL
+        val sidKey = if (secondary) PREF_SUB2_SID else PREF_SUB_SID
+
+        val sid = MPVLib.getPropertyInt(sidProp) ?: -1
         val ext = findExternalSubFilenameForSid(sid)
 
         with (prefs.edit()) {
             if (!ext.isNullOrEmpty()) {
-                putString(perFileKey(PREF_SUB_KIND, mediaPath), PREF_SUB_KIND_EXTERNAL)
-                putString(perFileKey(PREF_SUB_EXTERNAL, mediaPath), ext)
+                putString(perFileKey(kindKey, mediaPath), PREF_SUB_KIND_EXTERNAL)
+                putString(perFileKey(extKey, mediaPath), ext)
             } else {
-                putString(perFileKey(PREF_SUB_KIND, mediaPath), PREF_SUB_KIND_SID)
-                putInt(perFileKey(PREF_SUB_SID, mediaPath), sid)
+                putString(perFileKey(kindKey, mediaPath), PREF_SUB_KIND_SID)
+                putInt(perFileKey(sidKey, mediaPath), sid)
             }
             apply()
         }
@@ -1687,19 +1692,84 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
         val mediaPath = MPVLib.getPropertyString("path") ?: return
         val prefs = getDefaultSharedPreferences(applicationContext)
 
-        val kind = prefs.getString(perFileKey(PREF_SUB_KIND, mediaPath), null) ?: return
-        if (kind == PREF_SUB_KIND_EXTERNAL) {
-            val sub = prefs.getString(perFileKey(PREF_SUB_EXTERNAL, mediaPath), null)
-            if (!sub.isNullOrEmpty()) {
-                // "cached" will select the subtitle; if it already exists, it will be reused.
-                MPVLib.command(arrayOf("sub-add", sub, "cached"))
+        // Load primary selection
+        val kind1 = prefs.getString(perFileKey(PREF_SUB_KIND, mediaPath), null)
+        val ext1 = prefs.getString(perFileKey(PREF_SUB_EXTERNAL, mediaPath), null)
+        val hasSid1 = prefs.contains(perFileKey(PREF_SUB_SID, mediaPath))
+        val sid1 = if (hasSid1) prefs.getInt(perFileKey(PREF_SUB_SID, mediaPath), -1) else null
+
+        // Load secondary selection
+        val kind2 = prefs.getString(perFileKey(PREF_SUB2_KIND, mediaPath), null)
+        val ext2 = prefs.getString(perFileKey(PREF_SUB2_EXTERNAL, mediaPath), null)
+        val hasSid2 = prefs.contains(perFileKey(PREF_SUB2_SID, mediaPath))
+        val sid2 = if (hasSid2) prefs.getInt(perFileKey(PREF_SUB2_SID, mediaPath), -1) else null
+
+        // If a secondary external subtitle is configured, ensure it's added first so we can resolve its track id.
+        // NOTE: mpv's "sub-add ... cached" selects the added subtitle as primary, so we always restore primary last.
+        var resolvedSid2FromExternal: Int? = null
+        if (kind2 == PREF_SUB_KIND_EXTERNAL && !ext2.isNullOrEmpty()) {
+            MPVLib.command(arrayOf("sub-add", ext2, "cached"))
+            resolvedSid2FromExternal = waitForExternalSubSid(ext2)
+        }
+
+        // Restore primary
+        when (kind1) {
+            PREF_SUB_KIND_EXTERNAL -> {
+                if (!ext1.isNullOrEmpty()) {
+                    // "cached" will select the subtitle; if it already exists, it will be reused.
+                    MPVLib.command(arrayOf("sub-add", ext1, "cached"))
+                }
             }
-        } else if (kind == PREF_SUB_KIND_SID) {
-            if (prefs.contains(perFileKey(PREF_SUB_SID, mediaPath))) {
-                val sid = prefs.getInt(perFileKey(PREF_SUB_SID, mediaPath), -1)
-                MPVLib.setPropertyInt("sid", sid)
+            PREF_SUB_KIND_SID -> {
+                if (sid1 != null) {
+                    MPVLib.setPropertyInt("sid", sid1)
+                }
             }
         }
+
+        // Restore secondary (apply after primary so we end in a consistent state)
+        when (kind2) {
+            PREF_SUB_KIND_EXTERNAL -> {
+                val sid = resolvedSid2FromExternal ?: (ext2?.let { waitForExternalSubSid(it) })
+                if (sid != null) {
+                    MPVLib.setPropertyInt("secondary-sid", sid)
+                }
+            }
+            PREF_SUB_KIND_SID -> {
+                if (sid2 != null) {
+                    MPVLib.setPropertyInt("secondary-sid", sid2)
+                }
+            }
+        }
+    }
+
+    private fun findExternalSubSidForFilename(filename: String): Int? {
+        val count = MPVLib.getPropertyInt("track-list/count") ?: return null
+        for (i in 0 until count) {
+            val type = MPVLib.getPropertyString("track-list/$i/type") ?: continue
+            if (type != "sub") continue
+            val isExternal = MPVLib.getPropertyBoolean("track-list/$i/external") == true
+            if (!isExternal) continue
+            val fn = MPVLib.getPropertyString("track-list/$i/external-filename") ?: continue
+            if (fn != filename) continue
+            return MPVLib.getPropertyInt("track-list/$i/id")
+        }
+        return null
+    }
+
+    private fun waitForExternalSubSid(filename: String, timeoutMs: Long = 350L): Int? {
+        val deadline = SystemClock.uptimeMillis() + timeoutMs
+        while (SystemClock.uptimeMillis() < deadline) {
+            val sid = findExternalSubSidForFilename(filename)
+            if (sid != null) return sid
+            try {
+                Thread.sleep(10)
+            } catch (_: InterruptedException) {
+                break
+            }
+        }
+        // One last attempt.
+        return findExternalSubSidForFilename(filename)
     }
 
     private fun findExternalSubFilenameForSid(sid: Int): String? {
@@ -1778,7 +1848,7 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
     }
     private fun cycleSub() = trackSwitchNotification {
         player.cycleSub()
-        try { rememberSubtitleSelectionForCurrentFile() } catch (_: Throwable) {}
+        try { rememberSubtitleSelectionForCurrentFile(secondary = false) } catch (_: Throwable) {}
         TrackData(player.sid, "sub")
     }
 
@@ -1795,7 +1865,7 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
 
             set(trackId)
             if (type == "sub") {
-                try { rememberSubtitleSelectionForCurrentFile() } catch (_: Throwable) {}
+                try { rememberSubtitleSelectionForCurrentFile(secondary = false) } catch (_: Throwable) {}
             }
             trackSwitchNotification { TrackData(trackId, type) }
             // Keep dialog open (apply-in-place).
@@ -1828,9 +1898,7 @@ private fun pickAudio() = selectTrack("audio", { player.aid }, { player.aid = it
         else
             player.sid = it.mpvId
 
-        if (!secondary) {
-            try { rememberSubtitleSelectionForCurrentFile() } catch (_: Throwable) {}
-        }
+	    try { rememberSubtitleSelectionForCurrentFile(secondary = secondary) } catch (_: Throwable) {}
         trackSwitchNotification { TrackData(it.mpvId, SubTrackDialog.TRACK_TYPE) }
         // Keep dialog open (apply-in-place).
     }
@@ -3240,11 +3308,14 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
         // When scrubbing, wait briefly for the finger to stop moving before doing an exact seek.
         private const val SCRUB_IDLE_SEEK_DELAY_MS = 140L
 
-        // Per-file subtitle persistence keys
-        private const val PREF_SUB_KIND = "sub_kind"
-        private const val PREF_SUB_EXTERNAL = "sub_external"
-        private const val PREF_SUB_SID = "sub_sid"
-        private const val PREF_SUB_KIND_EXTERNAL = "external"
-        private const val PREF_SUB_KIND_SID = "sid"
+	        // Per-file subtitle persistence keys
+	        private const val PREF_SUB_KIND = "sub_kind"
+	        private const val PREF_SUB_EXTERNAL = "sub_external"
+	        private const val PREF_SUB_SID = "sub_sid"
+	        private const val PREF_SUB2_KIND = "sub2_kind"
+	        private const val PREF_SUB2_EXTERNAL = "sub2_external"
+	        private const val PREF_SUB2_SID = "sub2_sid"
+	        private const val PREF_SUB_KIND_EXTERNAL = "external"
+	        private const val PREF_SUB_KIND_SID = "sid"
     }
 }
