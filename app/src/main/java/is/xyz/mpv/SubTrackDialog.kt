@@ -75,8 +75,11 @@ internal class SubTrackDialog(private val player: MPVView) {
         binding.primaryBtn.background = if (secondary) null else darkenDrawable
         binding.secondaryBtn.background = if (secondary) darkenDrawable else null
 
-        // show primary/secondary toggle if applicable
-        if (secondary || selectedMpvId2 != -1 || tracks.size > 2) {
+        // Show primary/secondary toggle when there is at least one real subtitle track.
+        // `tracks` always contains a pseudo "Off" track (mpvId == -1).
+        // - size == 1 -> only "Off" (no subtitles)
+        // - size >= 2 -> at least one real subtitle track
+        if (secondary || selectedMpvId2 != -1 || tracks.size > 1) {
             binding.buttonRow.visibility = View.VISIBLE
             binding.divider.visibility = View.VISIBLE
         } else {
