@@ -2456,7 +2456,7 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
         }
 
         picker.delay1 = player.subDelay ?: 0.0
-        picker.delay2 = if (player.secondarySid != -1) player.secondarySubDelay else null
+        picker.delay2 = if (player.secondarySid != -1) (player.secondarySubDelay ?: 0.0) else null
 
         dialog.setOnShowListener {
 
@@ -2521,7 +2521,11 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
         hiddenButtons.addAll(arrayOf(R.id.rowVideo1, R.id.rowVideo2, R.id.aspectBtn))
     if (player.aid == -1 || player.vid == -1)
         hiddenButtons.add(R.id.audioDelayBtn)
-    if (player.sid == -1)
+    // Subtitle controls should be available whenever *any* subtitle track is active.
+    // Previously this was gated only on the primary subtitle (sid), which made the
+    // subtitle delay dialog disappear when only the secondary subtitle (secondary-sid)
+    // was enabled.
+    if (player.sid == -1 && player.secondarySid == -1)
         hiddenButtons.addAll(arrayOf(R.id.subDelayBtn, R.id.rowSubSeek))
     /******/
 
