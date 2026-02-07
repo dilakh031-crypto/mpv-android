@@ -130,7 +130,7 @@
 
     <string name="pref_no_ui_pause_title">Continue playback during UI popups</string>
     <string name="pref_no_ui_pause_summary">Continue playback while popups are open. (e.g. during the playlist dialog)</string>
-    <string name="pref_no_ui_pause_default" translatable="false">audio-only</string>
+    <string name="pref_no_ui_pause_default" translatable="false">always</string>
 
     <string name="pref_playlist_exit_warning_title">Playlist exit confirmation</string>
     <string name="pref_playlist_exit_warning_summary">Show a confirmation dialog before exiting when a playlist is loaded.</string>
