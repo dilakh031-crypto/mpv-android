@@ -19,6 +19,7 @@ import android.content.res.ColorStateList
 import android.content.res.Configuration
 import android.graphics.drawable.Icon
 import android.graphics.Bitmap
+import android.graphics.BitmapFactory
 import android.graphics.Color
 import android.widget.ImageView
 import android.util.Log
@@ -498,6 +499,8 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
 
         // Read full settings and update UI
         readSettings()
+        // Purge cached previews / per-file state for videos that no longer exist.
+        cleanupOrphanedPerFileDataAsync()
         onConfigurationChanged(resources.configuration)
 
         // Edge-to-edge / immersive behavior
@@ -518,7 +521,7 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
         updateOrientation(true)
 
         // Best-effort: show a preview frame while mpv starts to avoid a brief black flash.
-        // Startup preview disabled (no overlay on entry)
+        try { showStartupPreview(filepath) } catch (_: Throwable) {}
 
         startPlayback(filepath)
     }
@@ -570,13 +573,115 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
     }
 
     private fun showStartupPreview(path: String) {
-        // Disabled: avoid showing any temporary overlay (black screen / preview) on video entry.
-        return
+        if (!shouldCacheStartupPreview(path))
+            return
+
+        if (isFilesystemPath(path) && !File(path).exists()) {
+            purgePerFileArtifacts(path)
+            return
+        }
+
+        if (startupPreviewOverlay != null)
+            return
+
+        val overlay = ImageView(this).apply {
+            setBackgroundColor(Color.BLACK)
+            scaleType = ImageView.ScaleType.CENTER_CROP
+            alpha = 1f
+            layoutParams = FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT,
+                FrameLayout.LayoutParams.MATCH_PARENT
+            )
+        }
+
+        // Above SurfaceView (video), below gesture/controls overlay.
+        binding.playerContainer.addView(overlay, 1)
+        startupPreviewOverlay = overlay
+
+        Thread {
+            var bmp: Bitmap? = null
+
+            // 1) Try cached full-res PNG captured on last exit.
+            try {
+                val prefs = getDefaultSharedPreferences(applicationContext)
+                val cached = thumbPngFileForPath(path)
+
+                var cachedOk = cached.exists() && cached.length() > 0L
+                if (cachedOk && isFilesystemPath(path)) {
+                    val mKey = perFileKey(PREF_THUMB_MTIME, path)
+                    val sKey = perFileKey(PREF_THUMB_FSIZE, path)
+                    if (prefs.contains(mKey) && prefs.contains(sKey)) {
+                        val wantM = prefs.getLong(mKey, -1L)
+                        val wantS = prefs.getLong(sKey, -1L)
+                        val f = File(path)
+                        if (wantM != f.lastModified() || wantS != f.length())
+                            cachedOk = false
+                    }
+                }
+
+                if (cachedOk)
+                    bmp = BitmapFactory.decodeFile(cached.absolutePath)
+            } catch (_: Throwable) {
+                bmp = null
+            }
+
+            // 2) Fallback: MediaMetadataRetriever first frame (best-effort).
+            if (bmp == null) {
+                try {
+                    val retriever = MediaMetadataRetriever()
+                    if (path.startsWith("content://")) {
+                        retriever.setDataSource(this, Uri.parse(path))
+                    } else {
+                        retriever.setDataSource(path)
+                    }
+
+                    bmp = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O_MR1) {
+                        val maxDim = 1280
+                        val w = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_WIDTH)?.toIntOrNull() ?: 0
+                        val h = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_HEIGHT)?.toIntOrNull() ?: 0
+                        if (w > 0 && h > 0) {
+                            val scale = maxDim.toFloat() / maxOf(w, h).toFloat()
+                            val tw = maxOf(1, (w * scale).toInt())
+                            val th = maxOf(1, (h * scale).toInt())
+                            retriever.getScaledFrameAtTime(
+                                0L,
+                                MediaMetadataRetriever.OPTION_CLOSEST_SYNC,
+                                tw,
+                                th
+                            )
+                        } else {
+                            retriever.frameAtTime
+                        }
+                    } else {
+                        retriever.frameAtTime
+                    }
+
+                    retriever.release()
+                } catch (_: Throwable) {
+                    bmp = null
+                }
+            }
+
+            eventUiHandler.post {
+                if (startupPreviewOverlay === overlay) {
+                    startupPreviewBitmap = bmp
+                    overlay.setImageBitmap(bmp)
+                } else {
+                    bmp?.recycle()
+                }
+            }
+        }.start()
     }
 
     private fun hideStartupPreview() {
-        // Disabled
-        return
+        val overlay = startupPreviewOverlay ?: return
+        (overlay.parent as? ViewGroup)?.removeView(overlay)
+        startupPreviewOverlay = null
+
+        startupPreviewBitmap?.let {
+            try { it.recycle() } catch (_: Throwable) {}
+        }
+        startupPreviewBitmap = null
     }
 
     private fun finishWithResult(code: Int, includeTimePos: Boolean = false) {
@@ -721,6 +826,11 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
 
     private fun onPauseImpl() {
         val fmt = MPVLib.getPropertyString("video-format")
+        val mediaPath = MPVLib.getPropertyString("path")
+        if (!fmt.isNullOrEmpty() && !mediaPath.isNullOrEmpty()) {
+            // Save a full-resolution PNG of the current frame for next startup.
+            if (isFinishing) persistCurrentFramePngForPathBlocking(mediaPath) else persistCurrentFramePngForPath(mediaPath)
+        }
         val shouldBackground = shouldBackground()
         if (shouldBackground && !fmt.isNullOrEmpty())
             BackgroundPlaybackService.thumbnail = MPVLib.grabThumbnail(THUMB_SIZE)
@@ -1581,6 +1691,147 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
     }
 
     private fun perFileKey(suffix: String, path: String): String = "perfile_${suffix}_${sha1Hex(path)}"
+
+
+    // --- Per-file thumbnail persistence (startup preview cache) ---
+    private fun shouldCacheStartupPreview(path: String): Boolean {
+        // Only cache for local-ish paths; skip remote/memory playback.
+        if (path.startsWith("memory://") ||
+            path.startsWith("http://") || path.startsWith("https://") ||
+            path.startsWith("rtmp://") || path.startsWith("rtmps://") ||
+            path.startsWith("rtsp://") || path.startsWith("mms://") ||
+            path.startsWith("udp://") || path.startsWith("tcp://")
+        ) return false
+        return true
+    }
+
+    private fun isFilesystemPath(path: String): Boolean = path.startsWith("/")
+
+    private fun thumbDir(): File {
+        val dir = File(filesDir, THUMB_DIR_NAME)
+        if (!dir.exists()) dir.mkdirs()
+        return dir
+    }
+
+    private fun thumbPngFileForPath(path: String): File =
+        File(thumbDir(), "${sha1Hex(path)}.png")
+
+    private fun thumbTmpFileForPath(path: String): File =
+        File(thumbDir(), "${sha1Hex(path)}.tmp.png")
+
+    private fun purgePerFileArtifacts(path: String) {
+        try { thumbPngFileForPath(path).delete() } catch (_: Throwable) {}
+        try { thumbTmpFileForPath(path).delete() } catch (_: Throwable) {}
+        val prefs = getDefaultSharedPreferences(applicationContext)
+        with (prefs.edit()) {
+            remove(perFileKey(PREF_THUMB_SRC, path))
+            remove(perFileKey(PREF_THUMB_MTIME, path))
+            remove(perFileKey(PREF_THUMB_FSIZE, path))
+            // Also clear remembered subtitle selection for that file.
+            remove(perFileKey(PREF_SUB_KIND, path))
+            remove(perFileKey(PREF_SUB_EXTERNAL, path))
+            remove(perFileKey(PREF_SUB_SID, path))
+            apply()
+        }
+    }
+
+    private fun cleanupOrphanedPerFileDataAsync() {
+        Thread {
+            try {
+                val prefs = getDefaultSharedPreferences(applicationContext)
+                val all = prefs.all
+                val keys = all.keys.filter { it.startsWith("perfile_${PREF_THUMB_SRC}_") }
+                if (keys.isNotEmpty()) {
+                    val edit = prefs.edit()
+                    for (k in keys) {
+                        val src = all[k] as? String ?: continue
+                        if (isFilesystemPath(src) && !File(src).exists()) {
+                            try { thumbPngFileForPath(src).delete() } catch (_: Throwable) {}
+                            try { thumbTmpFileForPath(src).delete() } catch (_: Throwable) {}
+                            edit.remove(k)
+                            edit.remove(perFileKey(PREF_THUMB_MTIME, src))
+                            edit.remove(perFileKey(PREF_THUMB_FSIZE, src))
+                            edit.remove(perFileKey(PREF_SUB_KIND, src))
+                            edit.remove(perFileKey(PREF_SUB_EXTERNAL, src))
+                            edit.remove(perFileKey(PREF_SUB_SID, src))
+                        }
+                    }
+                    edit.apply()
+                }
+                cleanupOrphanedWatchLater()
+            } catch (_: Throwable) {}
+        }.start()
+    }
+
+    private fun cleanupOrphanedWatchLater() {
+        val dir = File(filesDir, "watch_later")
+        if (!dir.isDirectory) return
+
+        for (cfg in dir.listFiles() ?: emptyArray()) {
+            if (!cfg.isFile) continue
+            try {
+                val text = cfg.readText(Charsets.UTF_8)
+                val m = Regex("(?m)^filename=(.+)$").find(text) ?: continue
+                var name = m.groupValues[1].trim()
+                if (name.startsWith("file://")) {
+                    try { name = Uri.parse(name).path ?: name.removePrefix("file://") } catch (_: Throwable) {}
+                }
+                if (name.startsWith("/") && !File(name).exists()) {
+                    cfg.delete()
+                }
+            } catch (_: Throwable) {}
+        }
+    }
+
+    private fun persistCurrentFramePngInternal(path: String) {
+        val outTmp = thumbTmpFileForPath(path)
+        val outFinal = thumbPngFileForPath(path)
+
+        try {
+            try { outTmp.delete() } catch (_: Throwable) {}
+
+            // Force png and capture the current *video* frame (no OSD/subs).
+            val oldFmt = MPVLib.getPropertyString("screenshot-format")
+            MPVLib.setPropertyString("screenshot-format", "png")
+            MPVLib.command(arrayOf("screenshot-to-file", outTmp.absolutePath, "video"))
+            oldFmt?.let { MPVLib.setPropertyString("screenshot-format", it) }
+
+            if (!outTmp.exists() || outTmp.length() <= 0L) {
+                try { outTmp.delete() } catch (_: Throwable) {}
+                return
+            }
+
+            if (outFinal.exists())
+                outFinal.delete()
+            outTmp.renameTo(outFinal)
+
+            val prefs = getDefaultSharedPreferences(applicationContext)
+            with (prefs.edit()) {
+                putString(perFileKey(PREF_THUMB_SRC, path), path)
+                if (isFilesystemPath(path)) {
+                    val f = File(path)
+                    putLong(perFileKey(PREF_THUMB_MTIME, path), f.lastModified())
+                    putLong(perFileKey(PREF_THUMB_FSIZE, path), f.length())
+                }
+                apply()
+            }
+        } catch (_: Throwable) {
+            try { outTmp.delete() } catch (_: Throwable) {}
+        }
+    }
+
+    private fun persistCurrentFramePngForPath(path: String) {
+        if (!shouldCacheStartupPreview(path))
+            return
+        Thread { persistCurrentFramePngInternal(path) }.start()
+    }
+
+    private fun persistCurrentFramePngForPathBlocking(path: String) {
+        if (!shouldCacheStartupPreview(path))
+            return
+        persistCurrentFramePngInternal(path)
+    }
+
 
     private fun rememberSubtitleSelectionForCurrentFile() {
         val mediaPath = MPVLib.getPropertyString("path") ?: return
@@ -3168,6 +3419,12 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
 
         // When scrubbing, wait briefly for the finger to stop moving before doing an exact seek.
         private const val SCRUB_IDLE_SEEK_DELAY_MS = 140L
+
+        // Per-file thumbnail persistence keys
+        private const val THUMB_DIR_NAME = "thumbs"
+        private const val PREF_THUMB_SRC = "thumb_src"
+        private const val PREF_THUMB_MTIME = "thumb_mtime"
+        private const val PREF_THUMB_FSIZE = "thumb_fsize"
 
         // Per-file subtitle persistence keys
         private const val PREF_SUB_KIND = "sub_kind"
