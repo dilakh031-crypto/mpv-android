@@ -58,6 +58,9 @@ import androidx.media.AudioFocusRequestCompat
 import androidx.media.AudioManagerCompat
 import java.io.File
 import java.lang.IllegalArgumentException
+import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.TimeoutException
 import kotlin.math.roundToInt
 
 typealias ActivityResultCallback = (Int, Intent?) -> Unit
@@ -112,6 +115,10 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
     private val gestureIdleSeekRunnable = Runnable { performGestureIdleSeek() }
     private val seekbarIdleSeekRunnable = Runnable { performSeekbarIdleSeek() }
 
+
+    private val scrubSeekTimeoutRunnable = Runnable { handleScrubSeekTimeout() }
+    private var scrubSeekTimeoutAtMs: Long = 0L
+
     private var toast: Toast? = null
 
     private var audioManager: AudioManager? = null
@@ -125,6 +132,23 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
     private var pendingFinishAfterRotate: Boolean = false
     private var exitRequestedOrientation: Int = ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
     private var lastOrientationProbePath: String? = null
+
+
+    // Background metadata probing (avoids UI thread stalls) + small LRU cache.
+    private val orientationProbeLock = Any()
+    private val orientationProbeCache =
+        object : LinkedHashMap<String, ProbedOrientation>(64, 0.75f, true) {
+            override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, ProbedOrientation>): Boolean {
+                return size > 64
+            }
+        }
+
+    private val metadataProbeExecutor = Executors.newFixedThreadPool(2) { r ->
+        Thread(r, "metadata_probe").apply { isDaemon = true }
+    }
+
+    // Monotonic token to ignore stale async probe results.
+    private var orientationProbeToken: Long = 0L
 
     // When auto-rotation is enabled, mpv can briefly report an unknown/square aspect ratio
     // (especially during startup / demuxer init). If we immediately react to that by setting
@@ -434,7 +458,7 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
             if (autoRotationMode == "auto" &&
                 packageManager.hasSystemFeature(PackageManager.FEATURE_SCREEN_PORTRAIT)
             ) {
-                val probed = probeOrientationFromMetadata(filepath)
+                val probed = probeOrientationFromMetadataFast(filepath)
                 val desired = when (probed) {
                     ProbedOrientation.LANDSCAPE -> ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
                     ProbedOrientation.PORTRAIT -> ActivityInfo.SCREEN_ORIENTATION_SENSOR_PORTRAIT
@@ -499,8 +523,6 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
 
         // Read full settings and update UI
         readSettings()
-        // Purge cached previews / per-file state for videos that no longer exist.
-        cleanupOrphanedPerFileDataAsync()
         onConfigurationChanged(resources.configuration)
 
         // Edge-to-edge / immersive behavior
@@ -573,10 +595,17 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
     }
 
     private fun showStartupPreview(path: String) {
-        if (!shouldCacheStartupPreview(path))
+        // Only show a preview for local-ish paths; skip remote/memory playback.
+        if (path.startsWith("memory://") ||
+            path.startsWith("http://") || path.startsWith("https://") ||
+            path.startsWith("rtmp://") || path.startsWith("rtmps://") ||
+            path.startsWith("rtsp://") || path.startsWith("mms://") ||
+            path.startsWith("udp://") || path.startsWith("tcp://")
+        ) {
             return
-
-        if (isFilesystemPath(path) && !File(path).exists()) {
+        }
+        // If the media was deleted, purge all per-file artifacts (thumb + subtitle prefs).
+        if (path.startsWith("/") && !File(path).exists()) {
             purgePerFileArtifacts(path)
             return
         }
@@ -585,89 +614,70 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
             return
 
         val overlay = ImageView(this).apply {
-            setBackgroundColor(Color.BLACK)
-            scaleType = ImageView.ScaleType.CENTER_CROP
-            alpha = 1f
-            layoutParams = FrameLayout.LayoutParams(
-                FrameLayout.LayoutParams.MATCH_PARENT,
-                FrameLayout.LayoutParams.MATCH_PARENT
+            layoutParams = ViewGroup.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.MATCH_PARENT
             )
+            scaleType = ImageView.ScaleType.CENTER_CROP
+            setBackgroundColor(Color.BLACK)
         }
 
-        // Above SurfaceView (video), below gesture/controls overlay.
-        binding.playerContainer.addView(overlay, 1)
+        // Insert above the SurfaceView but below gesture/controls layers.
+        // Layout order in player.xml: player(0), gestureLayer(1), outside(2).
+        (binding.root as? ViewGroup)?.addView(overlay, 1)
+
         startupPreviewOverlay = overlay
 
         Thread {
             var bmp: Bitmap? = null
 
-            // 1) Try cached full-res PNG captured on last exit.
+            val dm = resources.displayMetrics
+            val targetW = dm.widthPixels.coerceAtMost(2048)
+            val targetH = dm.heightPixels.coerceAtMost(2048)
+
+            // 1) Prefer cached last-frame PNG (fast, reliable, avoids black screen on re-open).
             try {
-                val prefs = getDefaultSharedPreferences(applicationContext)
-                val cached = thumbPngFileForPath(path)
-
-                var cachedOk = cached.exists() && cached.length() > 0L
-                if (cachedOk && isFilesystemPath(path)) {
-                    val mKey = perFileKey(PREF_THUMB_MTIME, path)
-                    val sKey = perFileKey(PREF_THUMB_FSIZE, path)
-                    if (prefs.contains(mKey) && prefs.contains(sKey)) {
-                        val wantM = prefs.getLong(mKey, -1L)
-                        val wantS = prefs.getLong(sKey, -1L)
-                        val f = File(path)
-                        if (wantM != f.lastModified() || wantS != f.length())
-                            cachedOk = false
-                    }
+                val cached = startupThumbFileForPath(path)
+                if (cached.exists()) {
+                    bmp = decodePngForOverlay(cached, targetW, targetH)
                 }
-
-                if (cachedOk)
-                    bmp = BitmapFactory.decodeFile(cached.absolutePath)
             } catch (_: Throwable) {
                 bmp = null
             }
 
-            // 2) Fallback: MediaMetadataRetriever first frame (best-effort).
+            // 2) Fallback to MediaMetadataRetriever for first open (no cache yet).
             if (bmp == null) {
+                val mmr = MediaMetadataRetriever()
                 try {
-                    val retriever = MediaMetadataRetriever()
                     if (path.startsWith("content://")) {
-                        retriever.setDataSource(this, Uri.parse(path))
+                        mmr.setDataSource(this, Uri.parse(path))
                     } else {
-                        retriever.setDataSource(path)
+                        mmr.setDataSource(path)
                     }
 
                     bmp = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O_MR1) {
-                        val maxDim = 1280
-                        val w = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_WIDTH)?.toIntOrNull() ?: 0
-                        val h = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_HEIGHT)?.toIntOrNull() ?: 0
-                        if (w > 0 && h > 0) {
-                            val scale = maxDim.toFloat() / maxOf(w, h).toFloat()
-                            val tw = maxOf(1, (w * scale).toInt())
-                            val th = maxOf(1, (h * scale).toInt())
-                            retriever.getScaledFrameAtTime(
-                                0L,
-                                MediaMetadataRetriever.OPTION_CLOSEST_SYNC,
-                                tw,
-                                th
-                            )
-                        } else {
-                            retriever.frameAtTime
-                        }
+                        mmr.getScaledFrameAtTime(
+                            0,
+                            MediaMetadataRetriever.OPTION_CLOSEST_SYNC,
+                            targetW,
+                            targetH
+                        )
                     } else {
-                        retriever.frameAtTime
+                        mmr.getFrameAtTime(0, MediaMetadataRetriever.OPTION_CLOSEST_SYNC)
                     }
-
-                    retriever.release()
                 } catch (_: Throwable) {
                     bmp = null
+                } finally {
+                    try { mmr.release() } catch (_: Throwable) {}
                 }
             }
 
             eventUiHandler.post {
-                if (startupPreviewOverlay === overlay) {
+                if (startupPreviewOverlay !== overlay)
+                    return@post
+                if (bmp != null) {
                     startupPreviewBitmap = bmp
                     overlay.setImageBitmap(bmp)
-                } else {
-                    bmp?.recycle()
                 }
             }
         }.start()
@@ -730,6 +740,14 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
 
         // Suppress any further callbacks
         activityIsForeground = false
+
+        eventUiHandler.removeCallbacksAndMessages(null)
+        scrubSeekHandler.removeCallbacksAndMessages(null)
+        fadeHandler.removeCallbacksAndMessages(null)
+        tapToggleHandler.removeCallbacksAndMessages(null)
+        try { abortLastScrubSeek() } catch (_: Throwable) {}
+        pendingTapToggleRunnable = null
+        try { metadataProbeExecutor.shutdownNow() } catch (_: Throwable) {}
 
         BackgroundPlaybackService.mediaToken = null
         mediaSession?.let {
@@ -826,11 +844,6 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
 
     private fun onPauseImpl() {
         val fmt = MPVLib.getPropertyString("video-format")
-        val mediaPath = MPVLib.getPropertyString("path")
-        if (!fmt.isNullOrEmpty() && !mediaPath.isNullOrEmpty()) {
-            // Save a full-resolution PNG of the current frame for next startup.
-            if (isFinishing) persistCurrentFramePngForPathBlocking(mediaPath) else persistCurrentFramePngForPath(mediaPath)
-        }
         val shouldBackground = shouldBackground()
         if (shouldBackground && !fmt.isNullOrEmpty())
             BackgroundPlaybackService.thumbnail = MPVLib.grabThumbnail(THUMB_SIZE)
@@ -842,6 +855,14 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
         activityIsForeground = false
         eventUiHandler.removeCallbacksAndMessages(null)
         cancelPendingTapToggle()
+        // Ensure no delayed seek/gesture callbacks run after the UI is paused.
+        scrubSeekHandler.removeCallbacksAndMessages(null)
+        fadeHandler.removeCallbacksAndMessages(null)
+        try { abortLastScrubSeek() } catch (_: Throwable) {}
+        gestureScrubActive = false
+        seekbarScrubActive = false
+        pendingGestureSeekSec = null
+        pendingSeekbarSeekPos = null
         if (isFinishing) {
             savePosition()
             // tell mpv to shut down so that any other property changes or such are ignored,
@@ -1084,12 +1105,27 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
     private var lockedUI = false
 
     private fun pauseForDialog(): StateRestoreCallback {
-        // Keep playback running while UI dialogs/menus are open.
-        // We still set keep-open so mpv doesn't exit at EOF while the user is interacting with UI.
-        val oldValue = MPVLib.getPropertyString("keep-open")
+        // Control whether playback pauses while UI dialogs/menus are open.
+        // Always set keep-open so mpv doesn't exit at EOF while the user is interacting with UI.
+        val oldKeepOpen = MPVLib.getPropertyString("keep-open")
         MPVLib.setPropertyBoolean("keep-open", true)
+
+        val wasPaused = psc.pause
+        val shouldPauseNow = when (noUIPauseMode) {
+            "never" -> true
+            "audio-only" -> !isPlayingAudioOnly()
+            else -> false // "always"
+        }
+
+        if (shouldPauseNow && !wasPaused) {
+            try { player.paused = true } catch (_: Throwable) {}
+        }
+
         return {
-            oldValue?.also { MPVLib.setPropertyString("keep-open", it) }
+            oldKeepOpen?.also { MPVLib.setPropertyString("keep-open", it) }
+            if (shouldPauseNow && !wasPaused && activityIsForeground) {
+                try { player.paused = false } catch (_: Throwable) {}
+            }
         }
     }
 
@@ -1692,147 +1728,6 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
 
     private fun perFileKey(suffix: String, path: String): String = "perfile_${suffix}_${sha1Hex(path)}"
 
-
-    // --- Per-file thumbnail persistence (startup preview cache) ---
-    private fun shouldCacheStartupPreview(path: String): Boolean {
-        // Only cache for local-ish paths; skip remote/memory playback.
-        if (path.startsWith("memory://") ||
-            path.startsWith("http://") || path.startsWith("https://") ||
-            path.startsWith("rtmp://") || path.startsWith("rtmps://") ||
-            path.startsWith("rtsp://") || path.startsWith("mms://") ||
-            path.startsWith("udp://") || path.startsWith("tcp://")
-        ) return false
-        return true
-    }
-
-    private fun isFilesystemPath(path: String): Boolean = path.startsWith("/")
-
-    private fun thumbDir(): File {
-        val dir = File(filesDir, THUMB_DIR_NAME)
-        if (!dir.exists()) dir.mkdirs()
-        return dir
-    }
-
-    private fun thumbPngFileForPath(path: String): File =
-        File(thumbDir(), "${sha1Hex(path)}.png")
-
-    private fun thumbTmpFileForPath(path: String): File =
-        File(thumbDir(), "${sha1Hex(path)}.tmp.png")
-
-    private fun purgePerFileArtifacts(path: String) {
-        try { thumbPngFileForPath(path).delete() } catch (_: Throwable) {}
-        try { thumbTmpFileForPath(path).delete() } catch (_: Throwable) {}
-        val prefs = getDefaultSharedPreferences(applicationContext)
-        with (prefs.edit()) {
-            remove(perFileKey(PREF_THUMB_SRC, path))
-            remove(perFileKey(PREF_THUMB_MTIME, path))
-            remove(perFileKey(PREF_THUMB_FSIZE, path))
-            // Also clear remembered subtitle selection for that file.
-            remove(perFileKey(PREF_SUB_KIND, path))
-            remove(perFileKey(PREF_SUB_EXTERNAL, path))
-            remove(perFileKey(PREF_SUB_SID, path))
-            apply()
-        }
-    }
-
-    private fun cleanupOrphanedPerFileDataAsync() {
-        Thread {
-            try {
-                val prefs = getDefaultSharedPreferences(applicationContext)
-                val all = prefs.all
-                val keys = all.keys.filter { it.startsWith("perfile_${PREF_THUMB_SRC}_") }
-                if (keys.isNotEmpty()) {
-                    val edit = prefs.edit()
-                    for (k in keys) {
-                        val src = all[k] as? String ?: continue
-                        if (isFilesystemPath(src) && !File(src).exists()) {
-                            try { thumbPngFileForPath(src).delete() } catch (_: Throwable) {}
-                            try { thumbTmpFileForPath(src).delete() } catch (_: Throwable) {}
-                            edit.remove(k)
-                            edit.remove(perFileKey(PREF_THUMB_MTIME, src))
-                            edit.remove(perFileKey(PREF_THUMB_FSIZE, src))
-                            edit.remove(perFileKey(PREF_SUB_KIND, src))
-                            edit.remove(perFileKey(PREF_SUB_EXTERNAL, src))
-                            edit.remove(perFileKey(PREF_SUB_SID, src))
-                        }
-                    }
-                    edit.apply()
-                }
-                cleanupOrphanedWatchLater()
-            } catch (_: Throwable) {}
-        }.start()
-    }
-
-    private fun cleanupOrphanedWatchLater() {
-        val dir = File(filesDir, "watch_later")
-        if (!dir.isDirectory) return
-
-        for (cfg in dir.listFiles() ?: emptyArray()) {
-            if (!cfg.isFile) continue
-            try {
-                val text = cfg.readText(Charsets.UTF_8)
-                val m = Regex("(?m)^filename=(.+)$").find(text) ?: continue
-                var name = m.groupValues[1].trim()
-                if (name.startsWith("file://")) {
-                    try { name = Uri.parse(name).path ?: name.removePrefix("file://") } catch (_: Throwable) {}
-                }
-                if (name.startsWith("/") && !File(name).exists()) {
-                    cfg.delete()
-                }
-            } catch (_: Throwable) {}
-        }
-    }
-
-    private fun persistCurrentFramePngInternal(path: String) {
-        val outTmp = thumbTmpFileForPath(path)
-        val outFinal = thumbPngFileForPath(path)
-
-        try {
-            try { outTmp.delete() } catch (_: Throwable) {}
-
-            // Force png and capture the current *video* frame (no OSD/subs).
-            val oldFmt = MPVLib.getPropertyString("screenshot-format")
-            MPVLib.setPropertyString("screenshot-format", "png")
-            MPVLib.command(arrayOf("screenshot-to-file", outTmp.absolutePath, "video"))
-            oldFmt?.let { MPVLib.setPropertyString("screenshot-format", it) }
-
-            if (!outTmp.exists() || outTmp.length() <= 0L) {
-                try { outTmp.delete() } catch (_: Throwable) {}
-                return
-            }
-
-            if (outFinal.exists())
-                outFinal.delete()
-            outTmp.renameTo(outFinal)
-
-            val prefs = getDefaultSharedPreferences(applicationContext)
-            with (prefs.edit()) {
-                putString(perFileKey(PREF_THUMB_SRC, path), path)
-                if (isFilesystemPath(path)) {
-                    val f = File(path)
-                    putLong(perFileKey(PREF_THUMB_MTIME, path), f.lastModified())
-                    putLong(perFileKey(PREF_THUMB_FSIZE, path), f.length())
-                }
-                apply()
-            }
-        } catch (_: Throwable) {
-            try { outTmp.delete() } catch (_: Throwable) {}
-        }
-    }
-
-    private fun persistCurrentFramePngForPath(path: String) {
-        if (!shouldCacheStartupPreview(path))
-            return
-        Thread { persistCurrentFramePngInternal(path) }.start()
-    }
-
-    private fun persistCurrentFramePngForPathBlocking(path: String) {
-        if (!shouldCacheStartupPreview(path))
-            return
-        persistCurrentFramePngInternal(path)
-    }
-
-
     private fun rememberSubtitleSelectionForCurrentFile() {
         val mediaPath = MPVLib.getPropertyString("path") ?: return
         val prefs = getDefaultSharedPreferences(applicationContext)
@@ -1881,6 +1776,125 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
             }
         }
     }
+
+
+    // --- Per-file startup preview thumbnail persistence (last-frame PNG) ---
+
+    private fun isRemoteishPath(path: String): Boolean {
+        return path.startsWith("memory://") ||
+            path.startsWith("http://") || path.startsWith("https://") ||
+            path.startsWith("rtmp://") || path.startsWith("rtmps://") ||
+            path.startsWith("rtsp://") || path.startsWith("mms://") ||
+            path.startsWith("udp://") || path.startsWith("tcp://")
+    }
+
+    private fun startupThumbDir(): File = File(filesDir, THUMB_DIR_NAME).apply {
+        if (!exists()) mkdirs()
+    }
+
+    private fun startupThumbFileForPath(path: String): File =
+        File(startupThumbDir(), "${sha1Hex(path)}.png")
+
+    private fun calculateInSampleSize(opts: BitmapFactory.Options, reqW: Int, reqH: Int): Int {
+        val (h, w) = opts.outHeight to opts.outWidth
+        var inSampleSize = 1
+        if (h > reqH || w > reqW) {
+            var halfH = h / 2
+            var halfW = w / 2
+            while ((halfH / inSampleSize) >= reqH && (halfW / inSampleSize) >= reqW) {
+                inSampleSize *= 2
+            }
+        }
+        return inSampleSize.coerceAtLeast(1)
+    }
+
+    private fun decodePngForOverlay(file: File, targetW: Int, targetH: Int): Bitmap? {
+        return try {
+            val opts = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+            BitmapFactory.decodeFile(file.absolutePath, opts)
+            val sample = calculateInSampleSize(opts, targetW, targetH)
+            val opts2 = BitmapFactory.Options().apply {
+                inSampleSize = sample
+                inPreferredConfig = Bitmap.Config.ARGB_8888
+            }
+            BitmapFactory.decodeFile(file.absolutePath, opts2)
+        } catch (_: Throwable) {
+            null
+        }
+    }
+
+    private fun purgePerFileArtifacts(path: String) {
+        val prefs = getDefaultSharedPreferences(applicationContext)
+        val existing = prefs.getStringSet(PREF_THUMB_INDEX_PATHS, emptySet())?.toMutableSet() ?: mutableSetOf()
+        if (existing.remove(path)) {
+            prefs.edit().putStringSet(PREF_THUMB_INDEX_PATHS, existing).apply()
+        }
+
+        // Delete cached startup thumbnail.
+        try { startupThumbFileForPath(path).delete() } catch (_: Throwable) {}
+
+        // Delete per-file subtitle selection (and any other per-file keys we own).
+        prefs.edit()
+            .remove(perFileKey(PREF_SUB_KIND, path))
+            .remove(perFileKey(PREF_SUB_EXTERNAL, path))
+            .remove(perFileKey(PREF_SUB_SID, path))
+            .apply()
+    }
+
+    private fun cleanupOrphanThumbnails() {
+        val prefs = getDefaultSharedPreferences(applicationContext)
+        val paths = prefs.getStringSet(PREF_THUMB_INDEX_PATHS, emptySet())?.toMutableSet() ?: return
+        if (paths.isEmpty()) return
+
+        val kept = mutableSetOf<String>()
+        for (p in paths) {
+            if (p.startsWith("/") && !File(p).exists()) {
+                // Source file is gone -> delete all associated artifacts.
+                purgePerFileArtifacts(p)
+            } else {
+                kept.add(p)
+            }
+        }
+        if (kept != paths) {
+            prefs.edit().putStringSet(PREF_THUMB_INDEX_PATHS, kept).apply()
+        }
+    }
+
+    private var startupThumbAsyncCounter: Long = 9_000_000L
+
+    private fun persistLastFramePngForCurrentFile(syncIfFinishing: Boolean) {
+        val mediaPath = MPVLib.getPropertyString("path") ?: return
+        if (isRemoteishPath(mediaPath)) return
+
+        // If the source is a direct filesystem path and it's gone, purge and bail.
+        if (mediaPath.startsWith("/") && !File(mediaPath).exists()) {
+            purgePerFileArtifacts(mediaPath)
+            return
+        }
+
+        val fmt = MPVLib.getPropertyString("video-format")
+        if (fmt.isNullOrEmpty()) return
+
+        val outFile = startupThumbFileForPath(mediaPath)
+        try { outFile.parentFile?.mkdirs() } catch (_: Throwable) {}
+
+        // Index so we can clean up if the source file is deleted later.
+        val prefs = getDefaultSharedPreferences(applicationContext)
+        val set = prefs.getStringSet(PREF_THUMB_INDEX_PATHS, emptySet())?.toMutableSet() ?: mutableSetOf()
+        if (set.add(mediaPath)) prefs.edit().putStringSet(PREF_THUMB_INDEX_PATHS, set).apply()
+
+        val cmd = arrayOf("screenshot-to-file", outFile.absolutePath, "video")
+        try {
+            if (syncIfFinishing) {
+                MPVLib.command(cmd)
+            } else {
+                MPVLib.commandAsync(cmd, startupThumbAsyncCounter++)
+            }
+        } catch (_: Throwable) {
+            // ignore
+        }
+    }
+
 
     private fun findExternalSubFilenameForSid(sid: Int): String? {
         if (sid < 0) return null
@@ -2842,6 +2856,64 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
 
     private enum class ProbedOrientation { LANDSCAPE, PORTRAIT, SQUARE, UNKNOWN }
 
+
+    private fun getCachedProbedOrientation(path: String): ProbedOrientation? {
+        synchronized(orientationProbeLock) {
+            return orientationProbeCache[path]
+        }
+    }
+
+    private fun putCachedProbedOrientation(path: String, value: ProbedOrientation) {
+        synchronized(orientationProbeLock) {
+            orientationProbeCache[path] = value
+        }
+    }
+
+    /**
+     * Fast best-effort probe:
+     * - Returns cached result immediately when available.
+     * - Otherwise tries a background probe but only waits a short time to avoid UI jank.
+     *   The probe continues in the background and will populate the cache when finished.
+     */
+    private fun probeOrientationFromMetadataFast(path: String, timeoutMs: Long = 120L): ProbedOrientation {
+        getCachedProbedOrientation(path)?.let { return it }
+
+        return try {
+            val fut = metadataProbeExecutor.submit<ProbedOrientation> {
+                val r = probeOrientationFromMetadata(path)
+                putCachedProbedOrientation(path, r)
+                r
+            }
+            val r = fut.get(timeoutMs, TimeUnit.MILLISECONDS)
+            r
+        } catch (_: TimeoutException) {
+            ProbedOrientation.UNKNOWN
+        } catch (_: Throwable) {
+            ProbedOrientation.UNKNOWN
+        }
+    }
+
+    private fun probeOrientationFromMetadataAsync(path: String, token: Long, callback: (ProbedOrientation) -> Unit) {
+        getCachedProbedOrientation(path)?.let { cached ->
+            callback(cached)
+            return
+        }
+
+        metadataProbeExecutor.execute {
+            val r = try { probeOrientationFromMetadata(path) } catch (_: Throwable) { ProbedOrientation.UNKNOWN }
+            putCachedProbedOrientation(path, r)
+
+            eventUiHandler.post {
+                // Ignore stale results if a newer probe was started.
+                if (token != orientationProbeToken)
+                    return@post
+                if (isFinishing || finishPending)
+                    return@post
+                callback(r)
+            }
+        }
+    }
+
     private fun probeOrientationFromMetadata(path: String): ProbedOrientation {
         // Skip unsupported / remote schemes (mpv will update orientation later from video-params).
         if (path.startsWith("http://") || path.startsWith("https://") ||
@@ -2892,29 +2964,31 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
             return
         lastOrientationProbePath = path
 
-        val probed = probeOrientationFromMetadata(path)
-        val desired = when (probed) {
-            ProbedOrientation.LANDSCAPE -> ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
-            ProbedOrientation.PORTRAIT -> ActivityInfo.SCREEN_ORIENTATION_SENSOR_PORTRAIT
-            ProbedOrientation.SQUARE -> ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
-            ProbedOrientation.UNKNOWN -> return
+        // Start (or use cached) probe off the UI thread.
+        val token = ++orientationProbeToken
+        probeOrientationFromMetadataAsync(path, token) { probed ->
+            val desired = when (probed) {
+                ProbedOrientation.LANDSCAPE -> ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
+                ProbedOrientation.PORTRAIT -> ActivityInfo.SCREEN_ORIENTATION_SENSOR_PORTRAIT
+                ProbedOrientation.SQUARE -> ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
+                ProbedOrientation.UNKNOWN -> return@probeOrientationFromMetadataAsync
+            }
+
+            // If we're already in portrait with an unspecified orientation, don't force-lock it.
+            // This avoids unnecessary churn when everything is already portrait.
+            if (desired == ActivityInfo.SCREEN_ORIENTATION_SENSOR_PORTRAIT &&
+                resources.configuration.orientation == Configuration.ORIENTATION_PORTRAIT &&
+                requestedOrientation == ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
+            ) return@probeOrientationFromMetadataAsync
+
+            // Only change if needed to prevent redundant config churn.
+            if (requestedOrientation != desired)
+                requestedOrientation = desired
+
+            // Hold the chosen orientation briefly so transient "square/unknown" aspect updates
+            // from mpv won't bounce us back to portrait during startup/reconfig.
+            lockOrientationStability(desired, if (isStartup) 2200L else 1600L)
         }
-
-
-        // If we're already in portrait with an unspecified orientation, don't force-lock it.
-        // This avoids unnecessary churn when everything is already portrait.
-        if (desired == ActivityInfo.SCREEN_ORIENTATION_SENSOR_PORTRAIT &&
-            resources.configuration.orientation == Configuration.ORIENTATION_PORTRAIT &&
-            requestedOrientation == ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
-        ) return
-
-        // Only change if needed to prevent redundant config churn.
-        if (requestedOrientation != desired)
-            requestedOrientation = desired
-
-        // Hold the chosen orientation briefly so transient "square/unknown" aspect updates
-        // from mpv won't bounce us back to portrait during startup/reconfig.
-        lockOrientationStability(desired, if (isStartup) 2200L else 1600L)
     }
 
 
@@ -3139,9 +3213,10 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
 
         if (eventId == MpvEvent.MPV_EVENT_PLAYBACK_RESTART) {
             // A seek completed. If the user has released the finger, resume playback now.
+            scrubSeekHandler.removeCallbacks(scrubSeekTimeoutRunnable)
             scrubSeekInFlight = false
             lastScrubAsyncUserdata = 0L
-            if (resumeAfterScrubSeek && !gestureScrubActive && !seekbarScrubActive) {
+            if (resumeAfterScrubSeek && !gestureScrubActive && !seekbarScrubActive && activityIsForeground) {
                 resumeAfterScrubSeek = false
                 eventUiHandler.post { player.paused = false }
             }
@@ -3194,9 +3269,10 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
         val ud = lastScrubAsyncUserdata
         if (ud != 0L) {
             try { MPVLib.abortAsyncCommand(ud) } catch (_: Throwable) {}
-            lastScrubAsyncUserdata = 0L
-            scrubSeekInFlight = false
         }
+        lastScrubAsyncUserdata = 0L
+        scrubSeekInFlight = false
+        scrubSeekHandler.removeCallbacks(scrubSeekTimeoutRunnable)
     }
 
     private fun sendScrubSeek(targetSec: Double, exact: Boolean) {
@@ -3205,8 +3281,46 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
         val ud = scrubAsyncCounter++
         lastScrubAsyncUserdata = ud
         val mode = if (exact) "absolute+exact" else "absolute+keyframes"
-        MPVLib.commandAsync(arrayOf("seek", targetSec.toString(), mode), ud)
+
+        val err = try {
+            MPVLib.commandAsync(arrayOf("seek", targetSec.toString(), mode), ud)
+        } catch (_: Throwable) {
+            -1
+        }
+
+        if (err < 0) {
+            Log.w(TAG, "mpv_command_async(seek) failed: $err")
+            lastScrubAsyncUserdata = 0L
+            scrubSeekInFlight = false
+            scrubSeekHandler.removeCallbacks(scrubSeekTimeoutRunnable)
+
+            // If the user already released the finger, don't get stuck paused.
+            if (resumeAfterScrubSeek && !gestureScrubActive && !seekbarScrubActive && activityIsForeground) {
+                resumeAfterScrubSeek = false
+                player.paused = false
+            }
+            return
+        }
+
         scrubSeekInFlight = true
+        scrubSeekTimeoutAtMs = SystemClock.uptimeMillis() + SCRUB_SEEK_TIMEOUT_MS
+        scrubSeekHandler.removeCallbacks(scrubSeekTimeoutRunnable)
+        scrubSeekHandler.postDelayed(scrubSeekTimeoutRunnable, SCRUB_SEEK_TIMEOUT_MS)
+    }
+
+    private fun handleScrubSeekTimeout() {
+        if (!scrubSeekInFlight)
+            return
+        if (SystemClock.uptimeMillis() < scrubSeekTimeoutAtMs)
+            return
+
+        Log.w(TAG, "Scrub seek timeout: clearing in-flight state")
+        abortLastScrubSeek()
+
+        if (resumeAfterScrubSeek && !gestureScrubActive && !seekbarScrubActive && activityIsForeground) {
+            resumeAfterScrubSeek = false
+            player.paused = false
+        }
     }
 
     private fun performGestureIdleSeek() {
@@ -3420,11 +3534,8 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
         // When scrubbing, wait briefly for the finger to stop moving before doing an exact seek.
         private const val SCRUB_IDLE_SEEK_DELAY_MS = 140L
 
-        // Per-file thumbnail persistence keys
-        private const val THUMB_DIR_NAME = "thumbs"
-        private const val PREF_THUMB_SRC = "thumb_src"
-        private const val PREF_THUMB_MTIME = "thumb_mtime"
-        private const val PREF_THUMB_FSIZE = "thumb_fsize"
+        // If mpv never reports completion, don't get stuck paused.
+        private const val SCRUB_SEEK_TIMEOUT_MS = 1500L
 
         // Per-file subtitle persistence keys
         private const val PREF_SUB_KIND = "sub_kind"
@@ -3432,5 +3543,9 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
         private const val PREF_SUB_SID = "sub_sid"
         private const val PREF_SUB_KIND_EXTERNAL = "external"
         private const val PREF_SUB_KIND_SID = "sid"
+
+        // Per-file startup preview thumbnail persistence (stored in app-internal filesDir)
+        private const val PREF_THUMB_INDEX_PATHS = "thumb_index_paths"
+        private const val THUMB_DIR_NAME = "startup_thumbs"
     }
 }
