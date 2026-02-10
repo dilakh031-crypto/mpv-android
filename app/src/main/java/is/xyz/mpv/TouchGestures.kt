@@ -104,6 +104,10 @@ internal class TouchGestures(private val observer: TouchGesturesObserver) {
         // Seeking should feel like 1s steps on slow drag (Samsung-like).
         // We achieve this by sending seek updates more frequently than volume/brightness.
         private const val SEEK_THROTTLE_DIV = 24
+
+        // Require gestures to be clearly horizontal/vertical before locking to that axis.
+        // This prevents accidental seeks when the user swipes mostly vertically.
+        private const val DIRECTION_LOCK_RATIO = 1.25f
     }
 
     fun cancel() {
@@ -163,19 +167,46 @@ internal class TouchGestures(private val observer: TouchGesturesObserver) {
         when (state) {
             State.Up -> {}
             State.Down -> {
-                // we might get into one of Control states if user moves enough
+                // We might enter one of the Control states if the user moves enough.
                 // For seeking we want a shorter activation distance (Samsung-like), so the
-                // first visible step can be 1s instead of jumping multiple seconds.
+                // first visible step can be ~1s instead of jumping multiple seconds.
+                //
+                // IMPORTANT: Seeking must be horizontal-only. We therefore require a
+                // sufficiently "horizontal" gesture before locking to ControlSeek, and we
+                // also refuse to activate ControlSeek from a vertical gesture even if the
+                // user configured it that way.
                 val seekTrigger = trigger / 4
 
-                if (abs(dx) > (if (gestureHoriz == State.ControlSeek) seekTrigger else trigger)) {
+                val absDx = abs(dx)
+                val absDy = abs(dy)
+
+                val horizThreshold = if (gestureHoriz == State.ControlSeek) seekTrigger else trigger
+                val vertGesture = if (initialPos.x > width / 2) gestureVertRight else gestureVertLeft
+                val vertThreshold = if (vertGesture == State.ControlSeek) seekTrigger else trigger
+
+                // Horizontal activation: require the gesture to be clearly horizontal.
+                val horizontalIntent =
+                    absDx > horizThreshold &&
+                    (absDy == 0f || absDx / absDy >= DIRECTION_LOCK_RATIO) &&
+                    (gestureHoriz != State.ControlSeek || absDy < trigger / 2)
+
+                // Vertical activation: require the gesture to be clearly vertical.
+                val verticalIntent =
+                    absDy > vertThreshold && (absDx == 0f || absDy / absDx >= DIRECTION_LOCK_RATIO)
+
+                if (horizontalIntent) {
                     state = gestureHoriz
                     stateDirection = 0
-                } else if (abs(dy) > (if ((if (initialPos.x > width / 2) gestureVertRight else gestureVertLeft) == State.ControlSeek) seekTrigger else trigger)) {
-                    state = if (initialPos.x > width / 2) gestureVertRight else gestureVertLeft
-                    stateDirection = 1
+                } else if (verticalIntent) {
+                    val chosen = vertGesture
+                    // Never seek from vertical swipes.
+                    if (chosen != State.ControlSeek) {
+                        state = chosen
+                        stateDirection = 1
+                    }
                 }
-                // send Init so that it has a chance to cache values before we start modifying them
+
+                // Send Init so that it has a chance to cache values before we start modifying them.
                 if (state != State.Down) {
                     sendPropertyChange(PropertyChange.Init, 0f)
 
