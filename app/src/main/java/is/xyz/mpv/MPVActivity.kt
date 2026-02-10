@@ -1043,22 +1043,14 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
     private var useAudioUI = false
 
     private var lockedUI = false
+
     private fun pauseForDialog(): StateRestoreCallback {
         // Keep playback running while UI dialogs/menus are open.
         // We still set keep-open so mpv doesn't exit at EOF while the user is interacting with UI.
         val oldValue = MPVLib.getPropertyString("keep-open")
         MPVLib.setPropertyBoolean("keep-open", true)
-
-        // Remember whether the user had the on-screen controls visible when opening the dialog.
-        // We'll restore that state when the dialog/menu stack exits back to video.
-        val controlsWereVisible = ::binding.isInitialized &&
-            (binding.controls.visibility == View.VISIBLE || binding.topControls.visibility == View.VISIBLE)
-
         return {
             oldValue?.also { MPVLib.setPropertyString("keep-open", it) }
-            if (controlsWereVisible) {
-                runIfActive { showControls() }
-            }
         }
     }
 
@@ -1121,32 +1113,37 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
                 binding.statsTextView.alpha = 1f
         }
 
-        // Auto-hide is intentionally disabled: controls stay visible until the user toggles them.
-        // (Menus/dialogs will force-hide the controls while they are open.)
+        // Intentionally do NOT auto-hide controls.
+        // The user must explicitly toggle them off (single tap), or they will be hidden when
+        // opening any in-player menu/dialog.
     }
 
-        /** Hide controls instantly */
-    fun hideControls() = hideControlsInternal(force = false)
-
-    /** Hide controls instantly when opening any menu/dialog (ignores the usual visibility guards). */
-    private fun hideControlsForMenu() = hideControlsInternal(force = true)
-
-    private fun hideControlsInternal(force: Boolean) {
-        if (!force && controlsShouldBeVisible())
-            return
-
-        // Cancel any pending fade-out so we don't leave alpha=0 while still VISIBLE.
+    /**
+     * Force-hide controls regardless of the current UI state.
+     *
+     * This is used when opening in-player menus/dialogs: controls must disappear immediately,
+     * and they must NOT reappear when the menu/dialog is dismissed.
+     */
+    private fun hideControlsForMenu() {
+        // Cancel any pending fade-out so the runnable cannot interfere.
         fadeHandler.removeCallbacks(fadeRunnable)
-        fadeRunnable.hasStarted = false
         binding.controls.animate().setListener(null).cancel()
         binding.topControls.animate().setListener(null).cancel()
         binding.statsTextView.animate().setListener(null).cancel()
 
-        // Ensure a clean state for the next showControls().
-        binding.controls.alpha = 1f
-        binding.topControls.alpha = 1f
-        binding.statsTextView.alpha = 1f
+        // Hide instantly (use GONE because of SurfaceView bug, see hideControls()).
+        binding.controls.visibility = View.GONE
+        binding.topControls.visibility = View.GONE
+        binding.statsTextView.visibility = View.GONE
 
+        val insetsController = WindowCompat.getInsetsController(window, window.decorView)
+        insetsController.hide(WindowInsetsCompat.Type.systemBars())
+    }
+
+    /** Hide controls instantly */
+    fun hideControls() {
+        if (controlsShouldBeVisible())
+            return
         // use GONE here instead of INVISIBLE (which makes more sense) because of Android bug with surface views
         // see http://stackoverflow.com/a/12655713/2606891
         binding.controls.visibility = View.GONE
@@ -1178,10 +1175,9 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
      * the same immersive flags as the activity window.
      */
     private fun showImmersiveDialog(dialog: AlertDialog) {
-        // Controls should stay visible indefinitely, but menus/dialogs should take over the screen.
-        // Hide controls immediately when any immersive dialog is shown.
+        // Requirement: when *any* in-player menu/dialog opens, controls must hide immediately,
+        // and must not automatically reappear when the dialog closes.
         hideControlsForMenu()
-        cancelPendingTapToggle()
 
         // Prevent the dialog window from taking focus first (avoids system bars flashing in).
         dialog.window?.setFlags(
@@ -2008,7 +2004,7 @@ private fun openPlaylistMenu(restore: StateRestoreCallback, onBack: (() -> Unit)
                     // Keep dialog open.
                 }
             }
-            urlDialog.show()
+            showImmersiveDialog(urlDialog)
         }
 
         override fun onItemPicked(item: MPVView.PlaylistItem) {
