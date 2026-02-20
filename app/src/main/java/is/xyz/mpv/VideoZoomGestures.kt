@@ -23,7 +23,7 @@ import kotlin.math.hypot
  *
  * IMPORTANT:
  *  - Touch input must come from an UNTRANSFORMED overlay view (gesture layer),
- *    not from the transformed SurfaceView itself.
+ *    not from the transformed video view itself.
  */
 internal class VideoZoomGestures(
     private val target: View,
@@ -48,15 +48,34 @@ internal class VideoZoomGestures(
     private var downTime = 0L
     private var didDrag = false
 
+    // Single-finger pan is applied on vsync to avoid bursty MotionEvent delivery
+    // causing visible micro-stutter.
+    private var panFingerDown = false
+    private var panPendingX = 0f
+    private var panPendingY = 0f
+    private var panFrameX = 0f
+    private var panFrameY = 0f
+
     private var lastTapTime = 0L
     private var lastTapX = 0f
     private var lastTapY = 0f
 
-    // Coalesce view property updates to vsync to avoid SurfaceView transaction jitter.
+    // Coalesce view property updates to vsync.
     private val choreographer: Choreographer = Choreographer.getInstance()
     private var applyScheduled = false
     private val frameCallback = Choreographer.FrameCallback {
         applyScheduled = false
+
+        // Apply pan at a stable cadence (vsync) while zoomed.
+        if (panFingerDown && didDrag && isZoomed() && !scaleDetector.isInProgress) {
+            val dx = panPendingX - panFrameX
+            val dy = panPendingY - panFrameY
+            panFrameX = panPendingX
+            panFrameY = panPendingY
+            tx += dx
+            ty += dy
+        }
+
         clampTranslationToVideoContent()
         applyToView()
     }
@@ -141,6 +160,7 @@ internal class VideoZoomGestures(
         tx = 0f
         ty = 0f
         didDrag = false
+        panFingerDown = false
         lastTapTime = 0L
         applyToView()
     }
@@ -159,6 +179,7 @@ internal class VideoZoomGestures(
         if (e.actionMasked == MotionEvent.ACTION_POINTER_UP && isZoomed()) {
             lastTapTime = 0L
             didDrag = true
+            panFingerDown = false
             if (e.pointerCount >= 2) {
                 val upIdx = e.actionIndex
                 val remainIdx = if (upIdx == 0) 1 else 0
@@ -166,6 +187,10 @@ internal class VideoZoomGestures(
                 lastY = e.getY(remainIdx)
                 downX = lastX
                 downY = lastY
+                panPendingX = lastX
+                panPendingY = lastY
+                panFrameX = lastX
+                panFrameY = lastY
                 downTime = SystemClock.uptimeMillis()
             }
             return true
@@ -175,6 +200,7 @@ internal class VideoZoomGestures(
         if (e.pointerCount > 1 || scaleDetector.isInProgress) {
             lastTapTime = 0L
             didDrag = true
+            panFingerDown = false
             return true
         }
 
@@ -187,15 +213,22 @@ internal class VideoZoomGestures(
                 downY = e.y
                 lastX = e.x
                 lastY = e.y
+                panPendingX = e.x
+                panPendingY = e.y
+                panFrameX = e.x
+                panFrameY = e.y
+                panFingerDown = true
                 downTime = SystemClock.uptimeMillis()
                 didDrag = false
                 return true
             }
             MotionEvent.ACTION_MOVE -> {
-                val dx = e.x - lastX
-                val dy = e.y - lastY
                 lastX = e.x
                 lastY = e.y
+
+                // Track latest pointer position; actual translation is applied on the next vsync.
+                panPendingX = e.x
+                panPendingY = e.y
 
                 if (!didDrag) {
                     val dist = hypot(e.x - downX, e.y - downY)
@@ -204,8 +237,6 @@ internal class VideoZoomGestures(
                 }
 
                 if (didDrag) {
-                    tx += dx
-                    ty += dy
                     scheduleApply()
                 }
                 return true
@@ -213,6 +244,8 @@ internal class VideoZoomGestures(
             MotionEvent.ACTION_UP -> {
                 val now = SystemClock.uptimeMillis()
                 val wasTap = !didDrag && (now - downTime) < DOUBLE_TAP_TIMEOUT
+
+                panFingerDown = false
 
                 if (!wasTap) {
                     lastTapTime = 0L
@@ -236,6 +269,7 @@ internal class VideoZoomGestures(
             MotionEvent.ACTION_CANCEL -> {
                 lastTapTime = 0L
                 didDrag = false
+                panFingerDown = false
                 return true
             }
         }
@@ -322,7 +356,8 @@ internal class VideoZoomGestures(
     companion object {
         private const val EPS = 0.001f
         private const val MIN_SCALE = 1f
-        private const val MAX_SCALE = 6f
+        // Increased maximum zoom from 6x to 20x.
+        private const val MAX_SCALE = 20f
         private const val DOUBLE_TAP_TIMEOUT = 300L
     }
 }
