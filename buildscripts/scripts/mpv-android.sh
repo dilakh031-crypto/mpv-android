@@ -51,9 +51,11 @@ if [ -n "$ANDROID_SIGNING_KEY" ]; then
 	apksigner=${ANDROID_HOME}/build-tools/${v_sdk_build_tools}/apksigner
 	for v in default api29; do
 		pushd $v
-		# sign the universal debug APK
-		"$apksigner" sign --ks "${ANDROID_SIGNING_KEY}" \
-			--in debug/app-$v-universal-debug.apk --out debug/app-$v-universal-debug-signed.apk
+		# sign the universal debug APK (if it exists)
+		if [ -f "debug/app-$v-universal-debug.apk" ]; then
+			"$apksigner" sign --ks "${ANDROID_SIGNING_KEY}" \
+				--in debug/app-$v-universal-debug.apk --out debug/app-$v-universal-debug-signed.apk
+		fi
 		# but all of the release APKs
 		for apk in release/*-unsigned.apk; do
 			"$apksigner" sign --ks "${ANDROID_SIGNING_KEY}" \
