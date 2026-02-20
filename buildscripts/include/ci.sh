@@ -3,7 +3,14 @@
 # go to buildscripts root folder
 cd "$( dirname "${BASH_SOURCE[0]}" )/.."
 
+# CI should build arm64 (arm64-v8a) by default.
+# You can override this by setting ARCH (armv7l, arm64, x86, x86_64).
+ARCH="${ARCH:-arm64}"
+
 . ./include/depinfo.sh
+
+# Make cache identifiers architecture-specific to avoid mixing prefixes.
+ci_tarball="${ci_tarball%.tgz}-arch-${ARCH}.tgz"
 
 msg() {
 	printf '==> %s\n' "$1"
@@ -34,7 +41,7 @@ build_prefix() {
 	# build everything mpv depends on (but not mpv itself)
 	for x in ${dep_mpv[@]}; do
 		msg "Building $x"
-		./buildall.sh $x
+		./buildall.sh --arch "$ARCH" $x
 	done
 
 	if [[ "$CACHE_MODE" == folder && -w "$CACHE_FOLDER" ]]; then
@@ -79,13 +86,13 @@ else
 fi
 
 msg "Building mpv"
-./buildall.sh -n mpv || {
+./buildall.sh --arch "$ARCH" -n mpv || {
 	# show logfile if configure failed
 	[ ! -f deps/mpv/_build/config.h ] && cat deps/mpv/_build/meson-logs/meson-log.txt
 	exit 1
 }
 
 msg "Building mpv-android"
-./buildall.sh -n
+./buildall.sh --arch "$ARCH" -n
 
 exit 0
