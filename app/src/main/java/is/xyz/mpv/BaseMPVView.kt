@@ -3,12 +3,28 @@ package `is`.xyz.mpv
 import android.content.Context
 import android.util.AttributeSet
 import android.util.Log
-import android.view.SurfaceHolder
-import android.view.SurfaceView
+import android.view.Surface
+import android.view.TextureView
 
 // Contains only the essential code needed to get a picture on the screen
 
-abstract class BaseMPVView(context: Context, attrs: AttributeSet) : SurfaceView(context, attrs), SurfaceHolder.Callback {
+/**
+ * IMPORTANT ABOUT SurfaceView vs TextureView
+ *
+ * mpv-android historically used a SurfaceView for best playback efficiency.
+ * However, SurfaceView is composed in a separate surface layer. On some devices/Android
+ * versions, applying large scale/translation transforms to a SurfaceView (e.g. 10x-20x
+ * zoom + pan) can result in visible "shimmer"/"jitter" during movement due to
+ * SurfaceFlinger/HWC quantization and asynchronous surface position updates.
+ *
+ * TextureView is part of the normal View hierarchy and its transforms are applied in the
+ * same composition pass as other UI, which makes high zoom/pan much more stable.
+ *
+ * This project implements pinch-to-zoom by transforming the video view itself
+ * (see VideoZoomGestures). Therefore, we use TextureView here to avoid jitter
+ * when zoomed to large scales.
+ */
+abstract class BaseMPVView(context: Context, attrs: AttributeSet) : TextureView(context, attrs), TextureView.SurfaceTextureListener {
     /**
      * Initialize libmpv.
      *
@@ -33,8 +49,17 @@ abstract class BaseMPVView(context: Context, attrs: AttributeSet) : SurfaceView(
         // need to idle at least once for playFile() logic to work
         MPVLib.setOptionString("idle", "once")
 
-        holder.addCallback(this)
+        surfaceTextureListener = this
         observeProperties()
+
+        mpvInitialized = true
+
+        // If the TextureView surface is already available, attach immediately.
+        if (isAvailable) {
+            val st = surfaceTexture
+            if (st != null)
+                onSurfaceTextureAvailable(st, width, height)
+        }
     }
 
     /**
@@ -43,8 +68,20 @@ abstract class BaseMPVView(context: Context, attrs: AttributeSet) : SurfaceView(
      * Call this once before the view is destroyed.
      */
     fun destroy() {
-        // Disable surface callbacks to avoid using uninitialized mpv state
-        holder.removeCallback(this)
+        // Best-effort detach if we're still attached.
+        if (surfaceAttached) {
+            try {
+                MPVLib.setPropertyString("vo", "null")
+                MPVLib.setPropertyString("force-window", "no")
+                MPVLib.detachSurface()
+            } catch (_: Throwable) {
+                // Ignore; we're shutting down anyway.
+            }
+            try { surface?.release() } catch (_: Throwable) {}
+            surface = null
+            surfaceAttached = false
+        }
+        mpvInitialized = false
 
         MPVLib.destroy()
     }
@@ -74,15 +111,32 @@ abstract class BaseMPVView(context: Context, attrs: AttributeSet) : SurfaceView(
         MPVLib.setOptionString("vo", vo)
     }
 
-    // Surface callbacks
+    // TextureView callbacks
 
-    override fun surfaceChanged(holder: SurfaceHolder, format: Int, width: Int, height: Int) {
-        MPVLib.setPropertyString("android-surface-size", "${width}x$height")
-    }
+    private var mpvInitialized: Boolean = false
+    private var surfaceAttached: Boolean = false
+    private var surface: Surface? = null
 
-    override fun surfaceCreated(holder: SurfaceHolder) {
+    override fun onSurfaceTextureAvailable(st: android.graphics.SurfaceTexture, width: Int, height: Int) {
+        if (!mpvInitialized)
+            return
         Log.w(TAG, "attaching surface")
-        MPVLib.attachSurface(holder.surface)
+
+        // If we're reusing a SurfaceTexture (rare), detach first.
+        if (surfaceAttached) {
+            try { MPVLib.detachSurface() } catch (_: Throwable) {}
+            try { surface?.release() } catch (_: Throwable) {}
+            surface = null
+            surfaceAttached = false
+        }
+
+        surface = Surface(st)
+        MPVLib.attachSurface(surface!!)
+        surfaceAttached = true
+
+        // Tell mpv the surface size (important for correct scaling).
+        MPVLib.setPropertyString("android-surface-size", "${width}x$height")
+
         // This forces mpv to render subs/osd/whatever into our surface even if it would ordinarily not
         MPVLib.setOptionString("force-window", "yes")
 
@@ -95,7 +149,16 @@ abstract class BaseMPVView(context: Context, attrs: AttributeSet) : SurfaceView(
         }
     }
 
-    override fun surfaceDestroyed(holder: SurfaceHolder) {
+    override fun onSurfaceTextureSizeChanged(st: android.graphics.SurfaceTexture, width: Int, height: Int) {
+        if (!mpvInitialized || !surfaceAttached)
+            return
+        MPVLib.setPropertyString("android-surface-size", "${width}x$height")
+    }
+
+    override fun onSurfaceTextureDestroyed(st: android.graphics.SurfaceTexture): Boolean {
+        if (!mpvInitialized || !surfaceAttached)
+            return true
+
         Log.w(TAG, "detaching surface")
         MPVLib.setPropertyString("vo", "null")
         MPVLib.setPropertyString("force-window", "no")
@@ -104,6 +167,14 @@ abstract class BaseMPVView(context: Context, attrs: AttributeSet) : SurfaceView(
         // FIXME: There could be a race condition here, because I don't think
         // setting a property will wait for VO deinit.
         MPVLib.detachSurface()
+        surfaceAttached = false
+        try { surface?.release() } catch (_: Throwable) {}
+        surface = null
+        return true
+    }
+
+    override fun onSurfaceTextureUpdated(st: android.graphics.SurfaceTexture) {
+        // no-op
     }
 
     companion object {
