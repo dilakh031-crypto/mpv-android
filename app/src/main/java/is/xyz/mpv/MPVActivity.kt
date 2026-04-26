@@ -2281,7 +2281,7 @@ private fun openTopMenu(existingRestoreState: StateRestoreCallback? = null) {
             translateContentUri(Uri.parse(path))
         else
             path
-        MPVLib.command(arrayOf(cmd, path2, "cached"))
+        MPVLib.command(arrayOf(cmd, path2, "select"))
 
         // Persist the chosen external track per video so it gets reloaded on reopen.
         if (cmd == "sub-add") {
