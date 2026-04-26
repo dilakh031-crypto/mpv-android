@@ -41,18 +41,17 @@ jobs:
         run: |
           buildscripts/include/ci.sh build
 
-      - name: Normalize APK name
+      - name: Verify APK
         run: |
-          shopt -s nullglob
-          files=(app/build/outputs/apk/default/release/app-default-arm64-v8a-release*.apk)
-          if [ ${#files[@]} -ne 1 ]; then
-            echo "Expected exactly one release APK, found ${#files[@]}"
-            ls -la app/build/outputs/apk/default/release
+          apk=app/build/outputs/apk/default/release/app-default-arm64-v8a-release.apk
+          if [ ! -f "$apk" ]; then
+            echo "Error: expected APK not found"
+            ls -la app/build/outputs/apk/default/release/ || true
             exit 1
           fi
-          mv "${files[0]}" app/build/outputs/apk/default/release/app-default-arm64-v8a-release.apk
 
       - uses: actions/upload-artifact@v7
         with:
           name: mpv-android
           path: app/build/outputs/apk/default/release/app-default-arm64-v8a-release.apk
+          if-no-files-found: error
