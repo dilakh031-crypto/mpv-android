@@ -98,13 +98,6 @@ void *event_thread(void *arg)
             mp_property = (mpv_event_property*)mp_event->data;
             sendPropertyUpdateToJava(env, mp_property);
             break;
-        case MPV_EVENT_COMMAND_REPLY: {
-            // Forward userdata and error code so Kotlin can match async commands.
-            // error is a field directly on mpv_event, not inside data.
-            env->CallStaticVoidMethod(mpv_MPVLib, mpv_MPVLib_commandReply,
-                (jlong)mp_event->reply_userdata, (jint)mp_event->error);
-            break;
-        }
         default:
             ALOGV("event: %s\n", mpv_event_name(mp_event->event_id));
             sendEventToJava(env, mp_event->event_id);
