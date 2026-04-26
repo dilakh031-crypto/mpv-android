@@ -33,7 +33,8 @@ android {
         abi {
             enable true
             reset()
-            include "arm64-v8a"
+            // include only arm64-v8a for the CI release APK
+            include("arm64-v8a")
             universalApk false
         }
     }
