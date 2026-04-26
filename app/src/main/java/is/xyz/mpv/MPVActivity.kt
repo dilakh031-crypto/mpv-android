@@ -68,15 +68,6 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
     // for use with fadeRunnable1..3
     private val fadeHandler = Handler(Looper.getMainLooper())
     // for use with stopServiceRunnable
-
-    // --- Async command userdata tracking ---
-    private val asyncCmdCounter = java.util.concurrent.atomic.AtomicLong(0L)
-    private fun nextCmdUd() = asyncCmdCounter.incrementAndGet()
-
-    // Pending state for secondary-subtitle async restore
-    private data class PendingSecondarySubRestore(val ext: String, val primarySidSnapshot: String?)
-    @Volatile private var pendingSecondarySubRestore: PendingSecondarySubRestore? = null
-    @Volatile private var secondarySubRestoreUd: Long = 0L
     private val stopServiceHandler = Handler(Looper.getMainLooper())
     // Delayed single-tap toggling (we wait a bit so a faster double-tap can be recognized
     // without flashing the control UI).
@@ -1763,10 +1754,8 @@ private fun restoreSubtitleSelectionForCurrentFile() {
     when (kind1) {
         PREF_SUB_KIND_EXTERNAL -> {
             if (!ext1.isNullOrEmpty()) {
-                // commandAsync: dispatches sub-add to mpv's internal queue and returns immediately.
-                // "cached" mode makes mpv auto-select the track once it finishes loading —
-                // no explicit SID assignment needed here.
-                MPVLib.commandAsync(arrayOf("sub-add", ext1, "cached"), nextCmdUd())
+                // "cached" will select the subtitle; if it already exists, it will be reused.
+                MPVLib.command(arrayOf("sub-add", ext1, "cached"))
             }
         }
         PREF_SUB_KIND_SID -> {
@@ -1776,20 +1765,31 @@ private fun restoreSubtitleSelectionForCurrentFile() {
         }
     }
 
-    // Snapshot the primary SID *before* issuing the secondary sub-add so we can
-    // restore it afterwards (sub-add can temporarily hijack the primary sid).
+    // Snapshot the primary state after restoring it (or after mpv picked a default).
+    // This is critical: restoring a secondary *external* subtitle requires sub-add, which can otherwise
+    // change the primary selection. We restore it back to this snapshot.
     val primarySidSnapshot = MPVLib.getPropertyString("sid")
 
-    // Restore secondary independently.
+    // Restore secondary (independent of primary; works even if primary was never explicitly chosen).
     when (kind2) {
         PREF_SUB_KIND_EXTERNAL -> {
             if (!ext2.isNullOrEmpty()) {
-                // Store context for the commandReply handler to finish the job.
-                val ud = nextCmdUd()
-                secondarySubRestoreUd = ud
-                pendingSecondarySubRestore = PendingSecondarySubRestore(ext2, primarySidSnapshot)
-                // "auto" = add without selecting as primary
-                MPVLib.commandAsync(arrayOf("sub-add", ext2, "auto"), ud)
+                // Prefer reusing an already-added track (autoloaded or added earlier) to avoid duplicates.
+                var sid = findExternalSubSidForFilename(ext2)
+                if (sid == null) {
+                    // Add without selecting as primary.
+                    MPVLib.command(arrayOf("sub-add", ext2, "auto"))
+                    sid = waitForExternalSubSid(ext2)
+                }
+
+                // Restore primary selection to keep primary/secondary fully independent.
+                if (primarySidSnapshot != null) {
+                    MPVLib.setPropertyString("sid", primarySidSnapshot)
+                }
+
+                if (sid != null) {
+                    setSubProp("secondary-sid", sid)
+                }
             }
         }
         PREF_SUB_KIND_SID -> {
@@ -2029,10 +2029,10 @@ private fun pickAudio() = selectTrack("audio", { player.aid }, { player.aid = it
     var handled = false
 
     impl.listener = { it, secondary ->
-        val prop = if (secondary) "secondary-sid" else "sid"
-        val value = if (it.mpvId == -1) "no" else it.mpvId.toString()
-        // commandAsync: non-blocking — switching a large ASS track won't freeze the UI thread
-        MPVLib.commandAsync(arrayOf("set", prop, value), nextCmdUd())
+        if (secondary)
+            player.secondarySid = it.mpvId
+        else
+            player.sid = it.mpvId
 
         try { rememberSubtitleSelectionForCurrentFile(secondary = secondary) } catch (_: Throwable) {}
         trackSwitchNotification { TrackData(it.mpvId, SubTrackDialog.TRACK_TYPE) }
@@ -2281,7 +2281,7 @@ private fun openTopMenu(existingRestoreState: StateRestoreCallback? = null) {
             translateContentUri(Uri.parse(path))
         else
             path
-        MPVLib.commandAsync(arrayOf(cmd, path2, "cached"), nextCmdUd())
+        MPVLib.command(arrayOf(cmd, path2, "cached"))
 
         // Persist the chosen external track per video so it gets reloaded on reopen.
         if (cmd == "sub-add") {
@@ -3162,26 +3162,6 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
         eventUiHandler.post { eventPropertyUi(property, value, metaUpdated) }
     }
 
-    override fun commandReply(userdata: Long, error: Int) {
-        // Handle completion of the secondary external subtitle async restore
-        if (userdata != 0L && userdata == secondarySubRestoreUd) {
-            val restore = pendingSecondarySubRestore ?: return
-            pendingSecondarySubRestore = null
-            secondarySubRestoreUd = 0L
-
-            // Find the track ID that was just added
-            val sid = findExternalSubSidForFilename(restore.ext) ?: return
-
-            // Restore primary SID snapshot so sub-add didn't displace it
-            if (restore.primarySidSnapshot != null) {
-                MPVLib.setPropertyString("sid", restore.primarySidSnapshot)
-            }
-            // Now wire up the secondary track
-            if (sid == -1) MPVLib.setPropertyString("secondary-sid", "no")
-            else MPVLib.setPropertyInt("secondary-sid", sid)
-        }
-    }
-
     override fun event(eventId: Int) {
         if (eventId == MpvEvent.MPV_EVENT_SHUTDOWN)
             finishWithResult(if (playbackHasStarted) RESULT_OK else RESULT_CANCELED)
@@ -3228,10 +3208,7 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
             }
 
             for (c in onloadCommands)
-                if (c.isNotEmpty() && c[0] == "sub-add")
-                    MPVLib.commandAsync(c, nextCmdUd())
-                else
-                    MPVLib.command(c)
+                MPVLib.command(c)
 
             // Restore the user's previously chosen subtitle and audio track for this video.
             try { restoreSubtitleSelectionForCurrentFile() } catch (_: Throwable) {}
