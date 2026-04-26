@@ -104,6 +104,14 @@ object MPVLib {
         }
     }
 
+    @JvmStatic
+    fun commandReply(userdata: Long, error: Int) {
+        synchronized(observers) {
+            for (o in observers)
+                o.commandReply(userdata, error)
+        }
+    }
+
     private val log_observers = mutableListOf<LogObserver>()
 
     @JvmStatic
@@ -135,6 +143,7 @@ object MPVLib {
         fun eventProperty(property: String, value: String)
         fun eventProperty(property: String, value: Double)
         fun event(eventId: Int)
+        fun commandReply(userdata: Long, error: Int) {}
     }
 
     interface LogObserver {
