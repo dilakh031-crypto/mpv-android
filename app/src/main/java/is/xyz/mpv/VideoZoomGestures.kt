@@ -28,7 +28,6 @@ import kotlin.math.hypot
 internal class VideoZoomGestures(
     private val target: View,
 ) {
-    var onScaleChanged: ((Float) -> Unit)? = null
     private var viewWidth = 0f
     private var viewHeight = 0f
 
@@ -120,7 +119,6 @@ internal class VideoZoomGestures(
                 tx = (k * tx) + ((1f - k) * fx)
                 ty = (k * ty) + ((1f - k) * fy)
                 scale = newScale
-                onScaleChanged?.invoke(scale)
 
                 scheduleApply()
                 return true
@@ -148,8 +146,6 @@ internal class VideoZoomGestures(
 
     fun isZoomed(): Boolean = scale > 1f + EPS
 
-    fun currentScale(): Float = scale
-
     fun shouldBlockOtherGestures(e: MotionEvent): Boolean {
         return isZoomed() || scaleDetector.isInProgress || e.pointerCount > 1
     }
@@ -166,7 +162,6 @@ internal class VideoZoomGestures(
         didDrag = false
         panFingerDown = false
         lastTapTime = 0L
-        onScaleChanged?.invoke(scale)
         applyToView()
     }
 

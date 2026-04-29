@@ -13,18 +13,13 @@ import `is`.xyz.mpv.MPVLib.MpvFormat.MPV_FORMAT_FLAG
 import `is`.xyz.mpv.MPVLib.MpvFormat.MPV_FORMAT_INT64
 import `is`.xyz.mpv.MPVLib.MpvFormat.MPV_FORMAT_NONE
 import `is`.xyz.mpv.MPVLib.MpvFormat.MPV_FORMAT_STRING
-import kotlin.math.roundToInt
 import kotlin.reflect.KProperty
 
 internal class MPVView(context: Context, attrs: AttributeSet) : BaseMPVView(context, attrs) {
-    private var mediaSurfaceWidth = 0
-    private var mediaSurfaceHeight = 0
-
     override fun initOptions() {
         val sharedPreferences = PreferenceManager.getDefaultSharedPreferences(context)
 
-        // Keep mpv's built-in fast profile as the baseline; we will override quality-sensitive
-        // pieces selectively instead of switching the whole player to the heavier default profile.
+        // apply phone-optimized defaults
         MPVLib.setOptionString("profile", "fast")
 
         // vo
@@ -190,8 +185,6 @@ internal class MPVView(context: Context, attrs: AttributeSet) : BaseMPVView(cont
             Property("paused-for-cache", MPV_FORMAT_FLAG),
             Property("speed", MPV_FORMAT_STRING),
             Property("track-list"),
-            Property("video-params/w", MPV_FORMAT_INT64),
-            Property("video-params/h", MPV_FORMAT_INT64),
             Property("video-params/aspect", MPV_FORMAT_DOUBLE),
             Property("video-params/rotate", MPV_FORMAT_DOUBLE),
             Property("playlist-pos", MPV_FORMAT_INT64),
@@ -335,69 +328,6 @@ internal class MPVView(context: Context, attrs: AttributeSet) : BaseMPVView(cont
         MPVLib.setPropertyInt("aaudio-session-id", id)
     }
 
-    /**
-     * Keep the viewport opening at its original fitted size, then grow the mpv surface only
-     * when the user zooms or the view size changes. That preserves a clean first frame while
-     * still giving the zoom gesture a higher-resolution backing buffer.
-     */
-    override fun onSurfaceSizeChanged(width: Int, height: Int) {
-        refreshSurfaceSizeForCurrentMedia(1f, force = true)
-    }
-
-    fun resetSurfaceSizeCache() {
-        mediaSurfaceWidth = 0
-        mediaSurfaceHeight = 0
-    }
-
-    fun refreshSurfaceSizeForCurrentMedia(zoomScale: Float = 1f, force: Boolean = false) {
-        val baseSize = currentBaseSurfaceSize() ?: return
-        val baseW = baseSize.first
-        val baseH = baseSize.second
-        if (baseW <= 0 || baseH <= 0)
-            return
-
-        val isImage = MPVLib.getPropertyString("current-tracks/video/image") == "yes"
-        if (!isImage) {
-            applySurfaceSize(baseW, baseH, force = true)
-            return
-        }
-
-        val sourceW = MPVLib.getPropertyInt("video-params/w") ?: run {
-            applySurfaceSize(baseW, baseH, force = true)
-            return
-        }
-        val sourceH = MPVLib.getPropertyInt("video-params/h") ?: run {
-            applySurfaceSize(baseW, baseH, force = true)
-            return
-        }
-        if (sourceW <= 0 || sourceH <= 0) {
-            applySurfaceSize(baseW, baseH, force = true)
-            return
-        }
-
-        val zoom = zoomScale.coerceAtLeast(1f)
-        val desiredW = if (zoom <= 1f + EPSILON) baseW else minOf(sourceW, maxOf(baseW, (baseW * zoom).roundToInt()))
-        val desiredH = if (zoom <= 1f + EPSILON) baseH else minOf(sourceH, maxOf(baseH, (baseH * zoom).roundToInt()))
-
-        applySurfaceSize(desiredW, desiredH, force = force)
-    }
-
-    private fun applySurfaceSize(width: Int, height: Int, force: Boolean) {
-        val safeW = width.coerceAtLeast(1)
-        val safeH = height.coerceAtLeast(1)
-        if (!force && mediaSurfaceWidth >= safeW && mediaSurfaceHeight >= safeH)
-            return
-        if (mediaSurfaceWidth == safeW && mediaSurfaceHeight == safeH)
-            return
-        mediaSurfaceWidth = safeW
-        mediaSurfaceHeight = safeH
-        try {
-            setAndroidSurfaceSize(safeW, safeH)
-        } catch (t: Throwable) {
-            Log.w(TAG, "Failed to set android-surface-size to ${safeW}x${safeH}", t)
-        }
-    }
-
     class TrackDelegate(private val name: String) {
         operator fun getValue(thisRef: Any?, property: KProperty<*>): Int {
             val v = MPVLib.getPropertyString(name)
@@ -467,7 +397,6 @@ internal class MPVView(context: Context, attrs: AttributeSet) : BaseMPVView(cont
 
     companion object {
         private const val TAG = "mpv"
-        private const val EPSILON = 0.001f
 
         // mpv option `hwdec` is set to this
         private const val HWDECS = "mediacodec,mediacodec-copy"
