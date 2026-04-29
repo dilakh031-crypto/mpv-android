@@ -97,6 +97,12 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
     private var scrubAsyncCounter = 1L
     private var lastScrubAsyncUserdata = 0L
 
+    // Slow track operations (large ASS subtitles, external audio, etc.) must not use
+    // mpv_command()/set_property() from the UI thread. A 100MB ASS file can take a
+    // long time to parse in libass; mpv_command_async() keeps the app responsive and
+    // lets playback continue whenever mpv can do the work asynchronously.
+    private var trackAsyncCounter = 100_000L
+
     private var gestureScrubActive = false
     private var pendingGestureSeekSec: Int? = null
     private var lastIssuedGestureSeekSec: Int? = null
@@ -1690,7 +1696,10 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
     }
 
     private fun perFileKey(suffix: String, path: String): String = "perfile_${suffix}_${sha1Hex(path)}"
-private fun rememberSubtitleSelectionForCurrentFile(secondary: Boolean = false) {
+private fun rememberSubtitleSelectionForCurrentFile(
+    secondary: Boolean = false,
+    sidOverride: Int? = null
+) {
     val mediaPath = MPVLib.getPropertyString("path") ?: return
     val prefs = getDefaultSharedPreferences(applicationContext)
 
@@ -1700,8 +1709,9 @@ private fun rememberSubtitleSelectionForCurrentFile(secondary: Boolean = false) 
     val sidKey = if (secondary) PREF_SUB2_SID else PREF_SUB_SID
 
     // "sid" / "secondary-sid" are stringly typed in mpv (can be "no", "auto" or a number).
-    val sidStr = MPVLib.getPropertyString(sidProp)
-    val sid = sidStr?.toIntOrNull() ?: -1
+    // When a subtitle was selected through the dialog we may have issued the change
+    // asynchronously, so persist the clicked id instead of reading a stale property.
+    val sid = sidOverride ?: (MPVLib.getPropertyString(sidProp)?.toIntOrNull() ?: -1)
     val ext = findExternalSubFilenameForSid(sid)
 
     with (prefs.edit()) {
@@ -1844,6 +1854,37 @@ private fun restoreSubtitleSelectionForCurrentFile() {
             return MPVLib.getPropertyString("track-list/$i/external-filename")
         }
         return null
+    }
+
+    private fun mpvCommandAsync(cmd: Array<String>): Int {
+        return MPVLib.commandAsync(cmd, trackAsyncCounter++)
+    }
+
+    private fun setMpvPropertyAsync(property: String, value: String): Int {
+        return mpvCommandAsync(arrayOf("set", property, value))
+    }
+
+    private fun setSubtitleTrackAsync(secondary: Boolean, sid: Int) {
+        val sidProp = if (secondary) "secondary-sid" else "sid"
+        val visibilityProp = if (secondary) "secondary-sub-visibility" else "sub-visibility"
+
+        if (sid == -1) {
+            // Do not set sid=no here. For large ASS subtitles, clearing sid can make mpv/libass
+            // rebuild the subtitle renderer when the user enables the same track again. Toggling
+            // visibility keeps the selected track alive and makes off/on nearly instant after the
+            // first load.
+            setMpvPropertyAsync(visibilityProp, "no")
+        } else {
+            setMpvPropertyAsync(sidProp, sid.toString())
+            setMpvPropertyAsync(visibilityProp, "yes")
+        }
+    }
+
+    private fun runTrackAddCommand(cmd: Array<String>) {
+        when (cmd.getOrNull(0)) {
+            "sub-add", "audio-add" -> mpvCommandAsync(cmd)
+            else -> MPVLib.command(cmd)
+        }
     }
 
     // --- Per-file audio persistence (chosen audio track/file is restored on reopen) ---
@@ -2029,12 +2070,9 @@ private fun pickAudio() = selectTrack("audio", { player.aid }, { player.aid = it
     var handled = false
 
     impl.listener = { it, secondary ->
-        if (secondary)
-            player.secondarySid = it.mpvId
-        else
-            player.sid = it.mpvId
+        setSubtitleTrackAsync(secondary, it.mpvId)
 
-        try { rememberSubtitleSelectionForCurrentFile(secondary = secondary) } catch (_: Throwable) {}
+        try { rememberSubtitleSelectionForCurrentFile(secondary = secondary, sidOverride = it.mpvId) } catch (_: Throwable) {}
         trackSwitchNotification { TrackData(it.mpvId, SubTrackDialog.TRACK_TYPE) }
         // Keep dialog open (apply-in-place).
     }
@@ -2281,13 +2319,21 @@ private fun openTopMenu(existingRestoreState: StateRestoreCallback? = null) {
             translateContentUri(Uri.parse(path))
         else
             path
-        MPVLib.command(arrayOf(cmd, path2, "cached"))
-
-        // Persist the chosen external track per video so it gets reloaded on reopen.
         if (cmd == "sub-add") {
+            // If this external subtitle is already in track-list, avoid even a cached sub-add;
+            // just re-select it and turn subtitle visibility back on.
+            val existingSid = findExternalSubSidForFilename(path2)
+            if (existingSid != null) {
+                setSubtitleTrackAsync(secondary = false, sid = existingSid)
+            } else {
+                mpvCommandAsync(arrayOf(cmd, path2, "cached"))
+            }
             try { rememberExternalSubtitleForCurrentFile(path2) } catch (_: Throwable) {}
         } else if (cmd == "audio-add") {
+            mpvCommandAsync(arrayOf(cmd, path2, "cached"))
             try { rememberExternalAudioForCurrentFile(path2) } catch (_: Throwable) {}
+        } else {
+            MPVLib.command(arrayOf(cmd, path2, "cached"))
         }
     }
 
@@ -3187,7 +3233,7 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
         if (eventId == MpvEvent.MPV_EVENT_START_FILE) {
             val cmds = onloadCommands.toTypedArray()
             onloadCommands.clear()
-            for (c in cmds)
+
             // Reset any view-level zoom/pan when a new file starts.
 
             // Apply orientation as early as possible for playlist items, so we don't show the wrong orientation first.
@@ -3207,8 +3253,8 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
                 // ignore
             }
 
-            for (c in onloadCommands)
-                MPVLib.command(c)
+            for (c in cmds)
+                runTrackAddCommand(c)
 
             // Restore the user's previously chosen subtitle and audio track for this video.
             try { restoreSubtitleSelectionForCurrentFile() } catch (_: Throwable) {}
