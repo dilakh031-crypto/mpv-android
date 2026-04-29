@@ -19,10 +19,8 @@ internal class MPVView(context: Context, attrs: AttributeSet) : BaseMPVView(cont
     override fun initOptions() {
         val sharedPreferences = PreferenceManager.getDefaultSharedPreferences(context)
 
-        // Apply mpv's balanced default profile instead of the low-quality fast profile.
-        // The fast profile forces bilinear scaling and disables sigmoid upscaling,
-        // which makes zoomed still images look noticeably blockier.
-        MPVLib.setOptionString("profile", "default")
+        // apply phone-optimized defaults
+        MPVLib.setOptionString("profile", "fast")
 
         // vo
         setVo(if (sharedPreferences.getBoolean("gpu_next", false))
