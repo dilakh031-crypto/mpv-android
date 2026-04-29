@@ -8,6 +8,7 @@ import android.view.View
 import android.view.ViewConfiguration
 import kotlin.math.PI
 import kotlin.math.abs
+import kotlin.math.floor
 import kotlin.math.hypot
 import kotlin.math.max
 import kotlin.math.min
@@ -20,9 +21,10 @@ import kotlin.math.roundToInt
  *  - Unzoomed view uses the normal view-sized mpv surface so mpv, not Android's
  *    TextureView compositor, performs the huge downscale. This avoids moire /
  *    false-color artifacts on high-frequency scans at 720p.
- *  - As soon as the user starts zooming, the render surface switches to the
- *    original-resolution/aspect-preserving buffer used by the previous fix, so
- *    zoom keeps full source detail and remains smooth.
+ *  - During zoom, the render surface grows with the actual zoom level, but
+ *    never ahead of it. This avoids the early-zoom case where Android would
+ *    minify an oversized source-resolution texture and reintroduce colored
+ *    moire/ghosting.
  *
  * We do not use mpv video-pan/video-zoom for finger movement.
  */
@@ -71,6 +73,7 @@ internal class VideoZoomGestures(
     private val panFilterY = OneEuroFilter()
 
     private var originalRenderSurfaceActive = false
+    private var currentRenderSurfaceScale = 1f
 
     // Coalesce view property updates to vsync. We do not animate here; we only avoid
     // writing View properties multiple times in one display frame.
@@ -90,11 +93,9 @@ internal class VideoZoomGestures(
                 panActive = false
                 canBeTap = false
 
-                // Switch to the original-detail buffer before the first visible zoom step.
-                // This keeps early zoom stages sharp without forcing Android to downscale
-                // the original-size texture while the image is still unzoomed.
-                requestOriginalRenderSurfaceSize(force = true)
-
+                // Keep the base mpv-downscaled buffer until scale actually grows.
+                // Switching to an oversized source-resolution buffer at scale≈1
+                // makes Android minify it and brings back colored moire.
                 resetPanFilters(detector.focusX, detector.focusY, SystemClock.uptimeMillis())
                 return true
             }
@@ -469,19 +470,17 @@ internal class VideoZoomGestures(
 
     private fun requestBaseRenderSurfaceSize(force: Boolean) {
         val player = renderTarget ?: return
-        if (!force && !originalRenderSurfaceActive)
+        if (!force && !originalRenderSurfaceActive && currentRenderSurfaceScale == 1f)
             return
 
         originalRenderSurfaceActive = false
+        currentRenderSurfaceScale = 1f
         player.resetRenderSurfaceSize()
     }
 
     private fun requestOriginalRenderSurfaceSize(force: Boolean) {
         val player = renderTarget ?: return
         refreshMetricsFromTarget()
-
-        if (!force && originalRenderSurfaceActive)
-            return
 
         if (viewWidth <= 1f || viewHeight <= 1f || videoPixelWidth <= 1 || videoPixelHeight <= 1) {
             requestBaseRenderSurfaceSize(force = true)
@@ -494,24 +493,44 @@ internal class VideoZoomGestures(
             return
         }
 
-        // Do not set the buffer to raw sourceWidth x sourceHeight directly.
-        // That changes the mpv viewport aspect to the video aspect, while
-        // TextureView still stretches the whole buffer into the screen view,
-        // which looks like panscan/crop.
+        // At normal size and the first tiny zoom steps, keep the buffer close to
+        // the actual displayed scale so mpv performs the hard 5K -> 720p
+        // anti-aliased downscale. Never let the buffer become larger than the
+        // current zoom scale, because Android would minify the texture and the
+        // colored moire/ghosting returns.
         //
-        // Instead, keep the buffer aspect identical to the on-screen view,
-        // but choose its scale so the *video content rect inside it* is
-        // rendered at the original source resolution. Black-bar space is
-        // included in the buffer when needed. There is still no safety cap:
-        // the source pixels are kept 1:1 in the visible video area.
-        val scaleX = videoPixelWidth.toFloat() / c.w
-        val scaleY = videoPixelHeight.toFloat() / c.h
-        val bufferScale = max(scaleX, scaleY).coerceAtLeast(1f)
+        // As zoom increases, the buffer grows behind/with the zoom and stops
+        // only when the visible video area reaches original source resolution.
+        // The buffer still preserves the screen aspect, so there is no panscan.
+        val sourceScaleX = videoPixelWidth.toFloat() / c.w
+        val sourceScaleY = videoPixelHeight.toFloat() / c.h
+        val maxSourceScale = max(sourceScaleX, sourceScaleY).coerceAtLeast(1f)
 
-        val bufferWidth = (viewWidth * bufferScale).roundToInt().coerceAtLeast(1)
-        val bufferHeight = (viewHeight * bufferScale).roundToInt().coerceAtLeast(1)
+        if (scale <= 1f + EPS || maxSourceScale <= 1f + EPS) {
+            requestBaseRenderSurfaceSize(force = true)
+            return
+        }
+
+        val desiredScale = floorToStep(scale.coerceAtMost(maxSourceScale), RENDER_BUFFER_SCALE_STEP)
+            .coerceIn(1f, maxSourceScale)
+
+        if (desiredScale <= 1f + EPS) {
+            requestBaseRenderSurfaceSize(force = true)
+            return
+        }
+
+        if (!force && originalRenderSurfaceActive && abs(currentRenderSurfaceScale - desiredScale) < 0.001f)
+            return
+
+        val bufferWidth = (viewWidth * desiredScale).roundToInt().coerceAtLeast(1)
+        val bufferHeight = (viewHeight * desiredScale).roundToInt().coerceAtLeast(1)
         player.setRenderSurfaceSize(bufferWidth, bufferHeight)
         originalRenderSurfaceActive = true
+        currentRenderSurfaceScale = desiredScale
+    }
+
+    private fun floorToStep(value: Float, step: Float): Float {
+        return (floor((value / step).toDouble()) * step).toFloat()
     }
 
     private fun filterParamsForCurrentScale(): FilterParams {
@@ -609,6 +628,7 @@ internal class VideoZoomGestures(
         private const val MIN_SCALE = 1f
         private const val MAX_SCALE = 20f
         private const val DOUBLE_TAP_TIMEOUT = 300L
+        private const val RENDER_BUFFER_SCALE_STEP = 0.25f
 
         private const val DEFAULT_FRAME_DT = 1f / 60f
         private const val MIN_FILTER_DT = 1f / 240f
