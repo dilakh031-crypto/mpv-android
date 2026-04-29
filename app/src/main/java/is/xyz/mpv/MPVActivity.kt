@@ -3067,11 +3067,7 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
         if (!activityIsForeground) return
         when (property) {
             "track-list" -> player.loadTracks()
-            "current-tracks/audio/selected" -> updateAudioUI()
-            "current-tracks/video/image" -> {
-                updateAudioUI()
-                player.updateStillImageScalerProfile()
-            }
+            "current-tracks/audio/selected", "current-tracks/video/image" -> updateAudioUI()
             "hwdec-current" -> updateDecoderButton()
         }
         if (metaUpdated)
