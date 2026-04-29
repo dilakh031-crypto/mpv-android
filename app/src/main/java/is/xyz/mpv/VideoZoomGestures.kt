@@ -15,21 +15,17 @@ import kotlin.math.min
 /**
  * Pinch-to-zoom + pan for mpv output.
  *
- * This intentionally keeps zoom as an Android view transform instead of using
- * mpv's video-zoom/video-pan properties. Changing mpv properties during finger
- * movement goes through mpv's render/update path and is too coarse for this UI.
+ * High zoom is handled by transforming a TextureView (see BaseMPVView), not a SurfaceView.
+ * That avoids SurfaceFlinger/HWC layer-position quantization at 19x/20x.
  *
- * The important part for high zoom levels (19x/20x) is that panning is NOT based
- * directly on the last MotionEvent coordinate. Finger sensors produce small
- * high-frequency noise; at very high zoom the eye sees this as wavy judder even
- * when the frame rate is fine. We therefore:
+ * This class still does a small amount of input cleanup:
+ *  - touch events come from an untransformed overlay view;
+ *  - batched MotionEvent historical samples are consumed in order;
+ *  - tap/double-tap detection is independent from the tiny pan-start threshold;
+ *  - at very high zoom only, a mild adaptive filter removes sensor micro-wobble.
  *
- *  - consume MotionEvent historical samples, not only the latest point;
- *  - keep tap/double-tap detection separate from tiny pan startup;
- *  - run an adaptive One Euro filter over the requested view translation;
- *  - apply the final transform once per vsync.
- *
- * Touch input must come from an untransformed overlay view, not from [target].
+ * No easing is applied to the rendered view during drag: the image follows the filtered finger
+ * target directly on the next vsync, so there is no permanent lag/catch-up stutter.
  */
 internal class VideoZoomGestures(
     private val target: View,
@@ -43,41 +39,36 @@ internal class VideoZoomGestures(
     private val touchSlop = ViewConfiguration.get(target.context).scaledTouchSlop.toFloat()
     private val panStartSlop = max(1f, min(2.5f, touchSlop * 0.22f))
 
-    // Linear scale factor (1.0 = normal).
+    // Linear scale factor (1.0 = normal). Translation is stored as Double so large
+    // 20x offsets do not lose sub-pixel precision before being sent to the View.
     private var scale = 1f
-
-    // tx/ty is the rendered transform. rawTx/rawTy is the exact finger target
-    // before filtering. Keeping both prevents cumulative drift from the filter.
-    private var tx = 0f
-    private var ty = 0f
-    private var rawTx = 0f
-    private var rawTy = 0f
+    private var tx = 0.0
+    private var ty = 0.0
 
     private var downX = 0f
     private var downY = 0f
-    private var lastRawX = 0f
-    private var lastRawY = 0f
+    private var lastPointerX = 0f
+    private var lastPointerY = 0f
+    private var lastPanX = 0f
+    private var lastPanY = 0f
     private var downTime = 0L
 
     private var panFingerDown = false
     private var panActive = false
     private var canBeTap = false
 
-    // If a gesture ends as a tap, undo any tiny movement caused by natural
-    // finger jitter before returning false to let the normal tap UI run.
-    private var tapStartTx = 0f
-    private var tapStartTy = 0f
-    private var tapStartRawTx = 0f
-    private var tapStartRawTy = 0f
+    private var tapStartTx = 0.0
+    private var tapStartTy = 0.0
 
     private var lastTapTime = 0L
     private var lastTapX = 0f
     private var lastTapY = 0f
 
-    private val filterX = OneEuroFilter()
-    private val filterY = OneEuroFilter()
+    private val panFilterX = OneEuroFilter()
+    private val panFilterY = OneEuroFilter()
 
-    // Coalesce view property updates to vsync.
+    // Coalesce view property updates to vsync. We do not animate here; we only avoid
+    // writing View properties multiple times in one display frame.
     private val choreographer: Choreographer = Choreographer.getInstance()
     private var applyScheduled = false
     private val frameCallback = Choreographer.FrameCallback {
@@ -93,9 +84,7 @@ internal class VideoZoomGestures(
                 lastTapTime = 0L
                 panActive = false
                 canBeTap = false
-                rawTx = tx
-                rawTy = ty
-                resetPanFilter()
+                resetPanFilters(detector.focusX, detector.focusY, SystemClock.uptimeMillis())
                 return true
             }
 
@@ -112,18 +101,15 @@ internal class VideoZoomGestures(
 
                 // Keep pinch focus stable.
                 // transform: screen = scale * content + translation
-                val fx = detector.focusX
-                val fy = detector.focusY
-                val k = newScale / oldScale
-
+                val fx = detector.focusX.toDouble()
+                val fy = detector.focusY.toDouble()
+                val k = (newScale / oldScale).toDouble()
+                tx = (k * tx) + ((1.0 - k) * fx)
+                ty = (k * ty) + ((1.0 - k) * fy)
                 scale = newScale
-                rawTx = (k * rawTx) + ((1f - k) * fx)
-                rawTy = (k * rawTy) + ((1f - k) * fy)
-                tx = rawTx
-                ty = rawTy
 
                 clampTranslationToVideoContent()
-                resetPanFilter()
+                resetPanFilters(detector.focusX, detector.focusY, SystemClock.uptimeMillis())
                 scheduleApply()
                 return true
             }
@@ -132,7 +118,7 @@ internal class VideoZoomGestures(
                 if (scale <= 1f + EPS)
                     reset()
                 else
-                    resetPanFilter()
+                    resetPanFilters(detector.focusX, detector.focusY, SystemClock.uptimeMillis())
             }
         }
     )
@@ -168,15 +154,13 @@ internal class VideoZoomGestures(
         }
 
         scale = 1f
-        tx = 0f
-        ty = 0f
-        rawTx = 0f
-        rawTy = 0f
+        tx = 0.0
+        ty = 0.0
         panFingerDown = false
         panActive = false
         canBeTap = false
         lastTapTime = 0L
-        resetPanFilter()
+        resetPanFilters(0f, 0f, SystemClock.uptimeMillis())
         applyToView()
     }
 
@@ -191,16 +175,13 @@ internal class VideoZoomGestures(
         // Always feed the scale detector first.
         scaleDetector.onTouchEvent(e)
 
-        // Pointer transitions during pinch: if one finger remains down, rebase
-        // pan input on that finger so the next one-finger event cannot jump.
+        // Pointer transitions during pinch:
+        // If one finger lifts and another remains down, rebase pan input so there is no jump.
         if (e.actionMasked == MotionEvent.ACTION_POINTER_UP && isZoomed()) {
             lastTapTime = 0L
             panFingerDown = false
             panActive = false
             canBeTap = false
-            rawTx = tx
-            rawTy = ty
-            resetPanFilter()
             if (e.pointerCount >= 2) {
                 val upIdx = e.actionIndex
                 val remainIdx = if (upIdx == 0) 1 else 0
@@ -208,9 +189,12 @@ internal class VideoZoomGestures(
                 val y = e.getY(remainIdx)
                 downX = x
                 downY = y
-                lastRawX = x
-                lastRawY = y
+                lastPointerX = x
+                lastPointerY = y
+                lastPanX = x
+                lastPanY = y
                 downTime = SystemClock.uptimeMillis()
+                resetPanFilters(x, y, downTime)
             }
             return true
         }
@@ -221,9 +205,6 @@ internal class VideoZoomGestures(
             panFingerDown = false
             panActive = false
             canBeTap = false
-            rawTx = tx
-            rawTy = ty
-            resetPanFilter()
             return true
         }
 
@@ -234,19 +215,19 @@ internal class VideoZoomGestures(
             MotionEvent.ACTION_DOWN -> {
                 downX = e.x
                 downY = e.y
-                lastRawX = e.x
-                lastRawY = e.y
+                lastPointerX = e.x
+                lastPointerY = e.y
+                lastPanX = e.x
+                lastPanY = e.y
                 downTime = SystemClock.uptimeMillis()
 
                 tapStartTx = tx
                 tapStartTy = ty
-                tapStartRawTx = rawTx
-                tapStartRawTy = rawTy
 
                 panFingerDown = true
                 panActive = false
                 canBeTap = true
-                resetPanFilter(e.eventTime * NS_PER_MS)
+                resetPanFilters(e.x, e.y, e.eventTime)
                 return true
             }
 
@@ -254,17 +235,16 @@ internal class VideoZoomGestures(
                 if (!panFingerDown)
                     return true
 
-                // Process batched historical samples first. Android often delivers
-                // touch points in bursts; using only the final point is a common
-                // source of visible unevenness during slow panning.
+                // Android may batch several touch points into one MOVE. Processing them in order
+                // prevents input bursts from becoming uneven pan steps.
                 for (i in 0 until e.historySize) {
                     processPanSample(
                         e.getHistoricalX(0, i),
                         e.getHistoricalY(0, i),
-                        e.getHistoricalEventTime(i) * NS_PER_MS,
+                        e.getHistoricalEventTime(i),
                     )
                 }
-                processPanSample(e.x, e.y, e.eventTime * NS_PER_MS)
+                processPanSample(e.x, e.y, e.eventTime)
                 return true
             }
 
@@ -276,16 +256,10 @@ internal class VideoZoomGestures(
                 panFingerDown = false
                 panActive = false
                 canBeTap = false
-                resetPanFilter()
 
                 if (!wasTap) {
                     lastTapTime = 0L
-                    // The low-pass filter may intentionally lag a few pixels
-                    // behind the raw finger target. Commit the visible position
-                    // so the next pan starts exactly where the image stopped.
-                    rawTx = tx
-                    rawTy = ty
-                    resetPanFilter()
+                    resetPanFilters(lastPointerX, lastPointerY, now)
                     return true
                 }
 
@@ -298,18 +272,17 @@ internal class VideoZoomGestures(
                     return true
                 }
 
-                // Single tap: restore any microscopic jitter-pan and let the
-                // Activity handle tap-to-toggle controls.
+                // Single tap: undo any tiny pan admitted below touch slop and let Activity
+                // handle tap-to-toggle controls.
                 tx = tapStartTx
                 ty = tapStartTy
-                rawTx = tapStartRawTx
-                rawTy = tapStartRawTy
                 clampTranslationToVideoContent()
                 applyToView()
 
                 lastTapTime = now
                 lastTapX = e.x
                 lastTapY = e.y
+                resetPanFilters(e.x, e.y, now)
                 return false
             }
 
@@ -318,9 +291,7 @@ internal class VideoZoomGestures(
                 panFingerDown = false
                 panActive = false
                 canBeTap = false
-                rawTx = tx
-                rawTy = ty
-                resetPanFilter()
+                resetPanFilters(lastPointerX, lastPointerY, SystemClock.uptimeMillis())
                 return true
             }
         }
@@ -328,49 +299,54 @@ internal class VideoZoomGestures(
         return true
     }
 
-    private fun processPanSample(x: Float, y: Float, timeNs: Long) {
+    private fun processPanSample(x: Float, y: Float, timeMs: Long) {
+        lastPointerX = x
+        lastPointerY = y
+
         val distFromDown = hypot(x - downX, y - downY)
         val gestureAge = SystemClock.uptimeMillis() - downTime
 
-        // Do not let the tiny pan startup threshold break double-tap. A touch is
-        // still a tap until it crosses Android's normal tap slop or is held.
+        // Keep double-tap reliable: a gesture remains a tap until normal Android tap slop
+        // is crossed or the press is held long enough.
         if (canBeTap && (distFromDown >= touchSlop || gestureAge >= DOUBLE_TAP_TIMEOUT)) {
             canBeTap = false
             lastTapTime = 0L
         }
 
         if (!panActive) {
-            if (distFromDown < panStartSlop) {
-                lastRawX = x
-                lastRawY = y
+            if (distFromDown < panStartSlop)
                 return
-            }
 
             panActive = true
-            // Rebase here so crossing the small startup slop does not create an
-            // initial jump. Only movement after activation pans the image.
-            lastRawX = x
-            lastRawY = y
-            resetPanFilter(timeNs)
+            // Avoid the first slop-crossing jump.
+            lastPanX = x
+            lastPanY = y
+            resetPanFilters(x, y, timeMs)
             return
         }
 
-        val dx = x - lastRawX
-        val dy = y - lastRawY
-        lastRawX = x
-        lastRawY = y
+        val params = filterParamsForCurrentScale()
+        val panX: Float
+        val panY: Float
+        if (params.enabled) {
+            panX = panFilterX.filter(x, timeMs, params)
+            panY = panFilterY.filter(y, timeMs, params)
+        } else {
+            panX = x
+            panY = y
+        }
+
+        val dx = panX - lastPanX
+        val dy = panY - lastPanY
+        lastPanX = panX
+        lastPanY = panY
 
         if (dx == 0f && dy == 0f)
             return
 
-        rawTx += dx
-        rawTy += dy
-        clampRawTranslationToVideoContent()
-
-        val params = filterParamsForCurrentScale()
-        tx = filterX.filter(rawTx, timeNs, params)
-        ty = filterY.filter(rawTy, timeNs, params)
-        clampRenderedTranslationToVideoContent()
+        tx += dx.toDouble()
+        ty += dy.toDouble()
+        clampTranslationToVideoContent()
         scheduleApply()
     }
 
@@ -380,9 +356,11 @@ internal class VideoZoomGestures(
         choreographer.postFrameCallback(frameCallback)
     }
 
-    private fun resetPanFilter(timeNs: Long = 0L) {
-        filterX.reset(rawTx, timeNs)
-        filterY.reset(rawTy, timeNs)
+    private fun resetPanFilters(x: Float, y: Float, timeMs: Long) {
+        panFilterX.reset(x, timeMs)
+        panFilterY.reset(y, timeMs)
+        lastPanX = x
+        lastPanY = y
     }
 
     private fun refreshMetricsFromTarget() {
@@ -422,54 +400,30 @@ internal class VideoZoomGestures(
             return
 
         if (scale <= 1f + EPS) {
-            tx = 0f
-            ty = 0f
-            rawTx = 0f
-            rawTy = 0f
+            tx = 0.0
+            ty = 0.0
             return
         }
-
-        clampRawTranslationToVideoContent()
-        clampRenderedTranslationToVideoContent()
-    }
-
-    private fun clampRawTranslationToVideoContent() {
-        val clamped = clampTranslation(rawTx, rawTy)
-        rawTx = clamped.x
-        rawTy = clamped.y
-    }
-
-    private fun clampRenderedTranslationToVideoContent() {
-        val clamped = clampTranslation(tx, ty)
-        tx = clamped.x
-        ty = clamped.y
-    }
-
-    private fun clampTranslation(x: Float, y: Float): Point {
-        if (viewWidth <= 1f || viewHeight <= 1f || scale <= 1f + EPS)
-            return Point(0f, 0f)
 
         val c = contentRect()
         val contentWScaled = scale * c.w
         val contentHScaled = scale * c.h
 
-        val clampedX = if (contentWScaled <= viewWidth + EPS) {
-            ((viewWidth - contentWScaled) * 0.5f) - scale * c.ox
+        tx = if (contentWScaled <= viewWidth + EPS) {
+            (((viewWidth - contentWScaled) * 0.5f) - scale * c.ox).toDouble()
         } else {
-            val minTx = viewWidth - scale * (c.ox + c.w)
-            val maxTx = -scale * c.ox
-            x.coerceIn(minTx, maxTx)
+            val minTx = (viewWidth - scale * (c.ox + c.w)).toDouble()
+            val maxTx = (-scale * c.ox).toDouble()
+            tx.coerceIn(minTx, maxTx)
         }
 
-        val clampedY = if (contentHScaled <= viewHeight + EPS) {
-            ((viewHeight - contentHScaled) * 0.5f) - scale * c.oy
+        ty = if (contentHScaled <= viewHeight + EPS) {
+            (((viewHeight - contentHScaled) * 0.5f) - scale * c.oy).toDouble()
         } else {
-            val minTy = viewHeight - scale * (c.oy + c.h)
-            val maxTy = -scale * c.oy
-            y.coerceIn(minTy, maxTy)
+            val minTy = (viewHeight - scale * (c.oy + c.h)).toDouble()
+            val maxTy = (-scale * c.oy).toDouble()
+            ty.coerceIn(minTy, maxTy)
         }
-
-        return Point(clampedX, clampedY)
     }
 
     private fun applyToView() {
@@ -477,26 +431,33 @@ internal class VideoZoomGestures(
         target.pivotY = 0f
         target.scaleX = scale
         target.scaleY = scale
-        target.translationX = tx
-        target.translationY = ty
+        target.translationX = tx.toFloat()
+        target.translationY = ty.toFloat()
     }
 
     private fun filterParamsForCurrentScale(): FilterParams {
-        // Near normal zoom, keep the image very responsive. At 19x/20x, lower
-        // the cutoff to remove the sensor's high-frequency micro-wobble. Beta
-        // raises the cutoff during faster movement, so long swipes stay direct.
-        val t = ((scale - 1f) / (MAX_SCALE - 1f)).coerceIn(0f, 1f)
+        if (scale < FILTER_START_SCALE)
+            return FilterParams(enabled = false, minCutoff = 0f, beta = 0f, derivativeCutoff = 0f)
+
+        val t = ((scale - FILTER_START_SCALE) / (MAX_SCALE - FILTER_START_SCALE)).coerceIn(0f, 1f)
         val smoothT = t * t * (3f - 2f * t)
-        val minCutoff = lerp(MAX_RESPONSIVE_CUTOFF, MAX_ZOOM_CUTOFF, smoothT)
-        val beta = lerp(RESPONSIVE_BETA, MAX_ZOOM_BETA, smoothT)
-        return FilterParams(minCutoff, beta, DERIVATIVE_CUTOFF)
+        return FilterParams(
+            enabled = true,
+            minCutoff = lerp(FILTER_MIN_CUTOFF_AT_START, FILTER_MIN_CUTOFF_AT_MAX, smoothT),
+            beta = lerp(FILTER_BETA_AT_START, FILTER_BETA_AT_MAX, smoothT),
+            derivativeCutoff = FILTER_D_CUTOFF,
+        )
     }
 
     private fun lerp(a: Float, b: Float, t: Float): Float = a + (b - a) * t
 
     private data class ContentRect(val ox: Float, val oy: Float, val w: Float, val h: Float)
-    private data class Point(val x: Float, val y: Float)
-    private data class FilterParams(val minCutoff: Float, val beta: Float, val derivativeCutoff: Float)
+    private data class FilterParams(
+        val enabled: Boolean,
+        val minCutoff: Float,
+        val beta: Float,
+        val derivativeCutoff: Float,
+    )
 
     private class LowPassFilter {
         private var initialized = false
@@ -523,24 +484,24 @@ internal class VideoZoomGestures(
         private val derivativeFilter = LowPassFilter()
         private var initialized = false
         private var previousRaw = 0f
-        private var previousTimeNs = 0L
+        private var previousTimeMs = 0L
 
-        fun reset(value: Float, timeNs: Long = 0L) {
+        fun reset(value: Float, timeMs: Long) {
             initialized = true
             previousRaw = value
-            previousTimeNs = timeNs
+            previousTimeMs = timeMs
             valueFilter.reset(value)
             derivativeFilter.reset(0f)
         }
 
-        fun filter(value: Float, timeNs: Long, params: FilterParams): Float {
+        fun filter(value: Float, timeMs: Long, params: FilterParams): Float {
             if (!initialized) {
-                reset(value, timeNs)
+                reset(value, timeMs)
                 return value
             }
 
-            val dt = if (previousTimeNs > 0L && timeNs > previousTimeNs)
-                ((timeNs - previousTimeNs).toDouble() / 1_000_000_000.0).toFloat()
+            val dt = if (previousTimeMs > 0L && timeMs > previousTimeMs)
+                ((timeMs - previousTimeMs).toFloat() / 1000f)
             else
                 DEFAULT_FRAME_DT
 
@@ -554,7 +515,7 @@ internal class VideoZoomGestures(
             val filtered = valueFilter.filter(value, alpha(cutoff, safeDt))
 
             previousRaw = value
-            previousTimeNs = timeNs
+            previousTimeMs = timeMs
             return filtered
         }
 
@@ -569,19 +530,18 @@ internal class VideoZoomGestures(
         private const val MIN_SCALE = 1f
         private const val MAX_SCALE = 20f
         private const val DOUBLE_TAP_TIMEOUT = 300L
-        private const val NS_PER_MS = 1_000_000L
 
         private const val DEFAULT_FRAME_DT = 1f / 60f
         private const val MIN_FILTER_DT = 1f / 240f
         private const val MAX_FILTER_DT = 1f / 30f
 
-        // One Euro filter tuning. These values are deliberately scale-adaptive:
-        // low zoom remains immediate, maximum zoom receives the strongest
-        // micro-jitter suppression.
-        private const val MAX_RESPONSIVE_CUTOFF = 10.0f
-        private const val MAX_ZOOM_CUTOFF = 3.2f
-        private const val RESPONSIVE_BETA = 0.030f
-        private const val MAX_ZOOM_BETA = 0.055f
-        private const val DERIVATIVE_CUTOFF = 1.0f
+        // Filtering is deliberately disabled at normal zoom. It only appears when
+        // finger sensor noise becomes visible because the image is deeply magnified.
+        private const val FILTER_START_SCALE = 10f
+        private const val FILTER_MIN_CUTOFF_AT_START = 12f
+        private const val FILTER_MIN_CUTOFF_AT_MAX = 6f
+        private const val FILTER_BETA_AT_START = 0.020f
+        private const val FILTER_BETA_AT_MAX = 0.050f
+        private const val FILTER_D_CUTOFF = 1.0f
     }
 }
