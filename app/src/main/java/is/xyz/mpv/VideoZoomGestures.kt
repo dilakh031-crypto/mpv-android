@@ -8,7 +8,7 @@ import android.view.View
 import android.view.ViewConfiguration
 import kotlin.math.PI
 import kotlin.math.abs
-import kotlin.math.floor
+import kotlin.math.ceil
 import kotlin.math.hypot
 import kotlin.math.max
 import kotlin.math.min
@@ -17,16 +17,17 @@ import kotlin.math.roundToInt
 /**
  * Pinch-to-zoom + pan for mpv output.
  *
- * Important quality detail:
- *  - Unzoomed view uses the normal view-sized mpv surface so mpv, not Android's
- *    TextureView compositor, performs the huge downscale. This avoids moire /
- *    false-color artifacts on high-frequency scans at 720p.
- *  - During zoom, the render surface grows with the actual zoom level, but
- *    never ahead of it. This avoids the early-zoom case where Android would
- *    minify an oversized source-resolution texture and reintroduce colored
- *    moire/ghosting.
+ * High zoom is handled by transforming a TextureView (see BaseMPVView), not a SurfaceView.
+ * That avoids SurfaceFlinger/HWC layer-position quantization at 19x/20x.
  *
- * We do not use mpv video-pan/video-zoom for finger movement.
+ * This class still does a small amount of input cleanup:
+ *  - touch events come from an untransformed overlay view;
+ *  - batched MotionEvent historical samples are consumed in order;
+ *  - tap/double-tap detection is independent from the tiny pan-start threshold;
+ *  - at very high zoom only, a mild adaptive filter removes sensor micro-wobble.
+ *
+ * No easing is applied to the rendered view during drag: the image follows the filtered finger
+ * target directly on the next vsync, so there is no permanent lag/catch-up stutter.
  */
 internal class VideoZoomGestures(
     private val target: View,
@@ -72,9 +73,6 @@ internal class VideoZoomGestures(
     private val panFilterX = OneEuroFilter()
     private val panFilterY = OneEuroFilter()
 
-    private var originalRenderSurfaceActive = false
-    private var currentRenderSurfaceScale = 1f
-
     // Coalesce view property updates to vsync. We do not animate here; we only avoid
     // writing View properties multiple times in one display frame.
     private val choreographer: Choreographer = Choreographer.getInstance()
@@ -92,10 +90,6 @@ internal class VideoZoomGestures(
                 lastTapTime = 0L
                 panActive = false
                 canBeTap = false
-
-                // Keep the base mpv-downscaled buffer until scale actually grows.
-                // Switching to an oversized source-resolution buffer at scale≈1
-                // makes Android minify it and brings back colored moire.
                 resetPanFilters(detector.focusX, detector.focusY, SystemClock.uptimeMillis())
                 return true
             }
@@ -122,7 +116,7 @@ internal class VideoZoomGestures(
 
                 clampTranslationToVideoContent()
                 resetPanFilters(detector.focusX, detector.focusY, SystemClock.uptimeMillis())
-                requestOriginalRenderSurfaceSize(force = false)
+                requestOriginalRenderSurfaceSize()
                 scheduleApply()
                 return true
             }
@@ -132,7 +126,7 @@ internal class VideoZoomGestures(
                     reset()
                 else {
                     resetPanFilters(detector.focusX, detector.focusY, SystemClock.uptimeMillis())
-                    requestOriginalRenderSurfaceSize(force = true)
+                    requestOriginalRenderSurfaceSize()
                 }
             }
         }
@@ -142,31 +136,26 @@ internal class VideoZoomGestures(
         viewWidth = width
         viewHeight = height
         refreshMetricsFromTarget()
-        if (isZoomed() || scaleDetector.isInProgress) {
+        if (isZoomed()) {
             clampTranslationToVideoContent()
-            requestOriginalRenderSurfaceSize(force = true)
             scheduleApply()
-        } else {
-            requestBaseRenderSurfaceSize(force = true)
         }
+        requestOriginalRenderSurfaceSize()
     }
 
     fun setVideoAspect(aspect: Double?) {
         videoAspect = aspect ?: 0.0
-        if (isZoomed() || scaleDetector.isInProgress) {
+        if (isZoomed()) {
             clampTranslationToVideoContent()
-            requestOriginalRenderSurfaceSize(force = true)
             scheduleApply()
         }
+        requestOriginalRenderSurfaceSize()
     }
 
     fun setVideoPixelSize(size: Pair<Int, Int>?) {
         videoPixelWidth = size?.first ?: 0
         videoPixelHeight = size?.second ?: 0
-        if (isZoomed() || scaleDetector.isInProgress)
-            requestOriginalRenderSurfaceSize(force = true)
-        else
-            requestBaseRenderSurfaceSize(force = true)
+        requestOriginalRenderSurfaceSize()
     }
 
     fun isZoomed(): Boolean = scale > 1f + EPS
@@ -190,11 +179,7 @@ internal class VideoZoomGestures(
         lastTapTime = 0L
         resetPanFilters(0f, 0f, SystemClock.uptimeMillis())
         applyToView()
-
-        // Critical for scan quality: after returning to normal size, do not keep
-        // the original-resolution texture and let Android minify it. Let mpv draw
-        // directly to the view-sized surface instead.
-        requestBaseRenderSurfaceSize(force = true)
+        requestOriginalRenderSurfaceSize()
     }
 
     /**
@@ -468,69 +453,55 @@ internal class VideoZoomGestures(
         target.translationY = ty.toFloat()
     }
 
-    private fun requestBaseRenderSurfaceSize(force: Boolean) {
-        val player = renderTarget ?: return
-        if (!force && !originalRenderSurfaceActive && currentRenderSurfaceScale == 1f)
-            return
-
-        originalRenderSurfaceActive = false
-        currentRenderSurfaceScale = 1f
-        player.resetRenderSurfaceSize()
-    }
-
-    private fun requestOriginalRenderSurfaceSize(force: Boolean) {
+    private fun requestOriginalRenderSurfaceSize() {
         val player = renderTarget ?: return
         refreshMetricsFromTarget()
 
         if (viewWidth <= 1f || viewHeight <= 1f || videoPixelWidth <= 1 || videoPixelHeight <= 1) {
-            requestBaseRenderSurfaceSize(force = true)
+            player.resetRenderSurfaceSize()
             return
         }
 
         val c = contentRect()
         if (c.w <= 1f || c.h <= 1f) {
-            requestBaseRenderSurfaceSize(force = true)
+            player.resetRenderSurfaceSize()
             return
         }
 
-        // At normal size and the first tiny zoom steps, keep the buffer close to
-        // the actual displayed scale so mpv performs the hard 5K -> 720p
-        // anti-aliased downscale. Never let the buffer become larger than the
-        // current zoom scale, because Android would minify the texture and the
-        // colored moire/ghosting returns.
+        // At scale == 1, keep the SurfaceTexture at the real screen/view size.
+        // That lets mpv perform the large 5K -> 720p downscale before the frame
+        // reaches TextureView. If the buffer stayed at source resolution here,
+        // TextureView/Android would perform the huge downscale and scans with
+        // halftone ink dots can show colored moire/ghost colors.
         //
-        // As zoom increases, the buffer grows behind/with the zoom and stops
-        // only when the visible video area reaches original source resolution.
-        // The buffer still preserves the screen aspect, so there is no panscan.
+        // While zooming, grow the buffer with the zoom level. It still preserves
+        // the screen aspect to avoid panscan, and it stops only when the visible
+        // video area reaches the original source resolution. No filter options
+        // are changed here; mpv.conf/preferences remain exactly as the project had them.
         val sourceScaleX = videoPixelWidth.toFloat() / c.w
         val sourceScaleY = videoPixelHeight.toFloat() / c.h
         val maxSourceScale = max(sourceScaleX, sourceScaleY).coerceAtLeast(1f)
 
         if (scale <= 1f + EPS || maxSourceScale <= 1f + EPS) {
-            requestBaseRenderSurfaceSize(force = true)
+            player.resetRenderSurfaceSize()
             return
         }
 
-        val desiredScale = floorToStep(scale.coerceAtMost(maxSourceScale), RENDER_BUFFER_SCALE_STEP)
+        val bufferScale = ceilToStep(scale.coerceAtMost(maxSourceScale), RENDER_BUFFER_SCALE_STEP)
             .coerceIn(1f, maxSourceScale)
 
-        if (desiredScale <= 1f + EPS) {
-            requestBaseRenderSurfaceSize(force = true)
+        if (bufferScale <= 1f + EPS) {
+            player.resetRenderSurfaceSize()
             return
         }
 
-        if (!force && originalRenderSurfaceActive && abs(currentRenderSurfaceScale - desiredScale) < 0.001f)
-            return
-
-        val bufferWidth = (viewWidth * desiredScale).roundToInt().coerceAtLeast(1)
-        val bufferHeight = (viewHeight * desiredScale).roundToInt().coerceAtLeast(1)
+        val bufferWidth = (viewWidth * bufferScale).roundToInt().coerceAtLeast(1)
+        val bufferHeight = (viewHeight * bufferScale).roundToInt().coerceAtLeast(1)
         player.setRenderSurfaceSize(bufferWidth, bufferHeight)
-        originalRenderSurfaceActive = true
-        currentRenderSurfaceScale = desiredScale
     }
 
-    private fun floorToStep(value: Float, step: Float): Float {
-        return (floor((value / step).toDouble()) * step).toFloat()
+    private fun ceilToStep(value: Float, step: Float): Float {
+        return (ceil((value / step).toDouble()) * step).toFloat()
     }
 
     private fun filterParamsForCurrentScale(): FilterParams {
