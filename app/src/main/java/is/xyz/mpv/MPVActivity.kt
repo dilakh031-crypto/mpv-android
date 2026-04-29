@@ -97,25 +97,6 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
     private var scrubAsyncCounter = 1L
     private var lastScrubAsyncUserdata = 0L
 
-    // Use a separate userdata range for detached commands that should not block playback.
-    private var detachedCommandUserdata = 1_000_000L
-
-    // Opening FilePickerActivity should not be treated as leaving playback in the background.
-    private var keepPlaybackDuringActivityResult = false
-
-    // External subtitles are first added without selecting them. Selecting only after mpv has
-    // finished registering the track avoids blocking playback on large ASS subtitle parsing.
-    private val externalSubSelectionHandler = Handler(Looper.getMainLooper())
-    private val pendingExternalSubSelections = linkedSetOf<String>()
-    private val externalSubSelectionRunnable = object : Runnable {
-        override fun run() {
-            selectReadyExternalSubtitles()
-            if (pendingExternalSubSelections.isNotEmpty()) {
-                externalSubSelectionHandler.postDelayed(this, EXTERNAL_SUB_SELECT_RETRY_MS)
-            }
-        }
-    }
-
     private var gestureScrubActive = false
     private var pendingGestureSeekSec: Int? = null
     private var lastIssuedGestureSeekSec: Int? = null
@@ -716,8 +697,6 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
 
         // Suppress any further callbacks
         activityIsForeground = false
-        externalSubSelectionHandler.removeCallbacks(externalSubSelectionRunnable)
-        pendingExternalSubSelections.clear()
 
         if (becomingNoisyReceiverRegistered) {
             unregisterReceiver(becomingNoisyReceiver)
@@ -840,10 +819,6 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
             // tell mpv to shut down so that any other property changes or such are ignored,
             // preventing useless busywork
             MPVLib.command(arrayOf("stop"))
-        } else if (keepPlaybackDuringActivityResult) {
-            // We are only opening an in-app picker (subtitles/audio/files). Do not pause here:
-            // the user is expected to return immediately and playback should continue unchanged.
-            savePosition()
         } else if (!shouldBackground) {
             player.paused = true
             // Persist watch-later state even if the process is later killed (Home -> kill).
@@ -1088,45 +1063,6 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
         MPVLib.setPropertyBoolean("keep-open", true)
         return {
             oldValue?.also { MPVLib.setPropertyString("keep-open", it) }
-        }
-    }
-
-    private fun runDetachedMpvCommand(command: Array<out String>) {
-        val userdata = detachedCommandUserdata++
-        val err = MPVLib.commandAsync(command, userdata)
-        if (err < 0) {
-            Log.e(TAG, "Failed to queue async mpv command ($err): ${command.joinToString(" ")}")
-        }
-    }
-
-    private fun addExternalSubtitleNonBlocking(path: String) {
-        // If this subtitle is already known to mpv, select it immediately. Otherwise, add it
-        // without selection and select it only after the async load has registered the track.
-        findExternalSubSidForFilename(path)?.let { sid ->
-            MPVLib.setPropertyInt("sid", sid)
-            return
-        }
-
-        pendingExternalSubSelections.remove(path)
-        pendingExternalSubSelections.add(path)
-        externalSubSelectionHandler.removeCallbacks(externalSubSelectionRunnable)
-
-        // Do not use "cached" here: it selects the subtitle as part of sub-add, which can
-        // stall playback while large ASS subtitles are parsed. "auto" registers the file first.
-        runDetachedMpvCommand(arrayOf("sub-add", path, "auto"))
-        externalSubSelectionHandler.postDelayed(externalSubSelectionRunnable, EXTERNAL_SUB_SELECT_RETRY_MS)
-    }
-
-    private fun selectReadyExternalSubtitles() {
-        val ready = mutableListOf<Pair<String, Int>>()
-        for (path in pendingExternalSubSelections) {
-            val sid = findExternalSubSidForFilename(path) ?: continue
-            ready.add(path to sid)
-        }
-
-        for ((path, sid) in ready) {
-            pendingExternalSubSelections.remove(path)
-            MPVLib.setPropertyInt("sid", sid)
         }
     }
 
@@ -1818,8 +1754,8 @@ private fun restoreSubtitleSelectionForCurrentFile() {
     when (kind1) {
         PREF_SUB_KIND_EXTERNAL -> {
             if (!ext1.isNullOrEmpty()) {
-                // Keep restoration non-blocking too: add first, then select after mpv registers it.
-                addExternalSubtitleNonBlocking(ext1)
+                // "cached" will select the subtitle; if it already exists, it will be reused.
+                MPVLib.command(arrayOf("sub-add", ext1, "cached"))
             }
         }
         PREF_SUB_KIND_SID -> {
@@ -2345,16 +2281,13 @@ private fun openTopMenu(existingRestoreState: StateRestoreCallback? = null) {
             translateContentUri(Uri.parse(path))
         else
             path
-        // Loading/parsing large ASS subtitles can take noticeable time. Add the file without
-        // selecting it first, then select the track only after mpv reports it as ready.
+        MPVLib.command(arrayOf(cmd, path2, "cached"))
+
+        // Persist the chosen external track per video so it gets reloaded on reopen.
         if (cmd == "sub-add") {
-            addExternalSubtitleNonBlocking(path2)
             try { rememberExternalSubtitleForCurrentFile(path2) } catch (_: Throwable) {}
-        } else {
-            MPVLib.command(arrayOf(cmd, path2, "cached"))
-            if (cmd == "audio-add") {
-                try { rememberExternalAudioForCurrentFile(path2) } catch (_: Throwable) {}
-            }
+        } else if (cmd == "audio-add") {
+            try { rememberExternalAudioForCurrentFile(path2) } catch (_: Throwable) {}
         }
     }
 
@@ -2735,7 +2668,6 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
             intent.putExtra("default_path", File(path).parent)
 
         activityResultCallbacks[requestCode] = callback
-        keepPlaybackDuringActivityResult = true
         startActivityForResult(intent, requestCode)
     }
     private fun openFilePickerFor(requestCode: Int, @StringRes titleRes: Int, callback: ActivityResultCallback) {
@@ -2744,11 +2676,7 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
 
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
         super.onActivityResult(requestCode, resultCode, data)
-        try {
-            activityResultCallbacks.remove(requestCode)?.invoke(resultCode, data)
-        } finally {
-            keepPlaybackDuringActivityResult = false
-        }
+        activityResultCallbacks.remove(requestCode)?.invoke(resultCode, data)
     }
 
     private fun refreshUi() {
@@ -3185,9 +3113,6 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
         if (property == "pause" || property == "current-tracks/audio/selected")
             handleAudioFocus()
 
-        if (property == "track-list" && pendingExternalSubSelections.isNotEmpty())
-            externalSubSelectionHandler.post { selectReadyExternalSubtitles() }
-
         if (!activityIsForeground) return
         eventUiHandler.post { eventPropertyUi(property, null, metaUpdated) }
     }
@@ -3531,9 +3456,6 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
 
         // When scrubbing, wait briefly for the finger to stop moving before doing an exact seek.
         private const val SCRUB_IDLE_SEEK_DELAY_MS = 140L
-
-        // Poll interval for selecting an external subtitle only after mpv has registered it.
-        private const val EXTERNAL_SUB_SELECT_RETRY_MS = 80L
 
         // Per-file subtitle persistence keys
         private const val PREF_SUB_KIND = "sub_kind"
