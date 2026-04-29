@@ -29,6 +29,7 @@ import android.os.*
 import android.preference.PreferenceManager.getDefaultSharedPreferences
 import android.support.v4.media.session.MediaSessionCompat
 import android.support.v4.media.session.PlaybackStateCompat
+import android.util.DisplayMetrics
 import android.util.Rational
 import androidx.core.content.ContextCompat
 import android.view.*
@@ -342,8 +343,8 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
         }
 
         // NOTE: touch events must come from an untransformed overlay view (gestureLayer).
-        // The player view is transformed for zoom/pan, so attaching gestures directly to it
-        // would inverse-transform MotionEvents and create feedback/jitter.
+        // If we attach them directly to the transformed SurfaceView, Android will
+        // inverse-transform MotionEvents which can create feedback/jitter.
         binding.gestureLayer.setOnTouchListener { _, e ->
             if (lockedUI)
                 return@setOnTouchListener false
@@ -495,7 +496,6 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
 
         // Initialize listeners for the player view
         initListeners()
-        installGestureMetricsUpdater()
 
         // Read full settings and update UI
         readSettings()
@@ -593,7 +593,7 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
             setBackgroundColor(Color.BLACK)
         }
 
-        // Insert above the player view but below gesture/controls layers.
+        // Insert above the SurfaceView but below gesture/controls layers.
         // Layout order in player.xml: player(0), gestureLayer(1), outside(2).
         (binding.root as? ViewGroup)?.addView(overlay, 1)
 
@@ -1512,38 +1512,7 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
         }
     }
 
-    private fun installGestureMetricsUpdater() {
-        binding.gestureLayer.addOnLayoutChangeListener { v, _, _, _, _, _, _, _, _ ->
-            if (v.width > 1 && v.height > 1) {
-                gestures.setMetrics(v.width.toFloat(), v.height.toFloat())
-                zoomGestures.setMetrics(v.width.toFloat(), v.height.toFloat())
-            }
-        }
-        binding.gestureLayer.post { updateGestureMetricsFromView() }
-    }
-
-    private fun updateGestureMetricsFromView() {
-        if (!::binding.isInitialized || !::gestures.isInitialized || !::zoomGestures.isInitialized)
-            return
-
-        val w = when {
-            binding.gestureLayer.width > 1 -> binding.gestureLayer.width
-            binding.player.width > 1 -> binding.player.width
-            else -> resources.displayMetrics.widthPixels
-        }
-        val h = when {
-            binding.gestureLayer.height > 1 -> binding.gestureLayer.height
-            binding.player.height > 1 -> binding.player.height
-            else -> resources.displayMetrics.heightPixels
-        }
-
-        if (w > 1 && h > 1) {
-            gestures.setMetrics(w.toFloat(), h.toFloat())
-            zoomGestures.setMetrics(w.toFloat(), h.toFloat())
-        }
-    }
-
-    override fun onConfigurationChanged(newConfig: Configuration) {
+        override fun onConfigurationChanged(newConfig: Configuration) {
         super.onConfigurationChanged(newConfig)
 
         // If we're exiting and requested an orientation restore, wait until Android applies it
@@ -1556,7 +1525,16 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
 
         val isLandscape = newConfig.orientation == Configuration.ORIENTATION_LANDSCAPE
 
-        updateGestureMetricsFromView()
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            val wm = windowManager.currentWindowMetrics
+            gestures.setMetrics(wm.bounds.width().toFloat(), wm.bounds.height().toFloat())
+            zoomGestures.setMetrics(wm.bounds.width().toFloat(), wm.bounds.height().toFloat())
+        } else @Suppress("DEPRECATION") {
+            val dm = DisplayMetrics()
+            windowManager.defaultDisplay.getRealMetrics(dm)
+            gestures.setMetrics(dm.widthPixels.toFloat(), dm.heightPixels.toFloat())
+            zoomGestures.setMetrics(dm.widthPixels.toFloat(), dm.heightPixels.toFloat())
+        }
 
         // Adjust control margins (only after the player UI is attached)
         if (uiInitialized) {

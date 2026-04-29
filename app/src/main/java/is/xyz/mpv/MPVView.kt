@@ -8,6 +8,11 @@ import android.util.AttributeSet
 import android.util.Log
 import android.view.*
 import androidx.core.content.ContextCompat
+import kotlin.math.abs
+import kotlin.math.ceil
+import kotlin.math.max
+import kotlin.math.min
+import kotlin.math.sqrt
 import `is`.xyz.mpv.MPVLib.MpvFormat.MPV_FORMAT_DOUBLE
 import `is`.xyz.mpv.MPVLib.MpvFormat.MPV_FORMAT_FLAG
 import `is`.xyz.mpv.MPVLib.MpvFormat.MPV_FORMAT_INT64
@@ -16,11 +21,102 @@ import `is`.xyz.mpv.MPVLib.MpvFormat.MPV_FORMAT_STRING
 import kotlin.reflect.KProperty
 
 internal class MPVView(context: Context, attrs: AttributeSet) : BaseMPVView(context, attrs) {
+    /**
+     * Zoom is applied by transforming this MPVView. With a plain SurfaceView,
+     * deep zoom can look wavy because Android magnifies a screen-sized surface.
+     * MPVView owns the real mpv surface, so it can request a denser backing
+     * buffer while zoomed. The request is delayed and bucketed to avoid constant
+     * surface recreation during pinch gestures.
+     */
+    private var zoomSurfaceScale = 1f
+    private val zoomSurfaceUpdate = Runnable { applyZoomSurfaceSizeForCurrentTransform() }
+
+    override fun setScaleX(scaleX: Float) {
+        super.setScaleX(scaleX)
+        scheduleZoomSurfaceSizeUpdate()
+    }
+
+    override fun setScaleY(scaleY: Float) {
+        super.setScaleY(scaleY)
+        scheduleZoomSurfaceSizeUpdate()
+    }
+
+    override fun onSizeChanged(w: Int, h: Int, oldw: Int, oldh: Int) {
+        super.onSizeChanged(w, h, oldw, oldh)
+        scheduleZoomSurfaceSizeUpdate(immediate = true)
+    }
+
+    private fun scheduleZoomSurfaceSizeUpdate(immediate: Boolean = false) {
+        if (width <= 1 || height <= 1)
+            return
+
+        removeCallbacks(zoomSurfaceUpdate)
+        if (immediate)
+            post(zoomSurfaceUpdate)
+        else
+            postDelayed(zoomSurfaceUpdate, ZOOM_SURFACE_UPDATE_DELAY_MS)
+    }
+
+    private fun applyZoomSurfaceSizeForCurrentTransform() {
+        val w = width
+        val h = height
+        if (w <= 1 || h <= 1)
+            return
+
+        val visualZoom = max(abs(scaleX), abs(scaleY))
+        val requestedSurfaceScale = surfaceScaleForZoom(visualZoom, w, h)
+
+        if (abs(requestedSurfaceScale - zoomSurfaceScale) < SURFACE_SCALE_HYSTERESIS)
+            return
+
+        zoomSurfaceScale = requestedSurfaceScale
+
+        if (requestedSurfaceScale <= 1f + 0.001f) {
+            holder.setSizeFromLayout()
+            Log.v(TAG, "zoom surface reset to layout size")
+            return
+        }
+
+        val fixedW = max(1, ceil(w * requestedSurfaceScale).toInt())
+        val fixedH = max(1, ceil(h * requestedSurfaceScale).toInt())
+        Log.v(TAG, "zoom surface backing size ${fixedW}x$fixedH for view ${w}x$h at visual zoom $visualZoom")
+        holder.setFixedSize(fixedW, fixedH)
+    }
+
+    private fun surfaceScaleForZoom(visualZoom: Float, viewW: Int, viewH: Int): Float {
+        if (visualZoom <= 1f + 0.02f)
+            return 1f
+
+        val byDimension = min(
+            MAX_ZOOM_SURFACE_DIMENSION / viewW.toFloat(),
+            MAX_ZOOM_SURFACE_DIMENSION / viewH.toFloat()
+        )
+        val byPixels = sqrt(MAX_ZOOM_SURFACE_PIXELS / (viewW.toFloat() * viewH.toFloat()))
+        val maxAllowed = min(MAX_ZOOM_SURFACE_SCALE, min(byDimension, byPixels)).coerceAtLeast(1f)
+
+        val wanted = when {
+            visualZoom >= 12f -> 2.00f
+            visualZoom >= 8f -> 1.75f
+            visualZoom >= 4f -> 1.50f
+            visualZoom >= 2f -> 1.25f
+            else -> 1.10f
+        }
+        return min(wanted, maxAllowed).coerceAtLeast(1f)
+    }
+
     override fun initOptions() {
+
         val sharedPreferences = PreferenceManager.getDefaultSharedPreferences(context)
 
         // apply phone-optimized defaults
         MPVLib.setOptionString("profile", "fast")
+
+        // Deep zoom magnifies mpv's base render, so avoid the cheapest
+        // scaler defaults from the fast profile. User video_scale prefs below
+        // still override the main luma scaler if set.
+        MPVLib.setOptionString("scale", "spline36")
+        MPVLib.setOptionString("cscale", "spline36")
+        MPVLib.setOptionString("dscale", "mitchell")
 
         // vo
         setVo(if (sharedPreferences.getBoolean("gpu_next", false))
@@ -400,5 +496,11 @@ internal class MPVView(context: Context, attrs: AttributeSet) : BaseMPVView(cont
 
         // mpv option `hwdec` is set to this
         private const val HWDECS = "mediacodec,mediacodec-copy"
+
+        private const val ZOOM_SURFACE_UPDATE_DELAY_MS = 140L
+        private const val SURFACE_SCALE_HYSTERESIS = 0.12f
+        private const val MAX_ZOOM_SURFACE_SCALE = 2.0f
+        private const val MAX_ZOOM_SURFACE_DIMENSION = 4096f
+        private const val MAX_ZOOM_SURFACE_PIXELS = 9_500_000f
     }
 }
