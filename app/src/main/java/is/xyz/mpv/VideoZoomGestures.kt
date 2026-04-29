@@ -63,7 +63,7 @@ internal class VideoZoomGestures(
     // Coalesce view property updates to vsync.
     private val choreographer: Choreographer = Choreographer.getInstance()
     private var applyScheduled = false
-    private val frameCallback = Choreographer.FrameCallback {
+    private val frameCallback: Choreographer.FrameCallback = Choreographer.FrameCallback {
         applyScheduled = false
 
         // Apply pan at a stable cadence (vsync) while zoomed.
