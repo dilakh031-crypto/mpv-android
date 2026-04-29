@@ -14,9 +14,10 @@
         Gesture layer.
 
         IMPORTANT: This view must not be transformed.
-        Zoom/pan are applied inside mpv using video-zoom/video-pan-x/y, not by
-        scaling the SurfaceView. Keeping input on this overlay avoids feedback/jitter
-        and lets mpv render high-resolution images from the original source pixels.
+        We apply zoom/pan transforms to the SurfaceView (player) itself.
+        If we attached gesture handling directly to the transformed SurfaceView,
+        Android would deliver touch coordinates that are continuously re-mapped
+        by the inverse transform matrix, causing feedback/jitter while zooming/panning.
     -->
     <View
         android:id="@+id/gestureLayer"
