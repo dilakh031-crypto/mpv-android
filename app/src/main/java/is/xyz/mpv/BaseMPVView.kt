@@ -94,92 +94,110 @@ abstract class BaseMPVView(context: Context, attrs: AttributeSet) : TextureView(
     }
 
     private var attachedSurface: Surface? = null
+    private var attachedSurfaceTexture: SurfaceTexture? = null
 
     private var viewSurfaceWidth = 0
     private var viewSurfaceHeight = 0
-    private var sourceRenderWidth = 0
-    private var sourceRenderHeight = 0
-    private var appliedRenderWidth = 0
-    private var appliedRenderHeight = 0
+    private var requestedRenderWidth: Int? = null
+    private var requestedRenderHeight: Int? = null
+    private var requestedDisplayAspect: Double? = null
+    private var currentRenderWidth = 0
+    private var currentRenderHeight = 0
 
     /**
-     * Use the media's native dimensions as the SurfaceTexture buffer size.
+     * Request the actual mpv/SurfaceTexture render size.
      *
-     * The player view may still be scaled by VideoZoomGestures, but mpv now renders
-     * into a native-sized buffer instead of a screen-sized one. This keeps still
-     * images and high resolution videos sharp when zoomed.
+     * Passing null falls back to the view size. Passing the decoded video size keeps
+     * zoom sourced from the original media resolution instead of magnifying a
+     * screen-sized render buffer.
      */
-    fun setSourceRenderSize(width: Int?, height: Int?) {
-        val w = width ?: 0
-        val h = height ?: 0
-        sourceRenderWidth = if (w > 0) w else 0
-        sourceRenderHeight = if (h > 0) h else 0
-        applyRenderSurfaceSize()
+    fun setRenderSurfaceSize(width: Int?, height: Int?, displayAspect: Double? = null) {
+        if (width != null && height != null && width > 0 && height > 0) {
+            requestedRenderWidth = width
+            requestedRenderHeight = height
+            requestedDisplayAspect = displayAspect?.takeIf { it > 0.001 }
+        } else {
+            requestedRenderWidth = null
+            requestedRenderHeight = null
+            requestedDisplayAspect = null
+        }
+        updateRenderSurfaceSize()
+        updateTextureTransform()
     }
 
-    private fun desiredRenderWidth(): Int = if (sourceRenderWidth > 0) sourceRenderWidth else viewSurfaceWidth
-    private fun desiredRenderHeight(): Int = if (sourceRenderHeight > 0) sourceRenderHeight else viewSurfaceHeight
-
-    private fun applyRenderSurfaceSize() {
-        val texture = surfaceTexture ?: return
-        val renderWidth = desiredRenderWidth()
-        val renderHeight = desiredRenderHeight()
-        if (renderWidth <= 0 || renderHeight <= 0)
+    private fun updateRenderSurfaceSize() {
+        val width = requestedRenderWidth ?: viewSurfaceWidth
+        val height = requestedRenderHeight ?: viewSurfaceHeight
+        if (width <= 0 || height <= 0)
+            return
+        if (width == currentRenderWidth && height == currentRenderHeight)
             return
 
-        applyTextureTransform(renderWidth, renderHeight)
+        currentRenderWidth = width
+        currentRenderHeight = height
 
-        if (renderWidth == appliedRenderWidth && renderHeight == appliedRenderHeight)
-            return
-
-        Log.v(TAG, "setting render surface size to ${renderWidth}x${renderHeight}")
-        texture.setDefaultBufferSize(renderWidth, renderHeight)
-        MPVLib.setPropertyString("android-surface-size", "${renderWidth}x${renderHeight}")
-        appliedRenderWidth = renderWidth
-        appliedRenderHeight = renderHeight
+        Log.v(TAG, "render surface size ${width}x${height}")
+        attachedSurfaceTexture?.setDefaultBufferSize(width, height)
+        updateTextureTransform()
+        if (attachedSurface != null)
+            MPVLib.setPropertyString("android-surface-size", "${width}x${height}")
     }
 
-    private fun applyTextureTransform(renderWidth: Int, renderHeight: Int) {
-        if (viewSurfaceWidth <= 0 || viewSurfaceHeight <= 0)
+    private fun updateTextureTransform() {
+        val vw = viewSurfaceWidth.toFloat()
+        val vh = viewSurfaceHeight.toFloat()
+        if (vw <= 0f || vh <= 0f) {
+            setTransform(null)
             return
-
-        val matrix = Matrix()
-        val viewAspect = viewSurfaceWidth.toFloat() / viewSurfaceHeight.toFloat()
-        val renderAspect = renderWidth.toFloat() / renderHeight.toFloat()
-
-        if (renderAspect > viewAspect) {
-            val scaleY = viewAspect / renderAspect
-            matrix.setScale(1f, scaleY, viewSurfaceWidth / 2f, viewSurfaceHeight / 2f)
-        } else if (renderAspect < viewAspect) {
-            val scaleX = renderAspect / viewAspect
-            matrix.setScale(scaleX, 1f, viewSurfaceWidth / 2f, viewSurfaceHeight / 2f)
         }
 
+        // When rendering into a source-sized buffer, TextureView would otherwise
+        // stretch that buffer to the full screen. Keep the source-sized render,
+        // but display it aspect-fit and centered so playback starts un-cropped.
+        if (requestedRenderWidth == null || requestedRenderHeight == null) {
+            setTransform(null)
+            return
+        }
+
+        val aspect = (requestedDisplayAspect ?: (currentRenderWidth.toDouble() / currentRenderHeight.toDouble())).toFloat()
+        val viewAspect = vw / vh
+        val scaleX: Float
+        val scaleY: Float
+        if (aspect > viewAspect) {
+            scaleX = 1f
+            scaleY = viewAspect / aspect
+        } else {
+            scaleX = aspect / viewAspect
+            scaleY = 1f
+        }
+
+        val matrix = Matrix()
+        matrix.setScale(scaleX, scaleY, vw * 0.5f, vh * 0.5f)
         setTransform(matrix)
     }
 
     private fun attachSurfaceTexture(texture: SurfaceTexture, width: Int, height: Int) {
-        viewSurfaceWidth = width
-        viewSurfaceHeight = height
-
-        if (attachedSurface != null) {
-            applyRenderSurfaceSize()
+        if (attachedSurface != null)
             return
-        }
 
         Log.w(TAG, "attaching texture surface")
-        // Configure the backing buffer before creating the Surface so mpv receives
-        // the requested native-sized render target from the start.
-        appliedRenderWidth = 0
-        appliedRenderHeight = 0
-        applyRenderSurfaceSize()
+        attachedSurfaceTexture = texture
+        viewSurfaceWidth = width
+        viewSurfaceHeight = height
+        updateRenderSurfaceSize()
+        updateTextureTransform()
+        if (currentRenderWidth <= 0 || currentRenderHeight <= 0) {
+            currentRenderWidth = width.coerceAtLeast(1)
+            currentRenderHeight = height.coerceAtLeast(1)
+            texture.setDefaultBufferSize(currentRenderWidth, currentRenderHeight)
+        }
+        updateTextureTransform()
+
         val surface = Surface(texture)
         attachedSurface = surface
 
         MPVLib.attachSurface(surface)
-        appliedRenderWidth = 0
-        appliedRenderHeight = 0
-        applyRenderSurfaceSize()
+        MPVLib.setPropertyString("android-surface-size", "${currentRenderWidth}x${currentRenderHeight}")
         // This forces mpv to render subs/osd/whatever into our surface even if it would ordinarily not
         MPVLib.setOptionString("force-window", "yes")
 
@@ -205,8 +223,10 @@ abstract class BaseMPVView(context: Context, attrs: AttributeSet) : TextureView(
         MPVLib.detachSurface()
         surface.release()
         attachedSurface = null
-        appliedRenderWidth = 0
-        appliedRenderHeight = 0
+        attachedSurfaceTexture = null
+        currentRenderWidth = 0
+        currentRenderHeight = 0
+        setTransform(null)
     }
 
     // Texture callbacks
@@ -218,7 +238,8 @@ abstract class BaseMPVView(context: Context, attrs: AttributeSet) : TextureView(
     override fun onSurfaceTextureSizeChanged(surface: SurfaceTexture, width: Int, height: Int) {
         viewSurfaceWidth = width
         viewSurfaceHeight = height
-        applyRenderSurfaceSize()
+        updateRenderSurfaceSize()
+        updateTextureTransform()
     }
 
     override fun onSurfaceTextureDestroyed(surface: SurfaceTexture): Boolean {
