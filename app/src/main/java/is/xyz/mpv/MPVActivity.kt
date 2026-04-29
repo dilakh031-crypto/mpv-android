@@ -403,7 +403,7 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
             // Prepare binding/gestures early so onConfigurationChanged is safe even if we change orientation immediately.
             binding = PlayerBinding.inflate(layoutInflater)
             gestures = TouchGestures(this)
-            zoomGestures = VideoZoomGestures(binding.player, binding.zoomHandoffOverlay)
+            zoomGestures = VideoZoomGestures(binding.player)
 
             // Do these here and not in MainActivity because mpv can be launched from a file browser.
             Utils.copyAssets(this)
@@ -3187,7 +3187,8 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
         if (eventId == MpvEvent.MPV_EVENT_START_FILE) {
             val cmds = onloadCommands.toTypedArray()
             onloadCommands.clear()
-            // Reset zoom/pan when a new file starts.
+            for (c in cmds)
+            // Reset any view-level zoom/pan when a new file starts.
 
             // Apply orientation as early as possible for playlist items, so we don't show the wrong orientation first.
             // Must run on the UI thread.
@@ -3196,7 +3197,7 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
                 if (p != null) eventUiHandler.post { try { applyOrientationFromMetadata(p) } catch (_: Throwable) {} }
             }
 
-            eventUiHandler.post { zoomGestures.reset() }
+            zoomGestures.reset()
             try {
                 MPVLib.setPropertyDouble("video-zoom", 0.0)
                 MPVLib.setPropertyDouble("video-pan-x", 0.0)
@@ -3206,7 +3207,7 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
                 // ignore
             }
 
-            for (c in cmds)
+            for (c in onloadCommands)
                 MPVLib.command(c)
 
             // Restore the user's previously chosen subtitle and audio track for this video.

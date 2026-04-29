@@ -1,44 +1,32 @@
 package `is`.xyz.mpv
 
-import android.graphics.Bitmap
-import android.os.Build
-import android.os.Handler
-import android.os.Looper
 import android.os.SystemClock
 import android.view.Choreographer
 import android.view.MotionEvent
-import android.view.PixelCopy
 import android.view.ScaleGestureDetector
-import android.view.SurfaceView
 import android.view.View
 import android.view.ViewConfiguration
-import android.widget.ImageView
-import kotlin.math.abs
 import kotlin.math.hypot
-import kotlin.math.ln
 
 /**
- * Smooth pinch-to-zoom + pan for mpv output.
+ * High-FPS pinch-to-zoom + pan for mpv output.
  *
- * This class deliberately uses a hybrid renderer:
- *  - while the finger is moving, the Android SurfaceView is transformed by the compositor;
- *    this is the same fast path as the old implementation and keeps gestures fluid.
- *  - shortly after the gesture stops, the same logical zoom/pan is committed to mpv with
- *    video-zoom/video-pan-x/y so the settled frame is rendered from the original source.
- *
- * The hard part is the handoff. If the SurfaceView transform is simply removed after mpv is
- * updated, Android can show a visible jump: one frame can be double-zoomed, unzoomed, or shifted
- * while mpv and the compositor catch up on different clocks. To make the handoff visually stable,
- * we keep a one-frame PixelCopy snapshot above the player during the switch, then fade it out.
- * The user should see only the expected quality change from compositor-upscaled to mpv-rendered.
+ * Design goals (Samsung-like):
+ *  - 60fps zoom/pan (compositor-level by transforming the Android view)
+ *  - While zoomed: one-finger pan, double-tap resets, seeking disabled
+ *  - Black bars (letter/pillarbox) are treated as "not part of video":
+ *      * They remain visible at small zoom.
+ *      * They disappear naturally once the zoom reaches the point where the
+ *        video content fills the viewport.
+ *      * Panning is clamped to the *video content rect*, not the whole view,
+ *        so you can't pan into the black bars.
  *
  * IMPORTANT:
- *  - Touch input must come from an untransformed overlay view (gestureLayer), not from the
- *    transformed video view itself.
+ *  - Touch input must come from an UNTRANSFORMED overlay view (gesture layer),
+ *    not from the transformed video view itself.
  */
 internal class VideoZoomGestures(
     private val target: View,
-    private val handoffOverlay: ImageView? = null,
 ) {
     private var viewWidth = 0f
     private var viewHeight = 0f
@@ -48,7 +36,7 @@ internal class VideoZoomGestures(
 
     private val touchSlop = ViewConfiguration.get(target.context).scaledTouchSlop.toFloat()
 
-    // Logical transform requested by the user (1.0 = normal, tx/ty in view pixels).
+    // Linear scale factor (1.0 = normal)
     private var scale = 1f
     private var tx = 0f
     private var ty = 0f
@@ -60,8 +48,8 @@ internal class VideoZoomGestures(
     private var downTime = 0L
     private var didDrag = false
 
-    // Single-finger pan is applied on vsync to avoid bursty MotionEvent delivery causing
-    // visible micro-stutter.
+    // Single-finger pan is applied on vsync to avoid bursty MotionEvent delivery
+    // causing visible micro-stutter.
     private var panFingerDown = false
     private var panPendingX = 0f
     private var panPendingY = 0f
@@ -71,19 +59,6 @@ internal class VideoZoomGestures(
     private var lastTapTime = 0L
     private var lastTapX = 0f
     private var lastTapY = 0f
-
-    // True when mpv currently owns the settled high-quality zoom/pan and the SurfaceView is
-    // identity-transformed. When the next real gesture starts, we switch back to the compositor
-    // fast path at the same logical transform.
-    private var mpvQualityActive = false
-
-    private var lastSentZoom = Double.NaN
-    private var lastSentPanX = Double.NaN
-    private var lastSentPanY = Double.NaN
-
-    private val mainHandler = Handler(Looper.getMainLooper())
-    private var handoffSerial = 0
-    private var handoffBitmap: Bitmap? = null
 
     // Coalesce view property updates to vsync.
     private val choreographer: Choreographer = Choreographer.getInstance()
@@ -105,55 +80,10 @@ internal class VideoZoomGestures(
         applyToView()
     }
 
-    private val highQualityCommitRunnable = Runnable {
-        beginHighQualityHandoff()
-    }
-
     private fun scheduleApply() {
         if (applyScheduled) return
         applyScheduled = true
         choreographer.postFrameCallback(frameCallback)
-    }
-
-    private fun cancelHighQualityCommit() {
-        target.removeCallbacks(highQualityCommitRunnable)
-        handoffSerial++
-    }
-
-    private fun hideHandoffOverlay(clearBitmap: Boolean = false) {
-        handoffSerial++
-        handoffOverlay?.let { overlay ->
-            overlay.animate().cancel()
-            overlay.alpha = 0f
-            overlay.visibility = View.GONE
-            overlay.scaleX = 1f
-            overlay.scaleY = 1f
-            overlay.translationX = 0f
-            overlay.translationY = 0f
-            overlay.setImageDrawable(null)
-        }
-        if (clearBitmap) {
-            handoffBitmap?.recycle()
-            handoffBitmap = null
-        }
-    }
-
-    /**
-     * Switch from settled mpv-quality mode back to the old smooth SurfaceView transform mode.
-     * This is intentionally done only when the user really starts dragging/pinching, not on a
-     * simple tap, so tapping controls while zoomed does not cause a quality flicker.
-     */
-    private fun ensureInteractiveFastPath() {
-        cancelHighQualityCommit()
-        hideHandoffOverlay(clearBitmap = false)
-        if (!mpvQualityActive)
-            return
-
-        // The reset is synchronous so we do not get a temporary double-transform when the
-        // SurfaceView transform is restored for interactive movement.
-        mpvQualityActive = false
-        resetMpvTransform(force = true, synchronous = true)
-        applyToView()
     }
 
     private val scaleDetector = ScaleGestureDetector(
@@ -162,15 +92,12 @@ internal class VideoZoomGestures(
             override fun onScaleBegin(detector: ScaleGestureDetector): Boolean {
                 lastTapTime = 0L
                 didDrag = true
-                ensureInteractiveFastPath()
                 return true
             }
 
             override fun onScale(detector: ScaleGestureDetector): Boolean {
                 if (viewWidth <= 1f || viewHeight <= 1f)
                     return true
-
-                ensureInteractiveFastPath()
 
                 val oldScale = scale
                 val requested = oldScale * detector.scaleFactor
@@ -179,9 +106,13 @@ internal class VideoZoomGestures(
                     return true
 
                 // Keep pinch focus stable.
+                //
                 // Our transform is: screen = scale * content + translation (pivot at 0,0).
-                // To zoom around focus F (in screen coords), update translation as:
+                // To zoom around focus F (in screen coords) we must update translation as:
                 //   t' = k * t + (1 - k) * F, where k = newScale / oldScale.
+                //
+                // The old implementation used (oldScale - newScale) * F, which becomes
+                // increasingly wrong when already zoomed/panned, causing noticeable drift.
                 val fx = detector.focusX
                 val fy = detector.focusY
                 val k = newScale / oldScale
@@ -203,24 +134,14 @@ internal class VideoZoomGestures(
     fun setMetrics(width: Float, height: Float) {
         viewWidth = width
         viewHeight = height
-        if (isZoomed()) {
-            clampTranslationToVideoContent()
-            if (mpvQualityActive)
-                scheduleHighQualityCommit(SHORT_COMMIT_DELAY_MS)
-            else
-                scheduleApply()
-        }
+        if (isZoomed())
+            scheduleApply()
     }
 
     fun setVideoAspect(aspect: Double?) {
         videoAspect = aspect ?: 0.0
-        if (isZoomed()) {
-            clampTranslationToVideoContent()
-            if (mpvQualityActive)
-                scheduleHighQualityCommit(SHORT_COMMIT_DELAY_MS)
-            else
-                scheduleApply()
-        }
+        if (isZoomed())
+            scheduleApply()
     }
 
     fun isZoomed(): Boolean = scale > 1f + EPS
@@ -234,8 +155,6 @@ internal class VideoZoomGestures(
             choreographer.removeFrameCallback(frameCallback)
             applyScheduled = false
         }
-        cancelHighQualityCommit()
-        hideHandoffOverlay(clearBitmap = false)
 
         scale = 1f
         tx = 0f
@@ -243,10 +162,7 @@ internal class VideoZoomGestures(
         didDrag = false
         panFingerDown = false
         lastTapTime = 0L
-        mpvQualityActive = false
-
-        applyIdentityToView()
-        resetMpvTransform(force = true, synchronous = true)
+        applyToView()
     }
 
     /**
@@ -293,7 +209,6 @@ internal class VideoZoomGestures(
 
         when (e.actionMasked) {
             MotionEvent.ACTION_DOWN -> {
-                cancelHighQualityCommit()
                 downX = e.x
                 downY = e.y
                 lastX = e.x
@@ -322,7 +237,6 @@ internal class VideoZoomGestures(
                 }
 
                 if (didDrag) {
-                    ensureInteractiveFastPath()
                     scheduleApply()
                 }
                 return true
@@ -335,7 +249,6 @@ internal class VideoZoomGestures(
 
                 if (!wasTap) {
                     lastTapTime = 0L
-                    finishGesture()
                     return true
                 }
 
@@ -351,40 +264,17 @@ internal class VideoZoomGestures(
                 lastTapTime = now
                 lastTapX = e.x
                 lastTapY = e.y
-                // Keep/restore high-quality settled rendering after a simple tap.
-                finishGesture()
                 return false
             }
             MotionEvent.ACTION_CANCEL -> {
                 lastTapTime = 0L
                 didDrag = false
                 panFingerDown = false
-                finishGesture()
                 return true
             }
         }
 
         return true
-    }
-
-    private fun finishGesture() {
-        clampTranslationToVideoContent()
-        if (scale <= 1f + EPS) {
-            reset()
-        } else if (mpvQualityActive) {
-            cancelHighQualityCommit()
-            applyIdentityToView()
-        } else {
-            applyToView()
-            scheduleHighQualityCommit(IDLE_COMMIT_DELAY_MS)
-        }
-    }
-
-    private fun scheduleHighQualityCommit(delayMs: Long) {
-        cancelHighQualityCommit()
-        if (viewWidth <= 1f || viewHeight <= 1f || scale <= 1f + EPS)
-            return
-        target.postDelayed(highQualityCommitRunnable, delayMs)
     }
 
     /**
@@ -419,7 +309,6 @@ internal class VideoZoomGestures(
             return
 
         if (scale <= 1f + EPS) {
-            scale = 1f
             tx = 0f
             ty = 0f
             return
@@ -428,8 +317,7 @@ internal class VideoZoomGestures(
         val c = contentRect()
 
         // Clamp independently per axis.
-        // Use the transformed content rect (not the transformed whole view) so black bars are
-        // never pan space.
+        // Use the transformed content rect (not the transformed whole view) so black bars are never "pan space".
         val contentWScaled = scale * c.w
         val contentHScaled = scale * c.h
 
@@ -455,215 +343,21 @@ internal class VideoZoomGestures(
     }
 
     private fun applyToView() {
-        applyTransformTo(target, scale, tx, ty)
+        target.pivotX = 0f
+        target.pivotY = 0f
+        target.scaleX = scale
+        target.scaleY = scale
+        target.translationX = tx
+        target.translationY = ty
     }
-
-    private fun applyIdentityToView() {
-        applyTransformTo(target, 1f, 0f, 0f)
-    }
-
-    private fun applyTransformTo(view: View, s: Float, x: Float, y: Float) {
-        view.pivotX = 0f
-        view.pivotY = 0f
-        view.scaleX = s
-        view.scaleY = s
-        view.translationX = x
-        view.translationY = y
-    }
-
-    private fun beginHighQualityHandoff() {
-        if (viewWidth <= 1f || viewHeight <= 1f || scale <= 1f + EPS)
-            return
-
-        clampTranslationToVideoContent()
-
-        if (tryPixelCopyHandoff())
-            return
-
-        // Fallback for old Android versions or PixelCopy failures: do an immediate, synchronous
-        // switch. This avoids the old delayed double-transform flash.
-        commitHighQualityMpvTransform()
-        applyIdentityToView()
-    }
-
-    private fun tryPixelCopyHandoff(): Boolean {
-        val surfaceView = target as? SurfaceView ?: return false
-        val overlay = handoffOverlay ?: return false
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O)
-            return false
-        if (viewWidth <= 1f || viewHeight <= 1f)
-            return false
-
-        val w = viewWidth.toInt().coerceAtLeast(1)
-        val h = viewHeight.toInt().coerceAtLeast(1)
-        val bitmap = obtainHandoffBitmap(w, h) ?: return false
-        val serial = ++handoffSerial
-
-        try {
-            PixelCopy.request(surfaceView, bitmap, { result ->
-                if (serial != handoffSerial || scale <= 1f + EPS)
-                    return@request
-
-                if (result == PixelCopy.SUCCESS) {
-                    showHandoffOverlay(overlay, bitmap)
-                    commitHighQualityMpvTransform()
-                    applyIdentityToView()
-                    fadeHandoffOverlay(overlay, serial)
-                } else {
-                    commitHighQualityMpvTransform()
-                    applyIdentityToView()
-                }
-            }, mainHandler)
-            return true
-        } catch (_: Throwable) {
-            return false
-        }
-    }
-
-    private fun obtainHandoffBitmap(width: Int, height: Int): Bitmap? {
-        val old = handoffBitmap
-        if (old != null && !old.isRecycled && old.width == width && old.height == height)
-            return old
-
-        handoffOverlay?.setImageDrawable(null)
-        old?.recycle()
-        return try {
-            Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888).also {
-                handoffBitmap = it
-            }
-        } catch (_: Throwable) {
-            handoffBitmap = null
-            null
-        }
-    }
-
-    private fun showHandoffOverlay(overlay: ImageView, bitmap: Bitmap) {
-        overlay.animate().cancel()
-        overlay.setImageBitmap(bitmap)
-        overlay.alpha = 1f
-        overlay.visibility = View.VISIBLE
-        applyTransformTo(overlay, scale, tx, ty)
-    }
-
-    private fun fadeHandoffOverlay(overlay: ImageView, serial: Int) {
-        overlay.animate().cancel()
-        overlay.postDelayed({
-            if (serial != handoffSerial)
-                return@postDelayed
-            overlay.animate()
-                .alpha(0f)
-                .setStartDelay(0L)
-                .setDuration(HANDOFF_FADE_MS)
-                .withEndAction {
-                    if (serial == handoffSerial) {
-                        overlay.visibility = View.GONE
-                        overlay.setImageDrawable(null)
-                        applyTransformTo(overlay, 1f, 0f, 0f)
-                    }
-                }
-                .start()
-        }, HANDOFF_HOLD_MS)
-    }
-
-    private fun commitHighQualityMpvTransform() {
-        val mpvTransform = computeMpvTransform() ?: return
-
-        // Synchronous property writes here are deliberate. They happen only at gesture end, not
-        // continuously, and make the SurfaceView->mpv handoff much more deterministic.
-        setMpvDouble("video-zoom", mpvTransform.zoom, force = false, synchronous = true)
-        setMpvDouble("video-pan-x", mpvTransform.panX, force = false, synchronous = true)
-        setMpvDouble("video-pan-y", mpvTransform.panY, force = false, synchronous = true)
-
-        mpvQualityActive = true
-    }
-
-    private fun computeMpvTransform(): MpvTransform? {
-        if (viewWidth <= 1f || viewHeight <= 1f || scale <= 1f + EPS)
-            return null
-
-        clampTranslationToVideoContent()
-        val c = contentRect()
-        val safeScale = scale.coerceAtLeast(MIN_SCALE)
-        val zoom = log2(safeScale.toDouble())
-
-        var panX = 0.0
-        var panY = 0.0
-
-        if (c.w > 1f && c.h > 1f) {
-            // Desired transformed content rect from the same logical transform that drives the
-            // fast SurfaceView path.
-            val desiredLeft = safeScale * c.ox + tx
-            val desiredTop = safeScale * c.oy + ty
-
-            // mpv first centers the zoomed video, then applies pan as a fraction of the scaled
-            // video dimensions. Convert from desired pixel displacement to mpv units.
-            val centeredLeft = (viewWidth - safeScale * c.w) * 0.5f
-            val centeredTop = (viewHeight - safeScale * c.h) * 0.5f
-            panX = ((desiredLeft - centeredLeft) / (safeScale * c.w)).toDouble()
-            panY = ((desiredTop - centeredTop) / (safeScale * c.h)).toDouble()
-        }
-
-        return MpvTransform(zoom, panX, panY)
-    }
-
-    private fun resetMpvTransform(force: Boolean, synchronous: Boolean) {
-        setMpvDouble("video-zoom", 0.0, force, synchronous)
-        setMpvDouble("video-pan-x", 0.0, force, synchronous)
-        setMpvDouble("video-pan-y", 0.0, force, synchronous)
-    }
-
-    private fun setMpvDouble(property: String, value: Double, force: Boolean, synchronous: Boolean) {
-        val previous = when (property) {
-            "video-zoom" -> lastSentZoom
-            "video-pan-x" -> lastSentPanX
-            "video-pan-y" -> lastSentPanY
-            else -> Double.NaN
-        }
-
-        if (!force && !previous.isNaN() && abs(previous - value) < MPV_APPLY_EPS)
-            return
-
-        try {
-            if (synchronous) {
-                MPVLib.setPropertyDouble(property, value)
-            } else {
-                val result = MPVLib.commandAsync(arrayOf("set", property, value.toString()), 0L)
-                if (result < 0)
-                    MPVLib.setPropertyDouble(property, value)
-            }
-            when (property) {
-                "video-zoom" -> lastSentZoom = value
-                "video-pan-x" -> lastSentPanX = value
-                "video-pan-y" -> lastSentPanY = value
-            }
-        } catch (_: Throwable) {
-            // mpv may not be initialized yet during early Activity setup or after shutdown.
-        }
-    }
-
-    private fun log2(value: Double): Double = ln(value) / LN_2
 
     private data class ContentRect(val ox: Float, val oy: Float, val w: Float, val h: Float)
-    private data class MpvTransform(val zoom: Double, val panX: Double, val panY: Double)
 
     companion object {
         private const val EPS = 0.001f
-        private const val MPV_APPLY_EPS = 0.00001
         private const val MIN_SCALE = 1f
-        // Enough for deep inspection of 4K/6K images without forcing coarse jumps.
+        // Increased maximum zoom from 6x to 20x.
         private const val MAX_SCALE = 20f
         private const val DOUBLE_TAP_TIMEOUT = 300L
-
-        // Delay before switching from fast interactive SurfaceView transform to sharp mpv render.
-        // Kept low so the image becomes clean quickly, but high enough to avoid committing while
-        // MotionEvents are still arriving.
-        private const val IDLE_COMMIT_DELAY_MS = 64L
-        private const val SHORT_COMMIT_DELAY_MS = 16L
-
-        // Snapshot handoff: a very short cover avoids spatial jumps without making video feel
-        // frozen. The fade is just long enough to turn the switch into a quality improvement.
-        private const val HANDOFF_HOLD_MS = 32L
-        private const val HANDOFF_FADE_MS = 64L
-        private const val LN_2 = 0.6931471805599453
     }
 }
