@@ -72,9 +72,6 @@ internal class MPVView(context: Context, attrs: AttributeSet) : BaseMPVView(cont
                 MPVLib.setOptionString(mpvOption, preference)
         }
 
-
-        applyScanSafeDownscalingDefaults(sharedPreferences)
-
         val debandMode = sharedPreferences.getString("video_debanding", "")
         if (debandMode == "gradfun") {
             // lower the default radius (16) to improve performance
@@ -106,6 +103,8 @@ internal class MPVView(context: Context, attrs: AttributeSet) : BaseMPVView(cont
         MPVLib.setOptionString("tls-verify", "yes")
         MPVLib.setOptionString("tls-ca-file", "${this.context.filesDir.path}/cacert.pem")
         MPVLib.setOptionString("input-default-bindings", "yes")
+        // Keep still images open indefinitely instead of letting mpv advance/end them
+        // after its default image display timeout.
         MPVLib.setOptionString("image-display-duration", "inf")
         // Limit demuxer cache since the defaults are too high for mobile devices
         val cacheMegs = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O_MR1) 64 else 32
@@ -117,24 +116,6 @@ internal class MPVView(context: Context, attrs: AttributeSet) : BaseMPVView(cont
         MPVLib.setOptionString("screenshot-directory", screenshotDir.path)
         // workaround for <https://github.com/mpv-player/mpv/issues/14651>
         MPVLib.setOptionString("vd-lavc-film-grain", "cpu")
-    }
-
-    private fun applyScanSafeDownscalingDefaults(sharedPreferences: android.content.SharedPreferences) {
-        if (sharedPreferences.getString("video_downscale", "").isNullOrBlank()) {
-            MPVLib.setOptionString("dscale", "mitchell")
-            MPVLib.setOptionString("dscale-antiring", "0.75")
-        }
-
-        if (sharedPreferences.getString("video_scale", "").isNullOrBlank()) {
-            MPVLib.setOptionString("scale", "spline36")
-            MPVLib.setOptionString("scale-antiring", "0.60")
-        }
-
-        MPVLib.setOptionString("cscale", "mitchell")
-        MPVLib.setOptionString("cscale-antiring", "0.75")
-        MPVLib.setOptionString("correct-downscaling", "yes")
-        MPVLib.setOptionString("linear-downscaling", "yes")
-        MPVLib.setOptionString("dither-depth", "auto")
     }
 
     override fun postInitOptions() {
