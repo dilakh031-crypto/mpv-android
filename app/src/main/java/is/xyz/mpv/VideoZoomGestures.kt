@@ -1,4 +1,3 @@
---- START OF FILE app/src/main/java/is/xyz/mpv/VideoZoomGestures.kt ---
 package `is`.xyz.mpv
 
 import android.os.SystemClock
@@ -73,13 +72,6 @@ internal class VideoZoomGestures(
                     return true
 
                 // Keep pinch focus stable.
-                //
-                // Our transform is: screen = scale * content + translation (pivot at 0,0).
-                // To zoom around focus F (in screen coords) we must update translation as:
-                //   t' = k * t + (1 - k) * F, where k = newScale / oldScale.
-                //
-                // The old implementation used (oldScale - newScale) * F, which becomes
-                // increasingly wrong when already zoomed/panned, causing noticeable drift.
                 val fx = detector.focusX
                 val fy = detector.focusY
                 val k = newScale / oldScale
@@ -133,15 +125,12 @@ internal class VideoZoomGestures(
 
     /**
      * @return true if the event should be consumed.
-     *         While zoomed: pinch/pan/double-tap are consumed.
-     *         Single tap returns false so the Activity can toggle controls.
      */
     fun onTouchEvent(e: MotionEvent): Boolean {
         // Always feed the scale detector first.
         scaleDetector.onTouchEvent(e)
 
         // Pointer transitions during pinch:
-        // If one finger lifts and another remains down, update downX/downY and panFrameX/panFrameY so we don't jump.
         if (e.actionMasked == MotionEvent.ACTION_POINTER_UP && isZoomed()) {
             lastTapTime = 0L
             didDrag = true
@@ -278,13 +267,12 @@ internal class VideoZoomGestures(
         val c = contentRect()
 
         // Clamp independently per axis.
-        // Use the transformed content rect (not the transformed whole view) so black bars are never "pan space".
         val contentWScaled = scale * c.w
         val contentHScaled = scale * c.h
 
         // X axis
         tx = if (contentWScaled <= viewWidth + EPS) {
-            // Content smaller than viewport: keep it centered (no horizontal panning)
+            // Content smaller than viewport: keep it centered
             ((viewWidth - contentWScaled) * 0.5f) - scale * c.ox
         } else {
             val minTx = viewWidth - scale * (c.ox + c.w)
@@ -294,7 +282,7 @@ internal class VideoZoomGestures(
 
         // Y axis
         ty = if (contentHScaled <= viewHeight + EPS) {
-            // Content smaller than viewport: keep it centered (no vertical panning)
+            // Content smaller than viewport: keep it centered
             ((viewHeight - contentHScaled) * 0.5f) - scale * c.oy
         } else {
             val minTy = viewHeight - scale * (c.oy + c.h)
@@ -317,9 +305,7 @@ internal class VideoZoomGestures(
     companion object {
         private const val EPS = 0.001f
         private const val MIN_SCALE = 1f
-        // Increased maximum zoom from 6x to 20x.
         private const val MAX_SCALE = 20f
         private const val DOUBLE_TAP_TIMEOUT = 300L
     }
 }
---- END OF FILE app/src/main/java/is/xyz/mpv/VideoZoomGestures.kt ---
