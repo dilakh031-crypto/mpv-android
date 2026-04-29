@@ -1,6 +1,8 @@
 package `is`.xyz.mpv
 
 import android.content.Context
+import android.graphics.Color
+import android.graphics.Matrix
 import android.graphics.SurfaceTexture
 import android.util.AttributeSet
 import android.util.Log
@@ -12,10 +14,17 @@ import android.view.TextureView
 abstract class BaseMPVView(context: Context, attrs: AttributeSet) : TextureView(context, attrs), TextureView.SurfaceTextureListener {
     init {
         // TextureView is part of the normal View hierarchy. This makes high-zoom
-        // scale/translation much smoother than transforming a SurfaceView layer,
-        // especially on older Android devices where SurfaceView composition is
-        // quantized by SurfaceFlinger/HWC.
-        isOpaque = true
+        // scale/translation much smoother than transforming a SurfaceView layer.
+        //
+        // Important for original-resolution buffers:
+        // When the SurfaceTexture buffer aspect ratio differs from the view aspect ratio,
+        // we use a TextureView transform matrix to preserve aspect ratio. In that state the
+        // texture does not cover the whole view; if TextureView is marked opaque, Android may
+        // leave the uncovered bars undefined during live buffer-size changes, which appears as
+        // strong black-edge flicker. Keep it non-opaque and paint the background black so the
+        // bars are stable.
+        isOpaque = false
+        setBackgroundColor(Color.BLACK)
     }
 
     /**
@@ -94,71 +103,45 @@ abstract class BaseMPVView(context: Context, attrs: AttributeSet) : TextureView(
 
     private var attachedSurface: Surface? = null
     private var attachedTexture: SurfaceTexture? = null
-
-    private var renderSurfaceWidth = 0
-    private var renderSurfaceHeight = 0
-    private var renderSurfaceOverridden = false
+    private var surfaceViewWidth = 0
+    private var surfaceViewHeight = 0
+    private var renderBufferWidth = 0
+    private var renderBufferHeight = 0
+    private val textureMatrix = Matrix()
 
     /**
-     * Sets the real mpv/SurfaceTexture render-buffer size without changing the
-     * TextureView's on-screen size.
+     * Called by VideoZoomGestures.
      *
-     * Normal zoom still uses Android's smooth TextureView transform, but mpv now
-     * renders more source pixels into that texture while zoomed. This avoids the
-     * low-detail "screen-resolution screenshot" look on 4K/8K media.
+     * Previous version switched between screen-sized buffer and original-resolution buffer
+     * exactly when zoom crossed 1x. That is what caused the black bars to flicker while a
+     * video was playing: SurfaceTexture buffer-size changes are not visually atomic.
+     *
+     * The buffer is now independent from the current zoom value. It is kept at the original
+     * video resolution whenever that resolution is known, even before zoom starts. Therefore
+     * zooming in/out only transforms the TextureView; it no longer reallocates the live video
+     * buffer during the pinch gesture.
      */
-    fun setRenderSurfaceSize(width: Int, height: Int) {
-        val safeWidth = width.coerceAtLeast(1)
-        val safeHeight = height.coerceAtLeast(1)
-        if (safeWidth == renderSurfaceWidth && safeHeight == renderSurfaceHeight)
-            return
+    fun setZoomRenderScale(scale: Float) = Unit
 
-        renderSurfaceWidth = safeWidth
-        renderSurfaceHeight = safeHeight
-        renderSurfaceOverridden = safeWidth != this.width || safeHeight != this.height
-        applyRenderSurfaceSize()
-    }
-
-    fun resetRenderSurfaceSize() {
-        renderSurfaceOverridden = false
-        val w = if (width > 1) width else renderSurfaceWidth
-        val h = if (height > 1) height else renderSurfaceHeight
-        if (w > 1 && h > 1)
-            setRenderSurfaceSize(w, h)
-    }
-
-    private fun desiredSurfaceWidth(fallbackWidth: Int): Int {
-        return if (renderSurfaceWidth > 1) renderSurfaceWidth else fallbackWidth.coerceAtLeast(1)
-    }
-
-    private fun desiredSurfaceHeight(fallbackHeight: Int): Int {
-        return if (renderSurfaceHeight > 1) renderSurfaceHeight else fallbackHeight.coerceAtLeast(1)
-    }
-
-    private fun applyRenderSurfaceSize() {
-        val texture = attachedTexture ?: return
-        if (renderSurfaceWidth <= 0 || renderSurfaceHeight <= 0)
-            return
-
-        texture.setDefaultBufferSize(renderSurfaceWidth, renderSurfaceHeight)
-        MPVLib.setPropertyString("android-surface-size", "${renderSurfaceWidth}x${renderSurfaceHeight}")
+    fun notifyVideoSizeChanged() {
+        updateRenderBufferSize(force = false)
     }
 
     private fun attachSurfaceTexture(texture: SurfaceTexture, width: Int, height: Int) {
         if (attachedSurface != null)
             return
 
+        Log.w(TAG, "attaching texture surface")
         attachedTexture = texture
-        renderSurfaceWidth = if (renderSurfaceOverridden) desiredSurfaceWidth(width) else width.coerceAtLeast(1)
-        renderSurfaceHeight = if (renderSurfaceOverridden) desiredSurfaceHeight(height) else height.coerceAtLeast(1)
-        texture.setDefaultBufferSize(renderSurfaceWidth, renderSurfaceHeight)
+        surfaceViewWidth = width
+        surfaceViewHeight = height
+        chooseAndApplyRenderBuffer(texture, force = true)
 
-        Log.w(TAG, "attaching texture surface ${renderSurfaceWidth}x${renderSurfaceHeight}")
         val surface = Surface(texture)
         attachedSurface = surface
 
         MPVLib.attachSurface(surface)
-        MPVLib.setPropertyString("android-surface-size", "${renderSurfaceWidth}x${renderSurfaceHeight}")
+        setMpvSurfaceSize()
         // This forces mpv to render subs/osd/whatever into our surface even if it would ordinarily not
         MPVLib.setOptionString("force-window", "yes")
 
@@ -185,6 +168,89 @@ abstract class BaseMPVView(context: Context, attrs: AttributeSet) : TextureView(
         surface.release()
         attachedSurface = null
         attachedTexture = null
+        renderBufferWidth = 0
+        renderBufferHeight = 0
+        textureMatrix.reset()
+        setTransform(textureMatrix)
+    }
+
+    private fun updateRenderBufferSize(force: Boolean) {
+        val texture = attachedTexture ?: return
+        if (surfaceViewWidth <= 1 || surfaceViewHeight <= 1)
+            return
+
+        val changed = chooseAndApplyRenderBuffer(texture, force)
+        if (changed)
+            setMpvSurfaceSize()
+    }
+
+    private fun chooseAndApplyRenderBuffer(texture: SurfaceTexture, force: Boolean): Boolean {
+        val size = chooseRenderBufferSize()
+        if (!force && size.width == renderBufferWidth && size.height == renderBufferHeight) {
+            updateTextureTransform()
+            return false
+        }
+
+        // Apply the aspect-preserving transform before and after the resize. This prevents a
+        // transient full-stretch frame in the black bars on devices that redraw immediately when
+        // SurfaceTexture's default buffer size changes.
+        renderBufferWidth = size.width
+        renderBufferHeight = size.height
+        updateTextureTransform()
+        texture.setDefaultBufferSize(renderBufferWidth, renderBufferHeight)
+        updateTextureTransform()
+
+        Log.w(TAG, "mpv texture buffer: ${renderBufferWidth}x${renderBufferHeight}")
+        return true
+    }
+
+    private fun updateTextureTransform() {
+        textureMatrix.reset()
+
+        if (surfaceViewWidth > 1 && surfaceViewHeight > 1 && renderBufferWidth > 1 && renderBufferHeight > 1) {
+            val viewAr = surfaceViewWidth.toFloat() / surfaceViewHeight.toFloat()
+            val bufferAr = renderBufferWidth.toFloat() / renderBufferHeight.toFloat()
+            val cx = surfaceViewWidth * 0.5f
+            val cy = surfaceViewHeight * 0.5f
+
+            if (bufferAr > viewAr) {
+                // Original video is wider than the view: keep full width and letterbox vertically.
+                textureMatrix.setScale(1f, viewAr / bufferAr, cx, cy)
+            } else {
+                // Original video is taller than the view: keep full height and pillarbox horizontally.
+                textureMatrix.setScale(bufferAr / viewAr, 1f, cx, cy)
+            }
+        }
+
+        setTransform(textureMatrix)
+    }
+
+    private fun setMpvSurfaceSize() {
+        if (renderBufferWidth > 1 && renderBufferHeight > 1)
+            MPVLib.setPropertyString("android-surface-size", "${renderBufferWidth}x${renderBufferHeight}")
+    }
+
+    private fun chooseRenderBufferSize(): RenderSize {
+        val viewW = surfaceViewWidth.coerceAtLeast(1)
+        val viewH = surfaceViewHeight.coerceAtLeast(1)
+
+        // Always use the original decoded video resolution exactly when it is known.
+        // No safety cap, no fitting to screen, no scale factor.
+        // This avoids reallocating when zoom starts/ends, which fixes the flicker.
+        return currentVideoSizeForDisplay() ?: RenderSize(viewW, viewH)
+    }
+
+    private fun currentVideoSizeForDisplay(): RenderSize? {
+        val w = MPVLib.getPropertyInt("video-params/w") ?: MPVLib.getPropertyInt("video-out-params/w") ?: return null
+        val h = MPVLib.getPropertyInt("video-params/h") ?: MPVLib.getPropertyInt("video-out-params/h") ?: return null
+        if (w <= 0 || h <= 0)
+            return null
+
+        val rotate = MPVLib.getPropertyInt("video-params/rotate") ?: MPVLib.getPropertyInt("video-out-params/rotate") ?: 0
+        return if (rotate % 180 == 90)
+            RenderSize(h, w)
+        else
+            RenderSize(w, h)
     }
 
     // Texture callbacks
@@ -194,11 +260,10 @@ abstract class BaseMPVView(context: Context, attrs: AttributeSet) : TextureView(
     }
 
     override fun onSurfaceTextureSizeChanged(surface: SurfaceTexture, width: Int, height: Int) {
-        if (!renderSurfaceOverridden) {
-            renderSurfaceWidth = width.coerceAtLeast(1)
-            renderSurfaceHeight = height.coerceAtLeast(1)
-        }
-        applyRenderSurfaceSize()
+        surfaceViewWidth = width
+        surfaceViewHeight = height
+        updateRenderBufferSize(force = true)
+        updateTextureTransform()
     }
 
     override fun onSurfaceTextureDestroyed(surface: SurfaceTexture): Boolean {
@@ -207,6 +272,8 @@ abstract class BaseMPVView(context: Context, attrs: AttributeSet) : TextureView(
     }
 
     override fun onSurfaceTextureUpdated(surface: SurfaceTexture) = Unit
+
+    private data class RenderSize(val width: Int, val height: Int)
 
     companion object {
         private const val TAG = "mpv"
