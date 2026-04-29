@@ -10,23 +10,14 @@
         android:layout_width="match_parent"
         android:layout_height="match_parent" />
 
-    <ImageView
-        android:id="@+id/zoomHandoffOverlay"
-        android:layout_width="match_parent"
-        android:layout_height="match_parent"
-        android:clickable="false"
-        android:focusable="false"
-        android:importantForAccessibility="no"
-        android:scaleType="fitXY"
-        android:visibility="gone" />
-
     <!--
         Gesture layer.
 
         IMPORTANT: This view must not be transformed.
-        During touch, zoom/pan are applied to the SurfaceView for compositor-level smoothness.
-        After touch settles, the same zoom/pan is committed inside mpv for high-resolution output.
-        Keeping input on this overlay avoids feedback/jitter from transformed touch coordinates.
+        We apply zoom/pan transforms to the SurfaceView (player) itself.
+        If we attached gesture handling directly to the transformed SurfaceView,
+        Android would deliver touch coordinates that are continuously re-mapped
+        by the inverse transform matrix, causing feedback/jitter while zooming/panning.
     -->
     <View
         android:id="@+id/gestureLayer"
