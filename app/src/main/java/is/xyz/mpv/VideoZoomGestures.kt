@@ -11,6 +11,7 @@ import kotlin.math.abs
 import kotlin.math.hypot
 import kotlin.math.max
 import kotlin.math.min
+import kotlin.math.roundToInt
 
 /**
  * Pinch-to-zoom + pan for mpv output.
@@ -30,11 +31,15 @@ import kotlin.math.min
 internal class VideoZoomGestures(
     private val target: View,
 ) {
+    private val renderTarget = target as? BaseMPVView
+
     private var viewWidth = 0f
     private var viewHeight = 0f
 
     /** video aspect ratio (rotation already applied). 0 => unknown */
     private var videoAspect = 0.0
+    private var videoPixelWidth = 0
+    private var videoPixelHeight = 0
 
     private val touchSlop = ViewConfiguration.get(target.context).scaledTouchSlop.toFloat()
     private val panStartSlop = max(1f, min(2.5f, touchSlop * 0.22f))
@@ -110,6 +115,7 @@ internal class VideoZoomGestures(
 
                 clampTranslationToVideoContent()
                 resetPanFilters(detector.focusX, detector.focusY, SystemClock.uptimeMillis())
+                requestOriginalRenderSurfaceSize()
                 scheduleApply()
                 return true
             }
@@ -117,8 +123,10 @@ internal class VideoZoomGestures(
             override fun onScaleEnd(detector: ScaleGestureDetector) {
                 if (scale <= 1f + EPS)
                     reset()
-                else
+                else {
                     resetPanFilters(detector.focusX, detector.focusY, SystemClock.uptimeMillis())
+                    requestOriginalRenderSurfaceSize()
+                }
             }
         }
     )
@@ -131,6 +139,7 @@ internal class VideoZoomGestures(
             clampTranslationToVideoContent()
             scheduleApply()
         }
+        requestOriginalRenderSurfaceSize()
     }
 
     fun setVideoAspect(aspect: Double?) {
@@ -139,6 +148,13 @@ internal class VideoZoomGestures(
             clampTranslationToVideoContent()
             scheduleApply()
         }
+        requestOriginalRenderSurfaceSize()
+    }
+
+    fun setVideoPixelSize(size: Pair<Int, Int>?) {
+        videoPixelWidth = size?.first ?: 0
+        videoPixelHeight = size?.second ?: 0
+        requestOriginalRenderSurfaceSize()
     }
 
     fun isZoomed(): Boolean = scale > 1f + EPS
@@ -162,6 +178,7 @@ internal class VideoZoomGestures(
         lastTapTime = 0L
         resetPanFilters(0f, 0f, SystemClock.uptimeMillis())
         applyToView()
+        requestOriginalRenderSurfaceSize()
     }
 
     /**
@@ -427,13 +444,46 @@ internal class VideoZoomGestures(
     }
 
     private fun applyToView() {
-        (target as? BaseMPVView)?.setZoomRenderScale(scale)
         target.pivotX = 0f
         target.pivotY = 0f
         target.scaleX = scale
         target.scaleY = scale
         target.translationX = tx.toFloat()
         target.translationY = ty.toFloat()
+    }
+
+    private fun requestOriginalRenderSurfaceSize() {
+        val player = renderTarget ?: return
+        refreshMetricsFromTarget()
+
+        if (viewWidth <= 1f || viewHeight <= 1f || videoPixelWidth <= 1 || videoPixelHeight <= 1) {
+            player.resetRenderSurfaceSize()
+            return
+        }
+
+        val c = contentRect()
+        if (c.w <= 1f || c.h <= 1f) {
+            player.resetRenderSurfaceSize()
+            return
+        }
+
+        // Do not set the buffer to raw sourceWidth x sourceHeight directly.
+        // That changes the mpv viewport aspect to the video aspect, while
+        // TextureView still stretches the whole buffer into the screen view,
+        // which looks like panscan/crop.
+        //
+        // Instead, keep the buffer aspect identical to the on-screen view,
+        // but choose its scale so the *video content rect inside it* is
+        // rendered at the original source resolution. Black-bar space is
+        // included in the buffer when needed. There is still no safety cap:
+        // the source pixels are kept 1:1 in the visible video area.
+        val scaleX = videoPixelWidth.toFloat() / c.w
+        val scaleY = videoPixelHeight.toFloat() / c.h
+        val bufferScale = max(scaleX, scaleY).coerceAtLeast(1f)
+
+        val bufferWidth = (viewWidth * bufferScale).roundToInt().coerceAtLeast(1)
+        val bufferHeight = (viewHeight * bufferScale).roundToInt().coerceAtLeast(1)
+        player.setRenderSurfaceSize(bufferWidth, bufferHeight)
     }
 
     private fun filterParamsForCurrentScale(): FilterParams {
