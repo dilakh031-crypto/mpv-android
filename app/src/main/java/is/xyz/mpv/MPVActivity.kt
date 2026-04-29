@@ -404,6 +404,13 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
             binding = PlayerBinding.inflate(layoutInflater)
             gestures = TouchGestures(this)
             zoomGestures = VideoZoomGestures(binding.player)
+            zoomGestures.onScaleChanged = { scale ->
+                try {
+                    player.refreshSurfaceSizeForCurrentMedia(scale)
+                } catch (_: Throwable) {
+                    // ignore
+                }
+            }
 
             // Do these here and not in MainActivity because mpv can be launched from a file browser.
             Utils.copyAssets(this)
@@ -1534,6 +1541,11 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
             windowManager.defaultDisplay.getRealMetrics(dm)
             gestures.setMetrics(dm.widthPixels.toFloat(), dm.heightPixels.toFloat())
             zoomGestures.setMetrics(dm.widthPixels.toFloat(), dm.heightPixels.toFloat())
+        }
+        try {
+            player.refreshSurfaceSizeForCurrentMedia(zoomGestures.currentScale(), force = true)
+        } catch (_: Throwable) {
+            // ignore
         }
 
         // Adjust control margins (only after the player UI is attached)
@@ -3067,6 +3079,13 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
         when (property) {
             "time-pos" -> updatePlaybackPos(psc.positionSec)
             "playlist-pos", "playlist-count" -> updatePlaylistButtons()
+            "video-params/w", "video-params/h" -> {
+                try {
+                    player.refreshSurfaceSizeForCurrentMedia(zoomGestures.currentScale(), force = true)
+                } catch (_: Throwable) {
+                    // ignore
+                }
+            }
         }
     }
 
@@ -3181,13 +3200,22 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
         }
 
         if (eventId == MpvEvent.MPV_EVENT_VIDEO_RECONFIG || eventId == MpvEvent.MPV_EVENT_FILE_LOADED) {
-            eventUiHandler.post { hideStartupPreview() }
+            eventUiHandler.post {
+                hideStartupPreview()
+                try {
+                    player.refreshSurfaceSizeForCurrentMedia(zoomGestures.currentScale(), force = (eventId == MpvEvent.MPV_EVENT_FILE_LOADED))
+                } catch (_: Throwable) {
+                    // ignore
+                }
+            }
         }
 
         if (eventId == MpvEvent.MPV_EVENT_START_FILE) {
             val cmds = onloadCommands.toTypedArray()
             onloadCommands.clear()
             for (c in cmds)
+                MPVLib.command(c)
+
             // Reset any view-level zoom/pan when a new file starts.
 
             // Apply orientation as early as possible for playlist items, so we don't show the wrong orientation first.
@@ -3197,18 +3225,17 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
                 if (p != null) eventUiHandler.post { try { applyOrientationFromMetadata(p) } catch (_: Throwable) {} }
             }
 
+            player.resetSurfaceSizeCache()
             zoomGestures.reset()
             try {
                 MPVLib.setPropertyDouble("video-zoom", 0.0)
                 MPVLib.setPropertyDouble("video-pan-x", 0.0)
                 MPVLib.setPropertyDouble("video-pan-y", 0.0)
+                MPVLib.setPropertyString("video-aspect-override", "-1")
                 MPVLib.setPropertyDouble("panscan", 0.0)
             } catch (_: Throwable) {
                 // ignore
             }
-
-            for (c in onloadCommands)
-                MPVLib.command(c)
 
             // Restore the user's previously chosen subtitle and audio track for this video.
             try { restoreSubtitleSelectionForCurrentFile() } catch (_: Throwable) {}
