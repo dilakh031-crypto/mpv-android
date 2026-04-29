@@ -1,17 +1,21 @@
 package `is`.xyz.mpv
 
 import android.os.SystemClock
+import android.view.Choreographer
 import android.view.MotionEvent
 import android.view.ScaleGestureDetector
 import android.view.View
 import android.view.ViewConfiguration
+import kotlin.math.abs
 import kotlin.math.hypot
+import kotlin.math.max
+import kotlin.math.min
 
 /**
  * High-FPS pinch-to-zoom + pan for mpv output.
  *
  * Design goals (Samsung-like):
- *  - 60fps/120fps zoom/pan (compositor-level by transforming the Android view)
+ *  - 60fps zoom/pan (compositor-level by transforming the Android view)
  *  - While zoomed: one-finger pan, double-tap resets, seeking disabled
  *  - Black bars (letter/pillarbox) are treated as "not part of video":
  *      * They remain visible at small zoom.
@@ -34,23 +38,107 @@ internal class VideoZoomGestures(
     private var videoAspect = 0.0
 
     private val touchSlop = ViewConfiguration.get(target.context).scaledTouchSlop.toFloat()
+    private val panStartSlop = max(1f, min(3f, touchSlop * 0.25f))
 
     // Linear scale factor (1.0 = normal)
     private var scale = 1f
+
+    // tx/ty is the currently rendered transform. targetTx/targetTy is where the
+    // finger says the video should be. Keeping the two separate lets us smooth
+    // irregular MotionEvent delivery without losing responsiveness.
     private var tx = 0f
     private var ty = 0f
+    private var targetTx = 0f
+    private var targetTy = 0f
 
     private var downX = 0f
     private var downY = 0f
+    private var lastX = 0f
+    private var lastY = 0f
     private var downTime = 0L
     private var didDrag = false
 
-    private var panFrameX = 0f
-    private var panFrameY = 0f
+    // Single-finger pan state. Panning starts with a very small zoom-specific
+    // slop instead of Android's normal tap slop; the normal slop is too large at
+    // 20x zoom and causes visible jumps/stutter during slow pans.
+    private var panFingerDown = false
+    private var panActive = false
+    private var panLastX = 0f
+    private var panLastY = 0f
+
+    // A tiny movement can start smooth panning, but it must not immediately
+    // cancel tap/double-tap recognition. Keep the tap decision separate and
+    // roll back accidental micro-pan when the gesture ends as a tap.
+    private var canBeTap = false
+    private var tapStartTx = 0f
+    private var tapStartTy = 0f
+    private var tapStartTargetTx = 0f
+    private var tapStartTargetTy = 0f
 
     private var lastTapTime = 0L
     private var lastTapX = 0f
     private var lastTapY = 0f
+
+    // Coalesce view property updates to vsync.
+    private val choreographer: Choreographer = Choreographer.getInstance()
+    private var applyScheduled = false
+    private val frameCallback = Choreographer.FrameCallback {
+        applyScheduled = false
+
+        clampTranslationToVideoContent()
+
+        // Follow the requested pan on vsync. A small easing step hides tiny
+        // input bursts/pauses that are very noticeable when the video is zoomed
+        // all the way in, especially during slow one-finger movement.
+        if (isZoomed() && !scaleDetector.isInProgress && translationNeedsSettling()) {
+            val alpha = if (panFingerDown) PAN_FOLLOW_ALPHA else PAN_SETTLE_ALPHA
+            tx += (targetTx - tx) * alpha
+            ty += (targetTy - ty) * alpha
+
+            if (abs(targetTx - tx) < SETTLE_EPS)
+                tx = targetTx
+            if (abs(targetTy - ty) < SETTLE_EPS)
+                ty = targetTy
+
+            clampTranslationToVideoContent()
+        }
+
+        applyToView()
+
+        if (isZoomed() && !scaleDetector.isInProgress && translationNeedsSettling())
+            scheduleApply()
+    }
+
+    private fun scheduleApply() {
+        if (applyScheduled) return
+        applyScheduled = true
+        choreographer.postFrameCallback(frameCallback)
+    }
+
+    private fun syncTargetToRendered() {
+        targetTx = tx
+        targetTy = ty
+    }
+
+    private fun translationNeedsSettling(): Boolean {
+        return abs(targetTx - tx) > SETTLE_EPS || abs(targetTy - ty) > SETTLE_EPS
+    }
+
+    private fun rememberTapStart() {
+        tapStartTx = tx
+        tapStartTy = ty
+        tapStartTargetTx = targetTx
+        tapStartTargetTy = targetTy
+    }
+
+    private fun restoreTapStart() {
+        tx = tapStartTx
+        ty = tapStartTy
+        targetTx = tapStartTargetTx
+        targetTy = tapStartTargetTy
+        clampTranslationToVideoContent()
+        applyToView()
+    }
 
     private val scaleDetector = ScaleGestureDetector(
         target.context,
@@ -58,6 +146,9 @@ internal class VideoZoomGestures(
             override fun onScaleBegin(detector: ScaleGestureDetector): Boolean {
                 lastTapTime = 0L
                 didDrag = true
+                canBeTap = false
+                panActive = false
+                syncTargetToRendered()
                 return true
             }
 
@@ -72,21 +163,30 @@ internal class VideoZoomGestures(
                     return true
 
                 // Keep pinch focus stable.
+                //
+                // Our transform is: screen = scale * content + translation (pivot at 0,0).
+                // To zoom around focus F (in screen coords) we must update translation as:
+                //   t' = k * t + (1 - k) * F, where k = newScale / oldScale.
+                //
+                // The old implementation used (oldScale - newScale) * F, which becomes
+                // increasingly wrong when already zoomed/panned, causing noticeable drift.
                 val fx = detector.focusX
                 val fy = detector.focusY
                 val k = newScale / oldScale
                 tx = (k * tx) + ((1f - k) * fx)
                 ty = (k * ty) + ((1f - k) * fy)
                 scale = newScale
+                syncTargetToRendered()
 
-                clampTranslationToVideoContent()
-                applyToView()
+                scheduleApply()
                 return true
             }
 
             override fun onScaleEnd(detector: ScaleGestureDetector) {
                 if (scale <= 1f + EPS)
                     reset()
+                else
+                    syncTargetToRendered()
             }
         }
     )
@@ -94,18 +194,14 @@ internal class VideoZoomGestures(
     fun setMetrics(width: Float, height: Float) {
         viewWidth = width
         viewHeight = height
-        if (isZoomed()) {
-            clampTranslationToVideoContent()
-            applyToView()
-        }
+        if (isZoomed())
+            scheduleApply()
     }
 
     fun setVideoAspect(aspect: Double?) {
         videoAspect = aspect ?: 0.0
-        if (isZoomed()) {
-            clampTranslationToVideoContent()
-            applyToView()
-        }
+        if (isZoomed())
+            scheduleApply()
     }
 
     fun isZoomed(): Boolean = scale > 1f + EPS
@@ -115,34 +211,50 @@ internal class VideoZoomGestures(
     }
 
     fun reset() {
+        if (applyScheduled) {
+            choreographer.removeFrameCallback(frameCallback)
+            applyScheduled = false
+        }
+
         scale = 1f
         tx = 0f
         ty = 0f
+        syncTargetToRendered()
         didDrag = false
+        canBeTap = false
+        panFingerDown = false
+        panActive = false
         lastTapTime = 0L
         applyToView()
     }
 
     /**
      * @return true if the event should be consumed.
+     *         While zoomed: pinch/pan/double-tap are consumed.
+     *         Single tap returns false so the Activity can toggle controls.
      */
     fun onTouchEvent(e: MotionEvent): Boolean {
         // Always feed the scale detector first.
         scaleDetector.onTouchEvent(e)
 
         // Pointer transitions during pinch:
+        // If one finger lifts and another remains down, update lastX/lastY so we don't jump.
         if (e.actionMasked == MotionEvent.ACTION_POINTER_UP && isZoomed()) {
             lastTapTime = 0L
             didDrag = true
+            canBeTap = false
+            panFingerDown = false
+            panActive = false
+            syncTargetToRendered()
             if (e.pointerCount >= 2) {
                 val upIdx = e.actionIndex
                 val remainIdx = if (upIdx == 0) 1 else 0
-                val remainX = e.getX(remainIdx)
-                val remainY = e.getY(remainIdx)
-                downX = remainX
-                downY = remainY
-                panFrameX = remainX
-                panFrameY = remainY
+                lastX = e.getX(remainIdx)
+                lastY = e.getY(remainIdx)
+                downX = lastX
+                downY = lastY
+                panLastX = lastX
+                panLastY = lastY
                 downTime = SystemClock.uptimeMillis()
             }
             return true
@@ -152,6 +264,10 @@ internal class VideoZoomGestures(
         if (e.pointerCount > 1 || scaleDetector.isInProgress) {
             lastTapTime = 0L
             didDrag = true
+            canBeTap = false
+            panFingerDown = false
+            panActive = false
+            syncTargetToRendered()
             return true
         }
 
@@ -162,44 +278,70 @@ internal class VideoZoomGestures(
             MotionEvent.ACTION_DOWN -> {
                 downX = e.x
                 downY = e.y
-                panFrameX = e.x
-                panFrameY = e.y
+                lastX = e.x
+                lastY = e.y
+                panLastX = e.x
+                panLastY = e.y
+                rememberTapStart()
+                panFingerDown = true
+                panActive = false
+                canBeTap = true
                 downTime = SystemClock.uptimeMillis()
                 didDrag = false
                 return true
             }
             MotionEvent.ACTION_MOVE -> {
-                if (!didDrag) {
-                    val dist = hypot(e.x - downX, e.y - downY)
-                    if (dist >= touchSlop) {
-                        didDrag = true
-                        // Reset frame to the current point so we don't jump by the touchSlop distance
-                        panFrameX = e.x
-                        panFrameY = e.y
-                    }
+                lastX = e.x
+                lastY = e.y
+
+                val distFromDown = hypot(e.x - downX, e.y - downY)
+                val gestureAge = SystemClock.uptimeMillis() - downTime
+
+                // Keep the original tap tolerance for tap/double-tap, even though
+                // smooth panning may begin much earlier than that. This prevents
+                // tiny finger jitter during the second tap from disabling reset.
+                if (canBeTap && (distFromDown >= touchSlop || gestureAge >= DOUBLE_TAP_TIMEOUT)) {
+                    canBeTap = false
+                    lastTapTime = 0L
                 }
 
-                if (didDrag) {
-                    if (!scaleDetector.isInProgress) {
-                        val dx = e.x - panFrameX
-                        val dy = e.y - panFrameY
-                        tx += dx
-                        ty += dy
-                        
-                        clampTranslationToVideoContent()
-                        applyToView()
+                if (!panActive) {
+                    if (distFromDown >= panStartSlop) {
+                        panActive = true
+                        didDrag = true
+                        // Apply only movement from this point forward. This avoids the
+                        // old accumulated-slop jump when a very slow drag first starts.
+                        panLastX = e.x
+                        panLastY = e.y
                     }
-                    panFrameX = e.x
-                    panFrameY = e.y
+                } else {
+                    val dx = e.x - panLastX
+                    val dy = e.y - panLastY
+                    panLastX = e.x
+                    panLastY = e.y
+
+                    if (dx != 0f || dy != 0f) {
+                        targetTx += dx
+                        targetTy += dy
+                        clampTranslationToVideoContent()
+                        scheduleApply()
+                    }
                 }
                 return true
             }
             MotionEvent.ACTION_UP -> {
                 val now = SystemClock.uptimeMillis()
-                val wasTap = !didDrag && (now - downTime) < DOUBLE_TAP_TIMEOUT
+                val moveDist = hypot(e.x - downX, e.y - downY)
+                val wasTap = canBeTap && moveDist < touchSlop && (now - downTime) < DOUBLE_TAP_TIMEOUT
+
+                panFingerDown = false
+                panActive = false
+                canBeTap = false
 
                 if (!wasTap) {
                     lastTapTime = 0L
+                    if (translationNeedsSettling())
+                        scheduleApply()
                     return true
                 }
 
@@ -212,6 +354,9 @@ internal class VideoZoomGestures(
                     return true
                 }
 
+                // This was a tap, not a pan. Undo any tiny smooth-pan movement
+                // produced by natural finger jitter before passing the tap on.
+                restoreTapStart()
                 lastTapTime = now
                 lastTapX = e.x
                 lastTapY = e.y
@@ -220,6 +365,10 @@ internal class VideoZoomGestures(
             MotionEvent.ACTION_CANCEL -> {
                 lastTapTime = 0L
                 didDrag = false
+                canBeTap = false
+                panFingerDown = false
+                panActive = false
+                syncTargetToRendered()
                 return true
             }
         }
@@ -261,34 +410,43 @@ internal class VideoZoomGestures(
         if (scale <= 1f + EPS) {
             tx = 0f
             ty = 0f
+            syncTargetToRendered()
             return
         }
 
         val c = contentRect()
 
         // Clamp independently per axis.
+        // Use the transformed content rect (not the transformed whole view) so black bars are never "pan space".
         val contentWScaled = scale * c.w
         val contentHScaled = scale * c.h
 
-        // X axis
-        tx = if (contentWScaled <= viewWidth + EPS) {
-            // Content smaller than viewport: keep it centered
-            ((viewWidth - contentWScaled) * 0.5f) - scale * c.ox
-        } else {
-            val minTx = viewWidth - scale * (c.ox + c.w)
-            val maxTx = -scale * c.ox
-            tx.coerceIn(minTx, maxTx)
+        fun clampX(value: Float): Float {
+            return if (contentWScaled <= viewWidth + EPS) {
+                // Content smaller than viewport: keep it centered (no horizontal panning)
+                ((viewWidth - contentWScaled) * 0.5f) - scale * c.ox
+            } else {
+                val minTx = viewWidth - scale * (c.ox + c.w)
+                val maxTx = -scale * c.ox
+                value.coerceIn(minTx, maxTx)
+            }
         }
 
-        // Y axis
-        ty = if (contentHScaled <= viewHeight + EPS) {
-            // Content smaller than viewport: keep it centered
-            ((viewHeight - contentHScaled) * 0.5f) - scale * c.oy
-        } else {
-            val minTy = viewHeight - scale * (c.oy + c.h)
-            val maxTy = -scale * c.oy
-            ty.coerceIn(minTy, maxTy)
+        fun clampY(value: Float): Float {
+            return if (contentHScaled <= viewHeight + EPS) {
+                // Content smaller than viewport: keep it centered (no vertical panning)
+                ((viewHeight - contentHScaled) * 0.5f) - scale * c.oy
+            } else {
+                val minTy = viewHeight - scale * (c.oy + c.h)
+                val maxTy = -scale * c.oy
+                value.coerceIn(minTy, maxTy)
+            }
         }
+
+        tx = clampX(tx)
+        targetTx = clampX(targetTx)
+        ty = clampY(ty)
+        targetTy = clampY(targetTy)
     }
 
     private fun applyToView() {
@@ -304,8 +462,12 @@ internal class VideoZoomGestures(
 
     companion object {
         private const val EPS = 0.001f
+        private const val SETTLE_EPS = 0.01f
         private const val MIN_SCALE = 1f
+        // Increased maximum zoom from 6x to 20x.
         private const val MAX_SCALE = 20f
+        private const val PAN_FOLLOW_ALPHA = 0.72f
+        private const val PAN_SETTLE_ALPHA = 0.86f
         private const val DOUBLE_TAP_TIMEOUT = 300L
     }
 }
