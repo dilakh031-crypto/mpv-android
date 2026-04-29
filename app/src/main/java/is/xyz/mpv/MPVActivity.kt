@@ -355,8 +355,27 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
             val handledByZoom = zoomGestures.onTouchEvent(e)
 
             when {
-                blockDefault -> handledByZoom
-                else -> gestures.onTouchEvent(e)
+                !blockDefault -> gestures.onTouchEvent(e)
+
+                // While zoomed, still give TouchGestures ACTION_DOWN so a
+                // later tap-UP can toggle controls. Do not cancel it on tiny
+                // micro-moves; cancel only after a real zoom pan/pinch starts.
+                e.actionMasked == MotionEvent.ACTION_DOWN -> {
+                    gestures.onTouchEvent(e)
+                    true
+                }
+
+                // VideoZoomGestures returns false only for a valid single tap
+                // while zoomed. Forward ACTION_UP to normal gestures to show
+                // or hide the playback controls.
+                !handledByZoom -> gestures.onTouchEvent(e)
+
+                zoomGestures.shouldCancelOtherGestures() -> {
+                    gestures.cancel()
+                    true
+                }
+
+                else -> true
             }
         }
 
