@@ -12,7 +12,7 @@ import kotlin.math.hypot
  * High-FPS pinch-to-zoom + pan for mpv output.
  *
  * Design goals (Samsung-like):
- *  - 60fps zoom/pan (using mpv's native video-zoom and video-pan properties to retain full source resolution)
+ *  - 60fps zoom/pan (compositor-level by transforming the Android view)
  *  - While zoomed: one-finger pan, double-tap resets, seeking disabled
  *  - Black bars (letter/pillarbox) are treated as "not part of video":
  *      * They remain visible at small zoom.
@@ -110,6 +110,9 @@ internal class VideoZoomGestures(
                 // Our transform is: screen = scale * content + translation (pivot at 0,0).
                 // To zoom around focus F (in screen coords) we must update translation as:
                 //   t' = k * t + (1 - k) * F, where k = newScale / oldScale.
+                //
+                // The old implementation used (oldScale - newScale) * F, which becomes
+                // increasingly wrong when already zoomed/panned, causing noticeable drift.
                 val fx = detector.focusX
                 val fy = detector.focusY
                 val k = newScale / oldScale
@@ -159,15 +162,6 @@ internal class VideoZoomGestures(
         didDrag = false
         panFingerDown = false
         lastTapTime = 0L
-
-        // Clear any previous View-level transformations in case they were altered.
-        target.pivotX = 0f
-        target.pivotY = 0f
-        target.scaleX = 1f
-        target.scaleY = 1f
-        target.translationX = 0f
-        target.translationY = 0f
-
         applyToView()
     }
 
@@ -349,20 +343,12 @@ internal class VideoZoomGestures(
     }
 
     private fun applyToView() {
-        if (viewWidth <= 1f || viewHeight <= 1f) return
-
-        try {
-            // Use mpv native properties to retain full resolution
-            val zoom = kotlin.math.log2(scale.toDouble())
-            val panX = (scale - 1f) / 2f + tx / viewWidth
-            val panY = (scale - 1f) / 2f + ty / viewHeight
-
-            MPVLib.setPropertyDouble("video-zoom", zoom)
-            MPVLib.setPropertyDouble("video-pan-x", panX.toDouble())
-            MPVLib.setPropertyDouble("video-pan-y", panY.toDouble())
-        } catch (e: Exception) {
-            // Ignore if setting property fails
-        }
+        target.pivotX = 0f
+        target.pivotY = 0f
+        target.scaleX = scale
+        target.scaleY = scale
+        target.translationX = tx
+        target.translationY = ty
     }
 
     private data class ContentRect(val ox: Float, val oy: Float, val w: Float, val h: Float)

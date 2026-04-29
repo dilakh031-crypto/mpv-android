@@ -1535,6 +1535,7 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
             gestures.setMetrics(dm.widthPixels.toFloat(), dm.heightPixels.toFloat())
             zoomGestures.setMetrics(dm.widthPixels.toFloat(), dm.heightPixels.toFloat())
         }
+        player.refreshSurfaceSizeForCurrentMedia()
 
         // Adjust control margins (only after the player UI is attached)
         if (uiInitialized) {
@@ -3067,6 +3068,7 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
         when (property) {
             "time-pos" -> updatePlaybackPos(psc.positionSec)
             "playlist-pos", "playlist-count" -> updatePlaylistButtons()
+            "video-params/w", "video-params/h" -> player.refreshSurfaceSizeForCurrentMedia()
         }
     }
 
@@ -3078,6 +3080,9 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
                 updateOrientation()
                 updatePiPParams()
                 zoomGestures.setVideoAspect(player.getVideoAspect())
+            }
+            "current-tracks/video/image" -> {
+                player.refreshSurfaceSizeForCurrentMedia()
             }
         }
     }
@@ -3181,7 +3186,10 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
         }
 
         if (eventId == MpvEvent.MPV_EVENT_VIDEO_RECONFIG || eventId == MpvEvent.MPV_EVENT_FILE_LOADED) {
-            eventUiHandler.post { hideStartupPreview() }
+            eventUiHandler.post {
+                hideStartupPreview()
+                player.refreshSurfaceSizeForCurrentMedia()
+            }
         }
 
         if (eventId == MpvEvent.MPV_EVENT_START_FILE) {

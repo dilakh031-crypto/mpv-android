@@ -9,6 +9,10 @@ import android.view.SurfaceView
 // Contains only the essential code needed to get a picture on the screen
 
 abstract class BaseMPVView(context: Context, attrs: AttributeSet) : SurfaceView(context, attrs), SurfaceHolder.Callback {
+    private var baseSurfaceWidth = 0
+    private var baseSurfaceHeight = 0
+    private var appliedSurfaceWidth = 0
+    private var appliedSurfaceHeight = 0
     /**
      * Initialize libmpv.
      *
@@ -74,10 +78,40 @@ abstract class BaseMPVView(context: Context, attrs: AttributeSet) : SurfaceView(
         MPVLib.setOptionString("vo", vo)
     }
 
+
+    protected open fun onSurfaceSizeChanged(width: Int, height: Int) {
+        // Default no-op.
+    }
+
+    protected fun setAndroidSurfaceSize(width: Int, height: Int) {
+        if (width <= 0 || height <= 0)
+            return
+        if (appliedSurfaceWidth == width && appliedSurfaceHeight == height)
+            return
+        appliedSurfaceWidth = width
+        appliedSurfaceHeight = height
+        MPVLib.setPropertyString("android-surface-size", "${width}x$height")
+    }
+
+    protected fun setBaseSurfaceSize(width: Int, height: Int) {
+        if (width <= 0 || height <= 0)
+            return
+        baseSurfaceWidth = width
+        baseSurfaceHeight = height
+        setAndroidSurfaceSize(width, height)
+    }
+
+    protected fun currentBaseSurfaceSize(): Pair<Int, Int>? {
+        if (baseSurfaceWidth <= 0 || baseSurfaceHeight <= 0)
+            return null
+        return Pair(baseSurfaceWidth, baseSurfaceHeight)
+    }
+
     // Surface callbacks
 
     override fun surfaceChanged(holder: SurfaceHolder, format: Int, width: Int, height: Int) {
-        MPVLib.setPropertyString("android-surface-size", "${width}x$height")
+        setBaseSurfaceSize(width, height)
+        onSurfaceSizeChanged(width, height)
     }
 
     override fun surfaceCreated(holder: SurfaceHolder) {
