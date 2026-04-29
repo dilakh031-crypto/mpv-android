@@ -3187,8 +3187,8 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
         if (eventId == MpvEvent.MPV_EVENT_START_FILE) {
             val cmds = onloadCommands.toTypedArray()
             onloadCommands.clear()
-            for (c in cmds)
-            // Reset any view-level zoom/pan when a new file starts.
+
+            // Reset mpv-side zoom/pan when a new file starts.
 
             // Apply orientation as early as possible for playlist items, so we don't show the wrong orientation first.
             // Must run on the UI thread.
@@ -3197,7 +3197,7 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
                 if (p != null) eventUiHandler.post { try { applyOrientationFromMetadata(p) } catch (_: Throwable) {} }
             }
 
-            zoomGestures.reset()
+            eventUiHandler.post { zoomGestures.reset() }
             try {
                 MPVLib.setPropertyDouble("video-zoom", 0.0)
                 MPVLib.setPropertyDouble("video-pan-x", 0.0)
@@ -3207,7 +3207,7 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
                 // ignore
             }
 
-            for (c in onloadCommands)
+            for (c in cmds)
                 MPVLib.command(c)
 
             // Restore the user's previously chosen subtitle and audio track for this video.

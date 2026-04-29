@@ -7,23 +7,24 @@ import android.view.ScaleGestureDetector
 import android.view.View
 import android.view.ViewConfiguration
 import kotlin.math.hypot
+import kotlin.math.ln
 
 /**
  * High-FPS pinch-to-zoom + pan for mpv output.
  *
- * Design goals (Samsung-like):
- *  - 60fps zoom/pan (compositor-level by transforming the Android view)
- *  - While zoomed: one-finger pan, double-tap resets, seeking disabled
- *  - Black bars (letter/pillarbox) are treated as "not part of video":
- *      * They remain visible at small zoom.
- *      * They disappear naturally once the zoom reaches the point where the
- *        video content fills the viewport.
- *      * Panning is clamped to the *video content rect*, not the whole view,
- *        so you can't pan into the black bars.
+ * The important detail is that zoom is applied inside mpv with video-zoom/video-pan-x/y,
+ * not by scaling the Android SurfaceView. Scaling the SurfaceView only enlarges the
+ * already-rendered screen-sized frame, which makes high-resolution images look pixelated
+ * at large zoom levels. mpv-side zoom renders the selected part of the original frame
+ * directly into the screen surface.
+ *
+ * Design goals:
+ *  - Coalesce pinch/pan changes to vsync for smooth touch tracking.
+ *  - While zoomed: one-finger pan, double-tap resets, seeking disabled.
+ *  - Clamp panning to the video content rect so black bars are never pan space.
  *
  * IMPORTANT:
- *  - Touch input must come from an UNTRANSFORMED overlay view (gesture layer),
- *    not from the transformed video view itself.
+ *  - Touch input must come from an untransformed overlay view (gestureLayer).
  */
 internal class VideoZoomGestures(
     private val target: View,
@@ -36,7 +37,7 @@ internal class VideoZoomGestures(
 
     private val touchSlop = ViewConfiguration.get(target.context).scaledTouchSlop.toFloat()
 
-    // Linear scale factor (1.0 = normal)
+    // Linear scale factor (1.0 = normal). mpv video-zoom is log2(scale), computed at apply time.
     private var scale = 1f
     private var tx = 0f
     private var ty = 0f
@@ -60,7 +61,11 @@ internal class VideoZoomGestures(
     private var lastTapX = 0f
     private var lastTapY = 0f
 
-    // Coalesce view property updates to vsync.
+    private var lastAppliedZoom = Double.NaN
+    private var lastAppliedPanX = Double.NaN
+    private var lastAppliedPanY = Double.NaN
+
+    // Coalesce mpv property updates to vsync.
     private val choreographer: Choreographer = Choreographer.getInstance()
     private var applyScheduled = false
     private val frameCallback = Choreographer.FrameCallback {
@@ -77,7 +82,7 @@ internal class VideoZoomGestures(
         }
 
         clampTranslationToVideoContent()
-        applyToView()
+        applyToMpv()
     }
 
     private fun scheduleApply() {
@@ -107,12 +112,10 @@ internal class VideoZoomGestures(
 
                 // Keep pinch focus stable.
                 //
-                // Our transform is: screen = scale * content + translation (pivot at 0,0).
-                // To zoom around focus F (in screen coords) we must update translation as:
+                // Our logical transform is: screen = scale * content + translation (pivot at 0,0).
+                // To zoom around focus F (in screen coords) update translation as:
                 //   t' = k * t + (1 - k) * F, where k = newScale / oldScale.
-                //
-                // The old implementation used (oldScale - newScale) * F, which becomes
-                // increasingly wrong when already zoomed/panned, causing noticeable drift.
+                // This logical transform is then converted to mpv's video-zoom/video-pan-x/y.
                 val fx = detector.focusX
                 val fy = detector.focusY
                 val k = newScale / oldScale
@@ -162,7 +165,7 @@ internal class VideoZoomGestures(
         didDrag = false
         panFingerDown = false
         lastTapTime = 0L
-        applyToView()
+        applyToMpv(force = true)
     }
 
     /**
@@ -309,6 +312,7 @@ internal class VideoZoomGestures(
             return
 
         if (scale <= 1f + EPS) {
+            scale = 1f
             tx = 0f
             ty = 0f
             return
@@ -342,22 +346,74 @@ internal class VideoZoomGestures(
         }
     }
 
-    private fun applyToView() {
+    private fun applyToMpv(force: Boolean = false) {
+        // Keep the Android surface unscaled. All zoom happens in mpv so source pixels are preserved.
         target.pivotX = 0f
         target.pivotY = 0f
-        target.scaleX = scale
-        target.scaleY = scale
-        target.translationX = tx
-        target.translationY = ty
+        target.scaleX = 1f
+        target.scaleY = 1f
+        target.translationX = 0f
+        target.translationY = 0f
+
+        val c = contentRect()
+        val safeScale = scale.coerceAtLeast(MIN_SCALE)
+        val zoom = if (safeScale <= 1f + EPS) 0.0 else log2(safeScale.toDouble())
+
+        var panX = 0.0
+        var panY = 0.0
+
+        if (safeScale > 1f + EPS && c.w > 1f && c.h > 1f) {
+            // Desired transformed content rect from the gesture model.
+            val desiredLeft = safeScale * c.ox + tx
+            val desiredTop = safeScale * c.oy + ty
+
+            // mpv first centers the zoomed video, then applies pan as a fraction of the
+            // scaled video dimensions. Convert from desired pixel displacement to mpv units.
+            val centeredLeft = (viewWidth - safeScale * c.w) * 0.5f
+            val centeredTop = (viewHeight - safeScale * c.h) * 0.5f
+            panX = ((desiredLeft - centeredLeft) / (safeScale * c.w)).toDouble()
+            panY = ((desiredTop - centeredTop) / (safeScale * c.h)).toDouble()
+        }
+
+        setMpvDouble("video-zoom", zoom, force)
+        setMpvDouble("video-pan-x", panX, force)
+        setMpvDouble("video-pan-y", panY, force)
     }
+
+    private fun setMpvDouble(property: String, value: Double, force: Boolean) {
+        val previous = when (property) {
+            "video-zoom" -> lastAppliedZoom
+            "video-pan-x" -> lastAppliedPanX
+            "video-pan-y" -> lastAppliedPanY
+            else -> Double.NaN
+        }
+
+        if (!force && !previous.isNaN() && kotlin.math.abs(previous - value) < APPLY_EPS)
+            return
+
+        try {
+            MPVLib.setPropertyDouble(property, value)
+            when (property) {
+                "video-zoom" -> lastAppliedZoom = value
+                "video-pan-x" -> lastAppliedPanX = value
+                "video-pan-y" -> lastAppliedPanY = value
+            }
+        } catch (_: Throwable) {
+            // mpv may not be initialized yet during early Activity setup.
+        }
+    }
+
+    private fun log2(value: Double): Double = ln(value) / LN_2
 
     private data class ContentRect(val ox: Float, val oy: Float, val w: Float, val h: Float)
 
     companion object {
         private const val EPS = 0.001f
+        private const val APPLY_EPS = 0.00001
         private const val MIN_SCALE = 1f
-        // Increased maximum zoom from 6x to 20x.
+        // Enough for deep inspection of 4K/6K images without forcing users into coarse jumps.
         private const val MAX_SCALE = 20f
         private const val DOUBLE_TAP_TIMEOUT = 300L
+        private const val LN_2 = 0.6931471805599453
     }
 }
