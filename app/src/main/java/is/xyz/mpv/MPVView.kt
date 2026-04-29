@@ -305,12 +305,6 @@ internal class MPVView(context: Context, attrs: AttributeSet) : BaseMPVView(cont
         get() = MPVLib.getPropertyDouble("secondary-sub-delay")
         set(speed) = MPVLib.setPropertyDouble("secondary-sub-delay", speed!!)
 
-    val subVisibility: Boolean
-        get() = MPVLib.getPropertyBoolean("sub-visibility") != false
-
-    val secondarySubVisibility: Boolean
-        get() = MPVLib.getPropertyBoolean("secondary-sub-visibility") != false
-
     val estimatedVfFps: Double?
         get() = MPVLib.getPropertyDouble("estimated-vf-fps")
 

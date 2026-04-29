@@ -52,8 +52,8 @@ internal class SubTrackDialog(private val player: MPVView) {
     fun refresh() {
         tracks = player.tracks.getValue(TRACK_TYPE)
 
-        val sidNow = if (player.subVisibility) player.sid else -1
-        val sid2Now = if (player.secondarySubVisibility) player.secondarySid else -1
+        val sidNow = player.sid
+        val sid2Now = player.secondarySid
 
         // Prefer pending values (set by clicks) until mpv reflects them, then clear.
         selectedMpvId = pendingMpvId?.let {
