@@ -73,14 +73,6 @@ internal class VideoZoomGestures(
 
     private var currentRenderSurfaceScale = 1f
     private var renderResizeGeneration = 0
-    private var renderResizeRunnable: Runnable? = null
-
-    // Keep our own pinch state instead of trusting ScaleGestureDetector.isInProgress
-    // for routing taps. If Android/mpv interrupts a pointer stream while reopening a
-    // file, ScaleGestureDetector can keep reporting an in-progress scale until it
-    // receives a complete DOWN..UP/CANCEL stream. A stale value here makes the
-    // overlay consume ordinary single taps, so the player controls never toggle.
-    private var pinchActive = false
 
 
     // Coalesce view property updates to vsync. We do not animate here; we only avoid
@@ -93,79 +85,67 @@ internal class VideoZoomGestures(
         applyToView()
     }
 
-    private var scaleDetector = createScaleDetector()
+    private val scaleDetector = ScaleGestureDetector(
+        target.context,
+        object : ScaleGestureDetector.SimpleOnScaleGestureListener() {
+            override fun onScaleBegin(detector: ScaleGestureDetector): Boolean {
+                lastTapTime = 0L
+                panActive = false
+                canBeTap = false
 
-    private fun createScaleDetector(): ScaleGestureDetector {
-        return ScaleGestureDetector(
-            target.context,
-            object : ScaleGestureDetector.SimpleOnScaleGestureListener() {
-                override fun onScaleBegin(detector: ScaleGestureDetector): Boolean {
-                    pinchActive = true
-                    lastTapTime = 0L
-                    panActive = false
-                    canBeTap = false
+                // Do not resize the SurfaceTexture while fingers are actively
+                // pinching. Reallocating the mpv/TextureView buffer during the
+                // gesture is what makes zoom feel choppy and can disturb normal
+                // tap/control handling. We keep the current buffer during the
+                // live gesture and update it once the zoom settles.
+                renderResizeGeneration++
 
-                    // Do not resize the SurfaceTexture while fingers are actively
-                    // pinching. Reallocating the mpv/TextureView buffer during the
-                    // gesture is what makes zoom feel choppy and can disturb normal
-                    // tap/control handling. We keep the current buffer during the
-                    // live gesture and update it once the zoom settles.
-                    cancelScheduledRenderSurfaceResize()
+                resetPanFilters(detector.focusX, detector.focusY, SystemClock.uptimeMillis())
+                return true
+            }
 
-                    resetPanFilters(detector.focusX, detector.focusY, SystemClock.uptimeMillis())
+            override fun onScale(detector: ScaleGestureDetector): Boolean {
+                refreshMetricsFromTarget()
+                if (viewWidth <= 1f || viewHeight <= 1f)
                     return true
-                }
 
-                override fun onScale(detector: ScaleGestureDetector): Boolean {
-                    pinchActive = true
-                    refreshMetricsFromTarget()
-                    if (viewWidth <= 1f || viewHeight <= 1f)
-                        return true
-
-                    val oldScale = scale
-                    val requested = oldScale * detector.scaleFactor
-                    val newScale = requested.coerceIn(MIN_SCALE, MAX_SCALE)
-                    if (newScale == oldScale)
-                        return true
-
-                    // Keep pinch focus stable.
-                    // transform: screen = scale * content + translation
-                    val fx = detector.focusX.toDouble()
-                    val fy = detector.focusY.toDouble()
-                    val k = (newScale / oldScale).toDouble()
-                    tx = (k * tx) + ((1.0 - k) * fx)
-                    ty = (k * ty) + ((1.0 - k) * fy)
-                    scale = newScale
-
-                    clampTranslationToVideoContent()
-                    resetPanFilters(detector.focusX, detector.focusY, SystemClock.uptimeMillis())
-                    scheduleApply()
+                val oldScale = scale
+                val requested = oldScale * detector.scaleFactor
+                val newScale = requested.coerceIn(MIN_SCALE, MAX_SCALE)
+                if (newScale == oldScale)
                     return true
-                }
 
-                override fun onScaleEnd(detector: ScaleGestureDetector) {
-                    pinchActive = false
-                    if (scale <= 1f + EPS)
-                        reset()
-                    else {
-                        resetPanFilters(detector.focusX, detector.focusY, SystemClock.uptimeMillis())
-                        scheduleRenderSurfaceResize()
-                    }
+                // Keep pinch focus stable.
+                // transform: screen = scale * content + translation
+                val fx = detector.focusX.toDouble()
+                val fy = detector.focusY.toDouble()
+                val k = (newScale / oldScale).toDouble()
+                tx = (k * tx) + ((1.0 - k) * fx)
+                ty = (k * ty) + ((1.0 - k) * fy)
+                scale = newScale
+
+                clampTranslationToVideoContent()
+                resetPanFilters(detector.focusX, detector.focusY, SystemClock.uptimeMillis())
+                scheduleApply()
+                return true
+            }
+
+            override fun onScaleEnd(detector: ScaleGestureDetector) {
+                if (scale <= 1f + EPS)
+                    reset()
+                else {
+                    resetPanFilters(detector.focusX, detector.focusY, SystemClock.uptimeMillis())
+                    scheduleRenderSurfaceResize()
                 }
             }
-        ).apply {
-            // mpv-android already has its own double-tap gestures. Android's
-            // quick-scale (double-tap then drag) can create a one-finger scale
-            // stream that competes with tap-to-toggle and double-tap-to-reset.
-            isQuickScaleEnabled = false
         }
-    }
+    )
 
     fun setMetrics(width: Float, height: Float) {
         viewWidth = width
         viewHeight = height
         refreshMetricsFromTarget()
-        if (isZoomed() || pinchActive) {
+        if (isZoomed() || scaleDetector.isInProgress) {
             clampTranslationToVideoContent()
             scheduleRenderSurfaceResize(delayMs = 0L)
             scheduleApply()
@@ -176,7 +156,7 @@ internal class VideoZoomGestures(
 
     fun setVideoAspect(aspect: Double?) {
         videoAspect = aspect ?: 0.0
-        if (isZoomed() || pinchActive) {
+        if (isZoomed() || scaleDetector.isInProgress) {
             clampTranslationToVideoContent()
             scheduleRenderSurfaceResize(delayMs = 0L)
             scheduleApply()
@@ -186,7 +166,7 @@ internal class VideoZoomGestures(
     fun setVideoPixelSize(size: Pair<Int, Int>?) {
         videoPixelWidth = size?.first ?: 0
         videoPixelHeight = size?.second ?: 0
-        if (isZoomed() || pinchActive)
+        if (isZoomed() || scaleDetector.isInProgress)
             scheduleRenderSurfaceResize(delayMs = 0L)
         else
             requestBaseRenderSurfaceSize(force = true)
@@ -195,13 +175,7 @@ internal class VideoZoomGestures(
     fun isZoomed(): Boolean = scale > 1f + EPS
 
     fun shouldBlockOtherGestures(e: MotionEvent): Boolean {
-        // Routing must be conservative for normal taps. Only block the default
-        // mpv-android gesture layer when there is real zoom state or a real
-        // multi-pointer stream. Never let a stale ScaleGestureDetector flag eat
-        // single taps while unzoomed.
-        if (!isZoomed() && e.pointerCount == 1 && e.actionMasked == MotionEvent.ACTION_DOWN)
-            return false
-        return isZoomed() || pinchActive || e.pointerCount > 1
+        return isZoomed() || e.pointerCount > 1
     }
 
     fun reset() {
@@ -209,13 +183,6 @@ internal class VideoZoomGestures(
             choreographer.removeFrameCallback(frameCallback)
             applyScheduled = false
         }
-        cancelScheduledRenderSurfaceResize()
-
-        // Reset every touch-routing flag as well as the detector itself. This
-        // protects the controls from a stale in-progress pinch state after
-        // file/activity transitions, surface reconfiguration, or ACTION_CANCEL.
-        pinchActive = false
-        scaleDetector = createScaleDetector()
 
         scale = 1f
         tx = 0.0
@@ -244,21 +211,9 @@ internal class VideoZoomGestures(
         // Always feed the scale detector first.
         scaleDetector.onTouchEvent(e)
 
-        // Defensive recovery: if we receive a normal single-finger DOWN while
-        // unzoomed, the zoom layer must not remain in a stale pinch state from a
-        // previous file/surface lifecycle. Recreate the detector and replay this
-        // DOWN so future multi-touch still receives a complete stream.
-        if (e.actionMasked == MotionEvent.ACTION_DOWN && e.pointerCount == 1 && !isZoomed() && pinchActive) {
-            pinchActive = false
-            scaleDetector = createScaleDetector()
-            scaleDetector.onTouchEvent(e)
-        }
-
         // Pointer transitions during pinch:
         // If one finger lifts and another remains down, rebase pan input so there is no jump.
         if (e.actionMasked == MotionEvent.ACTION_POINTER_UP && isZoomed()) {
-            if (e.pointerCount - 1 <= 1)
-                pinchActive = false
             lastTapTime = 0L
             panFingerDown = false
             panActive = false
@@ -280,29 +235,8 @@ internal class VideoZoomGestures(
             return true
         }
 
-        if ((e.actionMasked == MotionEvent.ACTION_UP || e.actionMasked == MotionEvent.ACTION_CANCEL) && pinchActive) {
-            pinchActive = false
-            panFingerDown = false
-            panActive = false
-            canBeTap = false
-            lastTapTime = 0L
-
-            if (e.actionMasked == MotionEvent.ACTION_CANCEL)
-                scaleDetector = createScaleDetector()
-
-            if (scale <= 1f + EPS)
-                reset()
-            else
-                scheduleRenderSurfaceResize()
-
-            return true
-        }
-
         // Multi-touch, or an active pinch, is handled only by ScaleGestureDetector.
-        // Use pinchActive instead of scaleDetector.isInProgress: the detector is
-        // deliberately not allowed to route/consume normal one-finger taps when
-        // our own state says no pinch is active.
-        if (e.pointerCount > 1 || pinchActive) {
+        if (e.pointerCount > 1 || scaleDetector.isInProgress) {
             lastTapTime = 0L
             panFingerDown = false
             panActive = false
@@ -351,7 +285,6 @@ internal class VideoZoomGestures(
             }
 
             MotionEvent.ACTION_UP -> {
-                pinchActive = false
                 val now = SystemClock.uptimeMillis()
                 val moveDist = hypot(e.x - downX, e.y - downY)
                 val wasTap = canBeTap && moveDist < touchSlop && (now - downTime) < DOUBLE_TAP_TIMEOUT
@@ -390,8 +323,6 @@ internal class VideoZoomGestures(
             }
 
             MotionEvent.ACTION_CANCEL -> {
-                pinchActive = false
-                scaleDetector = createScaleDetector()
                 lastTapTime = 0L
                 panFingerDown = false
                 panActive = false
@@ -549,23 +480,12 @@ internal class VideoZoomGestures(
         player.resetRenderSurfaceSize()
     }
 
-    private fun cancelScheduledRenderSurfaceResize() {
-        renderResizeGeneration++
-        renderResizeRunnable?.let { target.removeCallbacks(it) }
-        renderResizeRunnable = null
-    }
-
     private fun scheduleRenderSurfaceResize(delayMs: Long = RENDER_RESIZE_AFTER_GESTURE_MS) {
-        renderResizeRunnable?.let { target.removeCallbacks(it) }
         val generation = ++renderResizeGeneration
-        val task = Runnable {
+        target.postDelayed({
             if (generation == renderResizeGeneration)
                 requestRenderSurfaceSizeForCurrentZoom()
-            if (generation == renderResizeGeneration)
-                renderResizeRunnable = null
-        }
-        renderResizeRunnable = task
-        target.postDelayed(task, delayMs)
+        }, delayMs)
     }
 
     private fun requestRenderSurfaceSizeForCurrentZoom() {
@@ -577,7 +497,7 @@ internal class VideoZoomGestures(
             return
         }
 
-        if (!isZoomed() || pinchActive) {
+        if (!isZoomed() || scaleDetector.isInProgress) {
             requestBaseRenderSurfaceSize(force = true)
             return
         }
