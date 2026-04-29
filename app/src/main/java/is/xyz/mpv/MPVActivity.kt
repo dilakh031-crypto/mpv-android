@@ -403,7 +403,17 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
             // Prepare binding/gestures early so onConfigurationChanged is safe even if we change orientation immediately.
             binding = PlayerBinding.inflate(layoutInflater)
             gestures = TouchGestures(this)
-            zoomGestures = VideoZoomGestures(binding.player)
+            zoomGestures = VideoZoomGestures(binding.player) { zoom, panX, panY ->
+                // Drive zoom/pan through mpv so it re-renders from source pixels,
+                // giving crisp detail even on 4K/6K images at maximum zoom.
+                try {
+                    MPVLib.setPropertyDouble("video-zoom",  zoom)
+                    MPVLib.setPropertyDouble("video-pan-x", panX)
+                    MPVLib.setPropertyDouble("video-pan-y", panY)
+                } catch (_: Throwable) {
+                    // mpv not ready yet; ignore
+                }
+            }
 
             // Do these here and not in MainActivity because mpv can be launched from a file browser.
             Utils.copyAssets(this)
