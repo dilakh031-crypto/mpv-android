@@ -175,7 +175,38 @@ internal class VideoZoomGestures(
     fun isZoomed(): Boolean = scale > 1f + EPS
 
     fun shouldBlockOtherGestures(e: MotionEvent): Boolean {
-        return isZoomed() || e.pointerCount > 1
+        if (e.pointerCount > 1)
+            return true
+
+        if (!isZoomed())
+            return false
+
+        // While zoomed, let a real single tap pass through to MPVActivity so it can
+        // toggle the video controls. Still block drags/pans and the second tap of a
+        // double-tap, because double-tap while zoomed belongs to zoom reset.
+        when (e.actionMasked) {
+            MotionEvent.ACTION_DOWN -> {
+                val dt = SystemClock.uptimeMillis() - lastTapTime
+                val dist = hypot(e.x - lastTapX, e.y - lastTapY)
+                return lastTapTime != 0L && dt < DOUBLE_TAP_TIMEOUT && dist < touchSlop * 3f
+            }
+            MotionEvent.ACTION_MOVE -> {
+                return hypot(e.x - downX, e.y - downY) >= touchSlop
+            }
+            MotionEvent.ACTION_UP -> {
+                val now = SystemClock.uptimeMillis()
+                val moveDist = hypot(e.x - downX, e.y - downY)
+                val isTap = canBeTap && moveDist < touchSlop && (now - downTime) < DOUBLE_TAP_TIMEOUT
+                if (!isTap)
+                    return true
+
+                val dt = now - lastTapTime
+                val dist = hypot(e.x - lastTapX, e.y - lastTapY)
+                return lastTapTime != 0L && dt < DOUBLE_TAP_TIMEOUT && dist < touchSlop * 3f
+            }
+        }
+
+        return true
     }
 
     fun reset() {
