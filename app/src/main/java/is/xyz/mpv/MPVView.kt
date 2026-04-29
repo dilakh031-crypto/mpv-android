@@ -16,18 +16,8 @@ import `is`.xyz.mpv.MPVLib.MpvFormat.MPV_FORMAT_STRING
 import kotlin.reflect.KProperty
 
 internal class MPVView(context: Context, attrs: AttributeSet) : BaseMPVView(context, attrs) {
-    // These flags let us improve still-image downscaling only when the user has
-    // not explicitly selected scaler settings in Preferences.
-    private var userSetScale = false
-    private var userSetDscale = false
-    private var userSetCscale = false
-    private var usingStillImageScalerProfile = false
-
     override fun initOptions() {
         val sharedPreferences = PreferenceManager.getDefaultSharedPreferences(context)
-        userSetScale = !sharedPreferences.getString("video_scale", "").isNullOrBlank()
-        userSetDscale = !sharedPreferences.getString("video_downscale", "").isNullOrBlank()
-        userSetCscale = false
 
         // apply phone-optimized defaults
         MPVLib.setOptionString("profile", "fast")
@@ -82,6 +72,9 @@ internal class MPVView(context: Context, attrs: AttributeSet) : BaseMPVView(cont
                 MPVLib.setOptionString(mpvOption, preference)
         }
 
+
+        applyScanSafeDownscalingDefaults(sharedPreferences)
+
         val debandMode = sharedPreferences.getString("video_debanding", "")
         if (debandMode == "gradfun") {
             // lower the default radius (16) to improve performance
@@ -125,73 +118,27 @@ internal class MPVView(context: Context, attrs: AttributeSet) : BaseMPVView(cont
         MPVLib.setOptionString("vd-lavc-film-grain", "cpu")
     }
 
+    private fun applyScanSafeDownscalingDefaults(sharedPreferences: android.content.SharedPreferences) {
+        if (sharedPreferences.getString("video_downscale", "").isNullOrBlank()) {
+            MPVLib.setOptionString("dscale", "mitchell")
+            MPVLib.setOptionString("dscale-antiring", "0.75")
+        }
+
+        if (sharedPreferences.getString("video_scale", "").isNullOrBlank()) {
+            MPVLib.setOptionString("scale", "spline36")
+            MPVLib.setOptionString("scale-antiring", "0.60")
+        }
+
+        MPVLib.setOptionString("cscale", "mitchell")
+        MPVLib.setOptionString("cscale-antiring", "0.75")
+        MPVLib.setOptionString("correct-downscaling", "yes")
+        MPVLib.setOptionString("linear-downscaling", "yes")
+        MPVLib.setOptionString("dither-depth", "auto")
+    }
+
     override fun postInitOptions() {
         // we need to call write-watch-later manually
         MPVLib.setOptionString("save-position-on-quit", "no")
-    }
-
-    /**
-     * The original mpv-android profile is tuned for speed. On low-resolution
-     * screens, very high-resolution still images with halftone/scan dots can
-     * alias during downscaling and show coloured ghost/moiré patterns.
-     *
-     * Do not touch the zoom/buffer logic here. This only changes mpv's scaler
-     * profile for still images, and only when the user did not explicitly choose
-     * their own scaler in settings.
-     */
-    fun updateStillImageScalerProfile() {
-        val isStillImage = MPVLib.getPropertyString("current-tracks/video/image") == "yes"
-        if (isStillImage == usingStillImageScalerProfile)
-            return
-
-        usingStillImageScalerProfile = isStillImage
-        if (isStillImage)
-            applyStillImageScalerProfile()
-        else
-            restoreNormalScalerProfile()
-    }
-
-    private fun applyStillImageScalerProfile() {
-        if (!userSetDscale) {
-            // Mitchell is deliberately chosen over sharp Lanczos/EWA filters for
-            // scans: it anti-aliases dense ink-dot patterns better and reduces
-            // coloured moiré on 720p/FHD screens.
-            MPVLib.setOptionString("dscale", "mitchell")
-            MPVLib.setOptionString("dscale-antiring", "0.7")
-        }
-        if (!userSetScale) {
-            MPVLib.setOptionString("scale", "spline36")
-            MPVLib.setOptionString("scale-antiring", "0.6")
-        }
-        if (!userSetCscale) {
-            // Chroma also needs a real filter. The fast profile's chroma scaling
-            // can exaggerate false colours on JPEG scans with high-frequency detail.
-            MPVLib.setOptionString("cscale", "mitchell")
-            MPVLib.setOptionString("cscale-antiring", "0.7")
-        }
-
-        MPVLib.setOptionString("correct-downscaling", "yes")
-        MPVLib.setOptionString("linear-downscaling", "yes")
-    }
-
-    private fun restoreNormalScalerProfile() {
-        // Return to fast/mobile defaults for normal video unless the user has
-        // explicitly selected different scalers.
-        if (!userSetDscale) {
-            MPVLib.setOptionString("dscale", "bilinear")
-            MPVLib.setOptionString("dscale-antiring", "0.0")
-        }
-        if (!userSetScale) {
-            MPVLib.setOptionString("scale", "bilinear")
-            MPVLib.setOptionString("scale-antiring", "0.0")
-        }
-        if (!userSetCscale) {
-            MPVLib.setOptionString("cscale", "bilinear")
-            MPVLib.setOptionString("cscale-antiring", "0.0")
-        }
-
-        MPVLib.setOptionString("correct-downscaling", "no")
-        MPVLib.setOptionString("linear-downscaling", "no")
     }
 
     fun onPointerEvent(event: MotionEvent): Boolean {
