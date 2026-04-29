@@ -357,25 +357,23 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
             when {
                 !blockDefault -> gestures.onTouchEvent(e)
 
-                // While zoomed, still give TouchGestures ACTION_DOWN so a
-                // later tap-UP can toggle controls. Do not cancel it on tiny
-                // micro-moves; cancel only after a real zoom pan/pinch starts.
+                // While zoomed, keep the normal tap detector informed about ACTION_DOWN.
+                // If the zoom gesture later turns into a pan/pinch we cancel it; if it
+                // remains a single tap, ACTION_UP below reaches TouchGestures and the
+                // playback controls toggle reliably.
                 e.actionMasked == MotionEvent.ACTION_DOWN -> {
                     gestures.onTouchEvent(e)
                     true
                 }
 
-                // VideoZoomGestures returns false only for a valid single tap
-                // while zoomed. Forward ACTION_UP to normal gestures to show
-                // or hide the playback controls.
+                // VideoZoomGestures returns false only for a real single tap while zoomed.
+                // Forward that UP event to normal gestures so controls can show/hide.
                 !handledByZoom -> gestures.onTouchEvent(e)
 
-                zoomGestures.shouldCancelOtherGestures() -> {
+                else -> {
                     gestures.cancel()
                     true
                 }
-
-                else -> true
             }
         }
 

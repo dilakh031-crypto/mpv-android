@@ -92,10 +92,11 @@ internal class VideoZoomGestures(
                 panActive = false
                 canBeTap = false
 
-                // Reallocating the SurfaceTexture/mpv buffer while fingers are
-                // actively pinching is what makes zoom choppy and can also break
-                // normal tap/control detection. Keep the current buffer during
-                // the live gesture and resize it after the pinch settles.
+                // Do not resize the SurfaceTexture while fingers are actively
+                // pinching. Reallocating the mpv/TextureView buffer during the
+                // gesture is what makes zoom feel choppy and can disturb normal
+                // tap/control handling. We keep the current buffer during the
+                // live gesture and update it once the zoom settles.
                 renderResizeGeneration++
 
                 resetPanFilters(detector.focusX, detector.focusY, SystemClock.uptimeMillis())
@@ -176,14 +177,6 @@ internal class VideoZoomGestures(
         return isZoomed() || scaleDetector.isInProgress || e.pointerCount > 1
     }
 
-    fun shouldCancelOtherGestures(): Boolean {
-        // Do not cancel TouchGestures for tiny MOVE events that are still tap
-        // candidates. Cancelling here was the reason playback controls sometimes
-        // failed to appear: TouchGestures received ACTION_DOWN, then got canceled
-        // by a micro-move, then ACTION_UP could no longer complete the tap.
-        return panActive || scaleDetector.isInProgress
-    }
-
     fun reset() {
         if (applyScheduled) {
             choreographer.removeFrameCallback(frameCallback)
@@ -197,7 +190,6 @@ internal class VideoZoomGestures(
         panActive = false
         canBeTap = false
         lastTapTime = 0L
-        renderResizeGeneration++
         resetPanFilters(0f, 0f, SystemClock.uptimeMillis())
         applyToView()
 
@@ -515,10 +507,16 @@ internal class VideoZoomGestures(
             return
         }
 
-        // Keep mpv responsible for the hard downscale at normal size. During a
-        // live pinch, avoid resizing the SurfaceTexture. After the pinch settles,
-        // grow the buffer to the current zoom level, preserving screen aspect.
-        // This avoids both early-zoom moire and pinch stutter.
+        // At scale == 1, the surface stays at the real screen size so mpv does
+        // the large 5K -> 720p downscale with the anti-moire scaler. During a
+        // live pinch we also avoid resizing the surface to keep zoom smooth.
+        //
+        // After the pinch settles, the buffer grows only up to the current zoom
+        // level, preserving the screen aspect to avoid panscan. This prevents
+        // Android from minifying a too-large source texture at the first zoom
+        // steps, while still reaching 1:1 source detail at high zoom. There is
+        // no artificial safety cap; the only ceiling is the original source
+        // resolution for the visible video area.
         val sourceScaleX = videoPixelWidth.toFloat() / c.w
         val sourceScaleY = videoPixelHeight.toFloat() / c.h
         val maxSourceScale = max(sourceScaleX, sourceScaleY).coerceAtLeast(1f)
