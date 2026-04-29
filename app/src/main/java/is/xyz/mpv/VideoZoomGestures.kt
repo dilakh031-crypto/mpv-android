@@ -8,37 +8,33 @@ import android.view.View
 import android.view.ViewConfiguration
 import kotlin.math.PI
 import kotlin.math.abs
-import kotlin.math.ceil
 import kotlin.math.hypot
 import kotlin.math.max
 import kotlin.math.min
-import kotlin.math.roundToInt
 
 /**
  * Pinch-to-zoom + pan for mpv output.
  *
- * Important quality detail:
- *  - Unzoomed view uses the normal view-sized mpv surface so mpv, not Android's
- *    TextureView compositor, performs the huge downscale. This avoids moire /
- *    false-color artifacts on high-frequency scans at 720p.
- *  - During pinch zoom, the render surface is resized while the gesture is
- *    still active. That keeps the picture sharp under the fingers instead of
- *    upscaling a low-resolution TextureView buffer until ACTION_UP.
+ * High zoom is handled by transforming a TextureView (see BaseMPVView), not a SurfaceView.
+ * That avoids SurfaceFlinger/HWC layer-position quantization at 19x/20x.
  *
- * We do not use mpv video-pan/video-zoom for finger movement.
+ * This class still does a small amount of input cleanup:
+ *  - touch events come from an untransformed overlay view;
+ *  - batched MotionEvent historical samples are consumed in order;
+ *  - tap/double-tap detection is independent from the tiny pan-start threshold;
+ *  - at very high zoom only, a mild adaptive filter removes sensor micro-wobble.
+ *
+ * No easing is applied to the rendered view during drag: the image follows the filtered finger
+ * target directly on the next vsync, so there is no permanent lag/catch-up stutter.
  */
 internal class VideoZoomGestures(
     private val target: View,
 ) {
-    private val renderTarget = target as? BaseMPVView
-
     private var viewWidth = 0f
     private var viewHeight = 0f
 
     /** video aspect ratio (rotation already applied). 0 => unknown */
     private var videoAspect = 0.0
-    private var videoPixelWidth = 0
-    private var videoPixelHeight = 0
 
     private val touchSlop = ViewConfiguration.get(target.context).scaledTouchSlop.toFloat()
     private val panStartSlop = max(1f, min(2.5f, touchSlop * 0.22f))
@@ -71,10 +67,6 @@ internal class VideoZoomGestures(
     private val panFilterX = OneEuroFilter()
     private val panFilterY = OneEuroFilter()
 
-    private var currentRenderSurfaceScale = 1f
-    private var renderResizeGeneration = 0
-
-
     // Coalesce view property updates to vsync. We do not animate here; we only avoid
     // writing View properties multiple times in one display frame.
     private val choreographer: Choreographer = Choreographer.getInstance()
@@ -92,13 +84,6 @@ internal class VideoZoomGestures(
                 lastTapTime = 0L
                 panActive = false
                 canBeTap = false
-
-                // Cancel any delayed resize left from a previous gesture. From this point
-                // on, resize synchronously in coarse steps so the image is already sharp
-                // while the fingers are moving, not only after the pinch ends.
-                renderResizeGeneration++
-                requestMinimumZoomRenderSurfaceSize()
-
                 resetPanFilters(detector.focusX, detector.focusY, SystemClock.uptimeMillis())
                 return true
             }
@@ -125,7 +110,6 @@ internal class VideoZoomGestures(
 
                 clampTranslationToVideoContent()
                 resetPanFilters(detector.focusX, detector.focusY, SystemClock.uptimeMillis())
-                requestRenderSurfaceSizeForCurrentZoom()
                 scheduleApply()
                 return true
             }
@@ -133,10 +117,8 @@ internal class VideoZoomGestures(
             override fun onScaleEnd(detector: ScaleGestureDetector) {
                 if (scale <= 1f + EPS)
                     reset()
-                else {
+                else
                     resetPanFilters(detector.focusX, detector.focusY, SystemClock.uptimeMillis())
-                    requestRenderSurfaceSizeForCurrentZoom()
-                }
             }
         }
     )
@@ -145,68 +127,24 @@ internal class VideoZoomGestures(
         viewWidth = width
         viewHeight = height
         refreshMetricsFromTarget()
-        if (isZoomed() || scaleDetector.isInProgress) {
+        if (isZoomed()) {
             clampTranslationToVideoContent()
-            scheduleRenderSurfaceResize(delayMs = 0L)
             scheduleApply()
-        } else {
-            requestBaseRenderSurfaceSize(force = true)
         }
     }
 
     fun setVideoAspect(aspect: Double?) {
         videoAspect = aspect ?: 0.0
-        if (isZoomed() || scaleDetector.isInProgress) {
+        if (isZoomed()) {
             clampTranslationToVideoContent()
-            scheduleRenderSurfaceResize(delayMs = 0L)
             scheduleApply()
         }
-    }
-
-    fun setVideoPixelSize(size: Pair<Int, Int>?) {
-        videoPixelWidth = size?.first ?: 0
-        videoPixelHeight = size?.second ?: 0
-        if (isZoomed() || scaleDetector.isInProgress)
-            scheduleRenderSurfaceResize(delayMs = 0L)
-        else
-            requestBaseRenderSurfaceSize(force = true)
     }
 
     fun isZoomed(): Boolean = scale > 1f + EPS
 
     fun shouldBlockOtherGestures(e: MotionEvent): Boolean {
-        if (e.pointerCount > 1)
-            return true
-
-        if (!isZoomed())
-            return false
-
-        // While zoomed, let a real single tap pass through to MPVActivity so it can
-        // toggle the video controls. Still block drags/pans and the second tap of a
-        // double-tap, because double-tap while zoomed belongs to zoom reset.
-        when (e.actionMasked) {
-            MotionEvent.ACTION_DOWN -> {
-                val dt = SystemClock.uptimeMillis() - lastTapTime
-                val dist = hypot(e.x - lastTapX, e.y - lastTapY)
-                return lastTapTime != 0L && dt < DOUBLE_TAP_TIMEOUT && dist < touchSlop * 3f
-            }
-            MotionEvent.ACTION_MOVE -> {
-                return hypot(e.x - downX, e.y - downY) >= touchSlop
-            }
-            MotionEvent.ACTION_UP -> {
-                val now = SystemClock.uptimeMillis()
-                val moveDist = hypot(e.x - downX, e.y - downY)
-                val isTap = canBeTap && moveDist < touchSlop && (now - downTime) < DOUBLE_TAP_TIMEOUT
-                if (!isTap)
-                    return true
-
-                val dt = now - lastTapTime
-                val dist = hypot(e.x - lastTapX, e.y - lastTapY)
-                return lastTapTime != 0L && dt < DOUBLE_TAP_TIMEOUT && dist < touchSlop * 3f
-            }
-        }
-
-        return true
+        return isZoomed() || scaleDetector.isInProgress || e.pointerCount > 1
     }
 
     fun reset() {
@@ -224,11 +162,6 @@ internal class VideoZoomGestures(
         lastTapTime = 0L
         resetPanFilters(0f, 0f, SystemClock.uptimeMillis())
         applyToView()
-
-        // Critical for scan quality: after returning to normal size, do not keep
-        // the original-resolution texture and let Android minify it. Let mpv draw
-        // directly to the view-sized surface instead.
-        requestBaseRenderSurfaceSize(force = true)
     }
 
     /**
@@ -502,87 +435,6 @@ internal class VideoZoomGestures(
         target.translationY = ty.toFloat()
     }
 
-    private fun requestBaseRenderSurfaceSize(force: Boolean) {
-        val player = renderTarget ?: return
-        if (!force && currentRenderSurfaceScale == 1f)
-            return
-
-        currentRenderSurfaceScale = 1f
-        player.resetRenderSurfaceSize()
-    }
-
-    private fun scheduleRenderSurfaceResize(delayMs: Long = RENDER_RESIZE_AFTER_GESTURE_MS) {
-        val generation = ++renderResizeGeneration
-        target.postDelayed({
-            if (generation == renderResizeGeneration)
-                requestRenderSurfaceSizeForCurrentZoom()
-        }, delayMs)
-    }
-
-    private fun requestMinimumZoomRenderSurfaceSize() {
-        if (videoPixelWidth <= 1 || videoPixelHeight <= 1)
-            return
-
-        val oldScale = scale
-        scale = max(scale, 1f + EPS)
-        requestRenderSurfaceSizeForCurrentZoom(minimumDesiredScale = 1f + RENDER_BUFFER_SCALE_STEP)
-        scale = oldScale
-    }
-
-    private fun requestRenderSurfaceSizeForCurrentZoom(minimumDesiredScale: Float = 1f) {
-        val player = renderTarget ?: return
-        refreshMetricsFromTarget()
-
-        if (viewWidth <= 1f || viewHeight <= 1f || videoPixelWidth <= 1 || videoPixelHeight <= 1) {
-            requestBaseRenderSurfaceSize(force = true)
-            return
-        }
-
-        if (!isZoomed()) {
-            requestBaseRenderSurfaceSize(force = true)
-            return
-        }
-
-        val c = contentRect()
-        if (c.w <= 1f || c.h <= 1f) {
-            requestBaseRenderSurfaceSize(force = true)
-            return
-        }
-
-        // At scale == 1, the surface stays at the real screen size so mpv does
-        // the large 5K -> 720p downscale with the anti-moire scaler. Once pinch
-        // zoom starts, the buffer grows immediately in coarse steps up to the
-        // current zoom level, preserving the screen aspect to avoid panscan.
-        // This keeps the image sharp during the gesture while avoiding a costly
-        // SurfaceTexture reallocation on every touch sample. There is no
-        // artificial safety cap; the only ceiling is the original source
-        // resolution for the visible video area.
-        val sourceScaleX = videoPixelWidth.toFloat() / c.w
-        val sourceScaleY = videoPixelHeight.toFloat() / c.h
-        val maxSourceScale = max(sourceScaleX, sourceScaleY).coerceAtLeast(1f)
-
-        val desiredInputScale = max(scale, minimumDesiredScale).coerceAtMost(maxSourceScale)
-        val desiredScale = ceilToStep(desiredInputScale, RENDER_BUFFER_SCALE_STEP)
-            .coerceIn(1f, maxSourceScale)
-
-        if (desiredScale <= 1f + EPS) {
-            requestBaseRenderSurfaceSize(force = true)
-            return
-        }
-
-        if (desiredScale == currentRenderSurfaceScale)
-            return
-
-        val bufferWidth = (viewWidth * desiredScale).roundToInt().coerceAtLeast(1)
-        val bufferHeight = (viewHeight * desiredScale).roundToInt().coerceAtLeast(1)
-        player.setRenderSurfaceSize(bufferWidth, bufferHeight)
-        currentRenderSurfaceScale = desiredScale
-    }
-
-    private fun ceilToStep(value: Float, step: Float): Float {
-        return (ceil((value / step).toDouble()) * step).toFloat()
-    }
-
     private fun filterParamsForCurrentScale(): FilterParams {
         if (scale < FILTER_START_SCALE)
             return FilterParams(enabled = false, minCutoff = 0f, beta = 0f, derivativeCutoff = 0f)
@@ -678,8 +530,6 @@ internal class VideoZoomGestures(
         private const val MIN_SCALE = 1f
         private const val MAX_SCALE = 20f
         private const val DOUBLE_TAP_TIMEOUT = 300L
-        private const val RENDER_BUFFER_SCALE_STEP = 0.25f
-        private const val RENDER_RESIZE_AFTER_GESTURE_MS = 140L
 
         private const val DEFAULT_FRAME_DT = 1f / 60f
         private const val MIN_FILTER_DT = 1f / 240f

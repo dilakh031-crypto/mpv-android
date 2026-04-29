@@ -103,9 +103,6 @@ internal class MPVView(context: Context, attrs: AttributeSet) : BaseMPVView(cont
         MPVLib.setOptionString("tls-verify", "yes")
         MPVLib.setOptionString("tls-ca-file", "${this.context.filesDir.path}/cacert.pem")
         MPVLib.setOptionString("input-default-bindings", "yes")
-        // Keep still images open indefinitely instead of letting mpv advance/end them
-        // after its default image display timeout.
-        MPVLib.setOptionString("image-display-duration", "inf")
         // Limit demuxer cache since the defaults are too high for mobile devices
         val cacheMegs = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O_MR1) 64 else 32
         MPVLib.setOptionString("demuxer-max-bytes", "${cacheMegs * 1024 * 1024}")
@@ -328,13 +325,24 @@ internal class MPVView(context: Context, attrs: AttributeSet) : BaseMPVView(cont
         }
     }
 
-    fun getVideoPixelSize(): Pair<Int, Int>? {
-        val w = MPVLib.getPropertyInt("video-params/w") ?: return null
-        val h = MPVLib.getPropertyInt("video-params/h") ?: return null
-        if (w <= 0 || h <= 0)
-            return null
+    /**
+     * Updates TextureView/mpv rendering to use the source image/video resolution.
+     */
+    fun updateSourceVideoSize() {
+        val w = MPVLib.getPropertyInt("video-params/w")
+        val h = MPVLib.getPropertyInt("video-params/h")
         val rot = MPVLib.getPropertyInt("video-params/rotate") ?: 0
-        return if (rot % 180 == 90) h to w else w to h
+        val aspect = getVideoAspect()
+
+        if (w == null || h == null || w <= 0 || h <= 0) {
+            setSourceVideoSize(null, null, null)
+            return
+        }
+
+        if (rot % 180 == 90)
+            setSourceVideoSize(h, w, aspect)
+        else
+            setSourceVideoSize(w, h, aspect)
     }
 
     fun setAudioSessionId(id: Int) {
