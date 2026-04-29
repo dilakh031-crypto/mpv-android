@@ -325,15 +325,6 @@ internal class MPVView(context: Context, attrs: AttributeSet) : BaseMPVView(cont
         }
     }
 
-    fun getVideoPixelSize(): Pair<Int, Int>? {
-        val w = MPVLib.getPropertyInt("video-params/w") ?: return null
-        val h = MPVLib.getPropertyInt("video-params/h") ?: return null
-        if (w <= 0 || h <= 0)
-            return null
-        val rot = MPVLib.getPropertyInt("video-params/rotate") ?: 0
-        return if (rot % 180 == 90) h to w else w to h
-    }
-
     fun setAudioSessionId(id: Int) {
         MPVLib.setPropertyInt("audiotrack-session-id", id)
         MPVLib.setPropertyInt("aaudio-session-id", id)
