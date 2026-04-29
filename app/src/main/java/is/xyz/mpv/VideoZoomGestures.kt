@@ -11,22 +11,21 @@ import kotlin.math.hypot
 import kotlin.math.ln
 
 /**
- * Smooth pinch-to-zoom + pan for mpv output.
+ * Single-renderer pinch-to-zoom + pan for mpv output.
  *
- * This class deliberately uses a hybrid renderer:
- *  - while the finger is moving, the Android SurfaceView is transformed by the compositor;
- *    this is the same fast path as the old implementation and keeps gestures fluid.
- *  - shortly after the gesture stops, the same logical zoom/pan is committed to mpv with
- *    video-zoom/video-pan-x/y and the SurfaceView transform is released back to identity;
- *    this lets mpv render the selected area from the original high-resolution source.
+ * v3 removes the hybrid Android-view/mpv switch completely. The Android view is never used as
+ * the zoom renderer; it is kept at identity and mpv is the only renderer for both moving and
+ * settled states. This eliminates the visible transition between the old smooth Android scaler
+ * and the sharp mpv scaler.
  *
- * Continuous mpv-side zoom updates look sharp but are expensive on Android, especially for
- * video. Continuous SurfaceView-only zoom is smooth but magnifies the screen-sized frame.
- * The hybrid path keeps both: smooth interaction first, sharp settled image/video second.
+ * Smoothness is preserved by:
+ *  - coalescing MotionEvent bursts to one update per display vsync;
+ *  - sending mpv commands asynchronously instead of blocking the UI thread;
+ *  - sending only properties that actually changed.
  *
  * IMPORTANT:
- *  - Touch input must come from an untransformed overlay view (gestureLayer), not from the
- *    transformed video view itself.
+ *  - Touch input must come from an untransformed overlay view (gestureLayer), not from the video
+ *    view itself.
  */
 internal class VideoZoomGestures(
     private val target: View,
@@ -34,12 +33,12 @@ internal class VideoZoomGestures(
     private var viewWidth = 0f
     private var viewHeight = 0f
 
-    /** video aspect ratio (rotation already applied). 0 => unknown */
+    /** video aspect ratio, with rotation already applied. 0 => unknown */
     private var videoAspect = 0.0
 
     private val touchSlop = ViewConfiguration.get(target.context).scaledTouchSlop.toFloat()
 
-    // Logical transform requested by the user (1.0 = normal, tx/ty in view pixels).
+    // Logical transform requested by the user. 1.0 = normal. tx/ty are in view pixels.
     private var scale = 1f
     private var tx = 0f
     private var ty = 0f
@@ -63,22 +62,18 @@ internal class VideoZoomGestures(
     private var lastTapX = 0f
     private var lastTapY = 0f
 
-    // True when mpv currently owns the settled high-quality zoom/pan and the SurfaceView is
-    // supposed to be identity-transformed. When the next real gesture starts, we switch back
-    // to the compositor fast path.
-    private var mpvQualityActive = false
-
     private var lastSentZoom = Double.NaN
     private var lastSentPanX = Double.NaN
     private var lastSentPanY = Double.NaN
+    private var asyncSerial = 1L
 
-    // Coalesce view property updates to vsync.
     private val choreographer: Choreographer = Choreographer.getInstance()
     private var applyScheduled = false
+    private var lastMpvSendTime = 0L
+
     private val frameCallback = Choreographer.FrameCallback {
         applyScheduled = false
 
-        // Apply pan at a stable cadence (vsync) while zoomed.
         if (panFingerDown && didDrag && isZoomed() && !scaleDetector.isInProgress) {
             val dx = panPendingX - panFrameX
             val dy = panPendingY - panFrameY
@@ -89,16 +84,7 @@ internal class VideoZoomGestures(
         }
 
         clampTranslationToVideoContent()
-        applyToView()
-    }
-
-    private val highQualityCommitRunnable = Runnable {
-        commitHighQualityMpvTransform()
-    }
-
-    private val releaseSurfaceTransformRunnable = Runnable {
-        if (mpvQualityActive)
-            applyIdentityToView()
+        applyToMpvCoalesced()
     }
 
     private fun scheduleApply() {
@@ -107,33 +93,13 @@ internal class VideoZoomGestures(
         choreographer.postFrameCallback(frameCallback)
     }
 
-    private fun cancelHighQualityCommit() {
-        target.removeCallbacks(highQualityCommitRunnable)
-        target.removeCallbacks(releaseSurfaceTransformRunnable)
-    }
-
-    /**
-     * Switch from settled mpv-quality mode back to the old smooth SurfaceView transform mode.
-     * This is intentionally done only when the user really starts dragging/pinching, not on a
-     * simple tap, so tapping controls while zoomed does not cause a quality flicker.
-     */
-    private fun ensureInteractiveFastPath() {
-        cancelHighQualityCommit()
-        if (!mpvQualityActive)
-            return
-
-        mpvQualityActive = false
-        resetMpvTransform(force = true)
-        applyToView()
-    }
-
     private val scaleDetector = ScaleGestureDetector(
         target.context,
         object : ScaleGestureDetector.SimpleOnScaleGestureListener() {
             override fun onScaleBegin(detector: ScaleGestureDetector): Boolean {
                 lastTapTime = 0L
                 didDrag = true
-                ensureInteractiveFastPath()
+                keepAndroidViewIdentity()
                 return true
             }
 
@@ -141,23 +107,17 @@ internal class VideoZoomGestures(
                 if (viewWidth <= 1f || viewHeight <= 1f)
                     return true
 
-                ensureInteractiveFastPath()
-
                 val oldScale = scale
-                val requested = oldScale * detector.scaleFactor
-                val newScale = requested.coerceIn(MIN_SCALE, MAX_SCALE)
+                val newScale = (oldScale * detector.scaleFactor).coerceIn(MIN_SCALE, MAX_SCALE)
                 if (newScale == oldScale)
                     return true
 
                 // Keep pinch focus stable.
-                // Our transform is: screen = scale * content + translation (pivot at 0,0).
-                // To zoom around focus F (in screen coords), update translation as:
-                //   t' = k * t + (1 - k) * F, where k = newScale / oldScale.
-                val fx = detector.focusX
-                val fy = detector.focusY
+                // Transform model: screen = scale * content + translation.
+                // Zoom around focus F: t' = k * t + (1 - k) * F.
                 val k = newScale / oldScale
-                tx = (k * tx) + ((1f - k) * fx)
-                ty = (k * ty) + ((1f - k) * fy)
+                tx = (k * tx) + ((1f - k) * detector.focusX)
+                ty = (k * ty) + ((1f - k) * detector.focusY)
                 scale = newScale
 
                 scheduleApply()
@@ -167,6 +127,8 @@ internal class VideoZoomGestures(
             override fun onScaleEnd(detector: ScaleGestureDetector) {
                 if (scale <= 1f + EPS)
                     reset()
+                else
+                    scheduleApply()
             }
         }
     )
@@ -174,24 +136,14 @@ internal class VideoZoomGestures(
     fun setMetrics(width: Float, height: Float) {
         viewWidth = width
         viewHeight = height
-        if (isZoomed()) {
-            clampTranslationToVideoContent()
-            if (mpvQualityActive)
-                scheduleHighQualityCommit(SHORT_COMMIT_DELAY_MS)
-            else
-                scheduleApply()
-        }
+        if (isZoomed())
+            scheduleApply()
     }
 
     fun setVideoAspect(aspect: Double?) {
         videoAspect = aspect ?: 0.0
-        if (isZoomed()) {
-            clampTranslationToVideoContent()
-            if (mpvQualityActive)
-                scheduleHighQualityCommit(SHORT_COMMIT_DELAY_MS)
-            else
-                scheduleApply()
-        }
+        if (isZoomed())
+            scheduleApply()
     }
 
     fun isZoomed(): Boolean = scale > 1f + EPS
@@ -205,7 +157,6 @@ internal class VideoZoomGestures(
             choreographer.removeFrameCallback(frameCallback)
             applyScheduled = false
         }
-        cancelHighQualityCommit()
 
         scale = 1f
         tx = 0f
@@ -213,9 +164,8 @@ internal class VideoZoomGestures(
         didDrag = false
         panFingerDown = false
         lastTapTime = 0L
-        mpvQualityActive = false
 
-        applyIdentityToView()
+        keepAndroidViewIdentity()
         resetMpvTransform(force = true)
     }
 
@@ -225,6 +175,8 @@ internal class VideoZoomGestures(
      *         Single tap returns false so the Activity can toggle controls.
      */
     fun onTouchEvent(e: MotionEvent): Boolean {
+        keepAndroidViewIdentity()
+
         // Always feed the scale detector first.
         scaleDetector.onTouchEvent(e)
 
@@ -247,14 +199,16 @@ internal class VideoZoomGestures(
                 panFrameY = lastY
                 downTime = SystemClock.uptimeMillis()
             }
+            scheduleApply()
             return true
         }
 
-        // Multi-touch (or active pinch) should always be consumed.
+        // Multi-touch, or active pinch, should always be consumed.
         if (e.pointerCount > 1 || scaleDetector.isInProgress) {
             lastTapTime = 0L
             didDrag = true
             panFingerDown = false
+            scheduleApply()
             return true
         }
 
@@ -263,7 +217,6 @@ internal class VideoZoomGestures(
 
         when (e.actionMasked) {
             MotionEvent.ACTION_DOWN -> {
-                cancelHighQualityCommit()
                 downX = e.x
                 downY = e.y
                 lastX = e.x
@@ -280,8 +233,6 @@ internal class VideoZoomGestures(
             MotionEvent.ACTION_MOVE -> {
                 lastX = e.x
                 lastY = e.y
-
-                // Track latest pointer position; actual translation is applied on the next vsync.
                 panPendingX = e.x
                 panPendingY = e.y
 
@@ -291,10 +242,9 @@ internal class VideoZoomGestures(
                         didDrag = true
                 }
 
-                if (didDrag) {
-                    ensureInteractiveFastPath()
+                if (didDrag)
                     scheduleApply()
-                }
+
                 return true
             }
             MotionEvent.ACTION_UP -> {
@@ -305,7 +255,7 @@ internal class VideoZoomGestures(
 
                 if (!wasTap) {
                     lastTapTime = 0L
-                    finishGesture()
+                    scheduleApply()
                     return true
                 }
 
@@ -321,15 +271,14 @@ internal class VideoZoomGestures(
                 lastTapTime = now
                 lastTapX = e.x
                 lastTapY = e.y
-                // Keep/restore high-quality settled rendering after a simple tap.
-                finishGesture()
+                scheduleApply()
                 return false
             }
             MotionEvent.ACTION_CANCEL -> {
                 lastTapTime = 0L
                 didDrag = false
                 panFingerDown = false
-                finishGesture()
+                scheduleApply()
                 return true
             }
         }
@@ -337,29 +286,7 @@ internal class VideoZoomGestures(
         return true
     }
 
-    private fun finishGesture() {
-        clampTranslationToVideoContent()
-        if (scale <= 1f + EPS) {
-            reset()
-        } else if (mpvQualityActive) {
-            cancelHighQualityCommit()
-            applyIdentityToView()
-        } else {
-            applyToView()
-            scheduleHighQualityCommit(IDLE_COMMIT_DELAY_MS)
-        }
-    }
-
-    private fun scheduleHighQualityCommit(delayMs: Long) {
-        cancelHighQualityCommit()
-        if (viewWidth <= 1f || viewHeight <= 1f || scale <= 1f + EPS)
-            return
-        target.postDelayed(highQualityCommitRunnable, delayMs)
-    }
-
-    /**
-     * Compute the content (video) rect within the view at base scale.
-     */
+    /** Compute the content/video rect within the view at base scale. */
     private fun contentRect(): ContentRect {
         val w = viewWidth
         val h = viewHeight
@@ -371,11 +298,9 @@ internal class VideoZoomGestures(
         val cw: Float
         val ch: Float
         if (ar > viewAr) {
-            // video wider => fit width
             cw = w
             ch = w / ar
         } else {
-            // video taller/narrower => fit height
             ch = h
             cw = h * ar
         }
@@ -396,16 +321,10 @@ internal class VideoZoomGestures(
         }
 
         val c = contentRect()
-
-        // Clamp independently per axis.
-        // Use the transformed content rect (not the transformed whole view) so black bars are
-        // never pan space.
         val contentWScaled = scale * c.w
         val contentHScaled = scale * c.h
 
-        // X axis
         tx = if (contentWScaled <= viewWidth + EPS) {
-            // Content smaller than viewport: keep it centered (no horizontal panning)
             ((viewWidth - contentWScaled) * 0.5f) - scale * c.ox
         } else {
             val minTx = viewWidth - scale * (c.ox + c.w)
@@ -413,9 +332,7 @@ internal class VideoZoomGestures(
             tx.coerceIn(minTx, maxTx)
         }
 
-        // Y axis
         ty = if (contentHScaled <= viewHeight + EPS) {
-            // Content smaller than viewport: keep it centered (no vertical panning)
             ((viewHeight - contentHScaled) * 0.5f) - scale * c.oy
         } else {
             val minTy = viewHeight - scale * (c.oy + c.h)
@@ -424,18 +341,43 @@ internal class VideoZoomGestures(
         }
     }
 
-    private fun applyToView() {
-        // Fast interactive path: compositor transform. This is intentionally the same kind of
-        // transform the old implementation used, because it is extremely smooth on Android.
-        target.pivotX = 0f
-        target.pivotY = 0f
-        target.scaleX = scale
-        target.scaleY = scale
-        target.translationX = tx
-        target.translationY = ty
+    private fun applyToMpvCoalesced() {
+        keepAndroidViewIdentity()
+
+        val now = SystemClock.uptimeMillis()
+        if (now - lastMpvSendTime < MIN_MPV_SEND_INTERVAL_MS) {
+            scheduleApply()
+            return
+        }
+        lastMpvSendTime = now
+
+        val c = contentRect()
+        val safeScale = scale.coerceAtLeast(MIN_SCALE)
+        val zoom = if (safeScale <= 1f + EPS) 0.0 else log2(safeScale.toDouble())
+
+        var panX = 0.0
+        var panY = 0.0
+
+        if (safeScale > 1f + EPS && c.w > 1f && c.h > 1f) {
+            val desiredLeft = safeScale * c.ox + tx
+            val desiredTop = safeScale * c.oy + ty
+
+            // mpv centers the zoomed video first, then applies pan as a fraction of the scaled
+            // video dimensions. Convert from our pixel-space transform to mpv pan units.
+            val centeredLeft = (viewWidth - safeScale * c.w) * 0.5f
+            val centeredTop = (viewHeight - safeScale * c.h) * 0.5f
+            panX = ((desiredLeft - centeredLeft) / (safeScale * c.w)).toDouble()
+            panY = ((desiredTop - centeredTop) / (safeScale * c.h)).toDouble()
+        }
+
+        setMpvDoubleAsync("video-zoom", zoom, force = false)
+        setMpvDoubleAsync("video-pan-x", panX, force = false)
+        setMpvDoubleAsync("video-pan-y", panY, force = false)
     }
 
-    private fun applyIdentityToView() {
+    private fun keepAndroidViewIdentity() {
+        // Do not let Android become a second zoom renderer. This line is what removes the
+        // Android<->mpv visual switch completely.
         target.pivotX = 0f
         target.pivotY = 0f
         target.scaleX = 1f
@@ -444,52 +386,13 @@ internal class VideoZoomGestures(
         target.translationY = 0f
     }
 
-    private fun commitHighQualityMpvTransform() {
-        if (viewWidth <= 1f || viewHeight <= 1f || scale <= 1f + EPS)
-            return
-
-        clampTranslationToVideoContent()
-        val c = contentRect()
-        val safeScale = scale.coerceAtLeast(MIN_SCALE)
-        val zoom = log2(safeScale.toDouble())
-
-        var panX = 0.0
-        var panY = 0.0
-
-        if (c.w > 1f && c.h > 1f) {
-            // Desired transformed content rect from the same logical transform that drives the
-            // fast SurfaceView path.
-            val desiredLeft = safeScale * c.ox + tx
-            val desiredTop = safeScale * c.oy + ty
-
-            // mpv first centers the zoomed video, then applies pan as a fraction of the scaled
-            // video dimensions. Convert from desired pixel displacement to mpv units.
-            val centeredLeft = (viewWidth - safeScale * c.w) * 0.5f
-            val centeredTop = (viewHeight - safeScale * c.h) * 0.5f
-            panX = ((desiredLeft - centeredLeft) / (safeScale * c.w)).toDouble()
-            panY = ((desiredTop - centeredTop) / (safeScale * c.h)).toDouble()
-        }
-
-        setMpvDouble("video-zoom", zoom, force = false)
-        setMpvDouble("video-pan-x", panX, force = false)
-        setMpvDouble("video-pan-y", panY, force = false)
-
-        mpvQualityActive = true
-
-        // Give mpv a short moment to present the new crop before releasing the compositor
-        // transform. This avoids most visible snapping on slower devices, while still making the
-        // settled frame high-quality almost immediately.
-        target.removeCallbacks(releaseSurfaceTransformRunnable)
-        target.postDelayed(releaseSurfaceTransformRunnable, RELEASE_SURFACE_TRANSFORM_DELAY_MS)
-    }
-
     private fun resetMpvTransform(force: Boolean) {
-        setMpvDouble("video-zoom", 0.0, force)
-        setMpvDouble("video-pan-x", 0.0, force)
-        setMpvDouble("video-pan-y", 0.0, force)
+        setMpvDoubleAsync("video-zoom", 0.0, force)
+        setMpvDoubleAsync("video-pan-x", 0.0, force)
+        setMpvDoubleAsync("video-pan-y", 0.0, force)
     }
 
-    private fun setMpvDouble(property: String, value: Double, force: Boolean) {
+    private fun setMpvDoubleAsync(property: String, value: Double, force: Boolean) {
         val previous = when (property) {
             "video-zoom" -> lastSentZoom
             "video-pan-x" -> lastSentPanX
@@ -501,16 +404,28 @@ internal class VideoZoomGestures(
             return
 
         try {
-            val result = MPVLib.commandAsync(arrayOf("set", property, value.toString()), 0L)
+            // commandAsync avoids blocking the UI thread during pinch/pan. If it fails for any
+            // reason, fall back to the direct property setter.
+            val result = MPVLib.commandAsync(arrayOf("set", property, value.toString()), asyncSerial++)
             if (result < 0)
                 MPVLib.setPropertyDouble(property, value)
+
             when (property) {
                 "video-zoom" -> lastSentZoom = value
                 "video-pan-x" -> lastSentPanX = value
                 "video-pan-y" -> lastSentPanY = value
             }
         } catch (_: Throwable) {
-            // mpv may not be initialized yet during early Activity setup or after shutdown.
+            try {
+                MPVLib.setPropertyDouble(property, value)
+                when (property) {
+                    "video-zoom" -> lastSentZoom = value
+                    "video-pan-x" -> lastSentPanX = value
+                    "video-pan-y" -> lastSentPanY = value
+                }
+            } catch (_: Throwable) {
+                // mpv may not be initialized yet during early Activity setup or after shutdown.
+            }
         }
     }
 
@@ -522,16 +437,9 @@ internal class VideoZoomGestures(
         private const val EPS = 0.001f
         private const val MPV_APPLY_EPS = 0.00001
         private const val MIN_SCALE = 1f
-        // Enough for deep inspection of 4K/6K images without forcing coarse jumps.
         private const val MAX_SCALE = 20f
         private const val DOUBLE_TAP_TIMEOUT = 300L
-
-        // Delay before switching from fast interactive SurfaceView transform to sharp mpv render.
-        // Kept low so the image becomes clean immediately after the finger stops, but high enough
-        // to avoid committing while MotionEvents are still arriving.
-        private const val IDLE_COMMIT_DELAY_MS = 80L
-        private const val SHORT_COMMIT_DELAY_MS = 16L
-        private const val RELEASE_SURFACE_TRANSFORM_DELAY_MS = 48L
+        private const val MIN_MPV_SEND_INTERVAL_MS = 16L
         private const val LN_2 = 0.6931471805599453
     }
 }
