@@ -1,24 +1,21 @@
 package `is`.xyz.mpv
 
 import android.content.Context
+import android.graphics.Matrix
 import android.graphics.SurfaceTexture
 import android.util.AttributeSet
 import android.util.Log
 import android.view.Surface
 import android.view.TextureView
-import kotlin.math.ceil
-import kotlin.math.max
-import kotlin.math.min
-import kotlin.math.roundToInt
 
 // Contains only the essential code needed to get a picture on the screen
 
 abstract class BaseMPVView(context: Context, attrs: AttributeSet) : TextureView(context, attrs), TextureView.SurfaceTextureListener {
     init {
-        // TextureView is part of the normal View hierarchy. This keeps zoom/pan smooth.
-        // Quality is handled separately below by increasing the SurfaceTexture buffer size
-        // while zoomed, so Android scales a high-resolution mpv render instead of a
-        // screen-resolution screenshot-like texture.
+        // TextureView is part of the normal View hierarchy. This makes high-zoom
+        // scale/translation much smoother than transforming a SurfaceView layer,
+        // especially on older Android devices where SurfaceView composition is
+        // quantized by SurfaceFlinger/HWC.
         isOpaque = true
     }
 
@@ -102,24 +99,29 @@ abstract class BaseMPVView(context: Context, attrs: AttributeSet) : TextureView(
     private var surfaceViewHeight = 0
     private var renderBufferWidth = 0
     private var renderBufferHeight = 0
-    private var zoomRenderScale = 1f
+    private var zoomRenderActive = false
+    private val textureMatrix = Matrix()
 
     /**
-     * Called by VideoZoomGestures. Zoom/pan remains a TextureView transform for smoothness,
-     * but mpv renders into a larger buffer while zoomed so high-resolution videos/images keep
-     * their source detail when Android magnifies the TextureView.
+     * Called by VideoZoomGestures.
+     *
+     * Normal mode: the TextureView buffer matches the view size.
+     * Zoom mode: the TextureView buffer is the original video resolution exactly.
+     *
+     * There is intentionally no safety cap and no division by screen size here, per request.
      */
     fun setZoomRenderScale(scale: Float) {
-        val normalized = if (scale <= 1f + ZOOM_RENDER_EPS) 1f else scale.coerceAtMost(MAX_ZOOM_SCALE_HINT)
-        if (sameRenderScaleBucket(zoomRenderScale, normalized))
+        val active = scale > 1f + ZOOM_RENDER_EPS
+        if (zoomRenderActive == active)
             return
 
-        zoomRenderScale = normalized
+        zoomRenderActive = active
         updateRenderBufferSize(force = false)
     }
 
     fun notifyVideoSizeChanged() {
-        updateRenderBufferSize(force = false)
+        if (zoomRenderActive)
+            updateRenderBufferSize(force = false)
     }
 
     private fun attachSurfaceTexture(texture: SurfaceTexture, width: Int, height: Int) {
@@ -165,7 +167,7 @@ abstract class BaseMPVView(context: Context, attrs: AttributeSet) : TextureView(
         attachedTexture = null
         renderBufferWidth = 0
         renderBufferHeight = 0
-        zoomRenderScale = 1f
+        zoomRenderActive = false
     }
 
     private fun updateRenderBufferSize(force: Boolean) {
@@ -186,8 +188,30 @@ abstract class BaseMPVView(context: Context, attrs: AttributeSet) : TextureView(
         renderBufferWidth = size.width
         renderBufferHeight = size.height
         texture.setDefaultBufferSize(renderBufferWidth, renderBufferHeight)
-        Log.w(TAG, "mpv texture buffer: ${renderBufferWidth}x${renderBufferHeight}, zoom=$zoomRenderScale")
+        updateTextureTransform()
+        Log.w(TAG, "mpv texture buffer: ${renderBufferWidth}x${renderBufferHeight}, zoomActive=$zoomRenderActive")
         return true
+    }
+
+    private fun updateTextureTransform() {
+        textureMatrix.reset()
+
+        if (zoomRenderActive && surfaceViewWidth > 1 && surfaceViewHeight > 1 && renderBufferWidth > 1 && renderBufferHeight > 1) {
+            val viewAr = surfaceViewWidth.toFloat() / surfaceViewHeight.toFloat()
+            val bufferAr = renderBufferWidth.toFloat() / renderBufferHeight.toFloat()
+            val cx = surfaceViewWidth * 0.5f
+            val cy = surfaceViewHeight * 0.5f
+
+            if (bufferAr > viewAr) {
+                // Original video is wider than the view: keep full width and letterbox vertically.
+                textureMatrix.setScale(1f, viewAr / bufferAr, cx, cy)
+            } else {
+                // Original video is taller than the view: keep full height and pillarbox horizontally.
+                textureMatrix.setScale(bufferAr / viewAr, 1f, cx, cy)
+            }
+        }
+
+        setTransform(textureMatrix)
     }
 
     private fun setMpvSurfaceSize() {
@@ -199,47 +223,12 @@ abstract class BaseMPVView(context: Context, attrs: AttributeSet) : TextureView(
         val viewW = surfaceViewWidth.coerceAtLeast(1)
         val viewH = surfaceViewHeight.coerceAtLeast(1)
 
-        if (zoomRenderScale <= 1f + ZOOM_RENDER_EPS)
+        if (!zoomRenderActive)
             return RenderSize(viewW, viewH)
 
-        val videoSize = currentVideoSizeForDisplay()
-        val videoW = videoSize?.width ?: 0
-        val videoH = videoSize?.height ?: 0
-
-        // The useful oversampling is limited by the source itself and by the size of
-        // the fitted video rect, not by the full TextureView when letterboxing exists.
-        val sourceScale = if (videoW > 0 && videoH > 0) {
-            val videoAr = videoW.toFloat() / videoH.toFloat()
-            val viewAr = viewW.toFloat() / viewH.toFloat()
-            val contentW: Float
-            val contentH: Float
-            if (videoAr > viewAr) {
-                contentW = viewW.toFloat()
-                contentH = viewW.toFloat() / videoAr
-            } else {
-                contentH = viewH.toFloat()
-                contentW = viewH.toFloat() * videoAr
-            }
-            min(videoW.toFloat() / contentW, videoH.toFloat() / contentH).coerceAtLeast(1f)
-        } else {
-            DEFAULT_ZOOM_RENDER_SCALE
-        }
-
-        val desiredScale = min(sourceScale, MAX_RENDER_SCALE).coerceAtLeast(1f)
-
-        var outW = ceil(viewW * desiredScale).roundToInt().coerceAtLeast(viewW)
-        var outH = ceil(viewH * desiredScale).roundToInt().coerceAtLeast(viewH)
-
-        // Keep the buffer safe for older devices. This still preserves UHD detail on 1080p/1440p
-        // screens, and avoids catastrophic memory/GPU pressure with 8K sources.
-        val largest = max(outW, outH)
-        if (largest > MAX_RENDER_DIMENSION) {
-            val down = MAX_RENDER_DIMENSION.toFloat() / largest.toFloat()
-            outW = max(viewW, (outW * down).roundToInt())
-            outH = max(viewH, (outH * down).roundToInt())
-        }
-
-        return RenderSize(outW, outH)
+        // During zoom, use the original decoded video resolution exactly.
+        // No fitting to the screen, no scale factor, and no max-dimension clamp.
+        return currentVideoSizeForDisplay() ?: RenderSize(viewW, viewH)
     }
 
     private fun currentVideoSizeForDisplay(): RenderSize? {
@@ -255,13 +244,6 @@ abstract class BaseMPVView(context: Context, attrs: AttributeSet) : TextureView(
             RenderSize(w, h)
     }
 
-    private fun sameRenderScaleBucket(a: Float, b: Float): Boolean {
-        // The buffer has only two behavioral modes: normal and high-quality zoom.
-        // Avoid reallocating on every pinch delta; one upgrade on zoom enter and one
-        // downgrade on reset keeps gesture smooth.
-        return (a <= 1f + ZOOM_RENDER_EPS) == (b <= 1f + ZOOM_RENDER_EPS)
-    }
-
     // Texture callbacks
 
     override fun onSurfaceTextureAvailable(surface: SurfaceTexture, width: Int, height: Int) {
@@ -272,6 +254,7 @@ abstract class BaseMPVView(context: Context, attrs: AttributeSet) : TextureView(
         surfaceViewWidth = width
         surfaceViewHeight = height
         updateRenderBufferSize(force = true)
+        updateTextureTransform()
     }
 
     override fun onSurfaceTextureDestroyed(surface: SurfaceTexture): Boolean {
@@ -286,9 +269,5 @@ abstract class BaseMPVView(context: Context, attrs: AttributeSet) : TextureView(
     companion object {
         private const val TAG = "mpv"
         private const val ZOOM_RENDER_EPS = 0.01f
-        private const val MAX_ZOOM_SCALE_HINT = 20f
-        private const val DEFAULT_ZOOM_RENDER_SCALE = 2f
-        private const val MAX_RENDER_SCALE = 4f
-        private const val MAX_RENDER_DIMENSION = 4096
     }
 }
