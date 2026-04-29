@@ -13,15 +13,13 @@ import `is`.xyz.mpv.MPVLib.MpvFormat.MPV_FORMAT_FLAG
 import `is`.xyz.mpv.MPVLib.MpvFormat.MPV_FORMAT_INT64
 import `is`.xyz.mpv.MPVLib.MpvFormat.MPV_FORMAT_NONE
 import `is`.xyz.mpv.MPVLib.MpvFormat.MPV_FORMAT_STRING
-import kotlin.math.roundToInt
 import kotlin.reflect.KProperty
 
 internal class MPVView(context: Context, attrs: AttributeSet) : BaseMPVView(context, attrs) {
     override fun initOptions() {
         val sharedPreferences = PreferenceManager.getDefaultSharedPreferences(context)
 
-        // Keep mpv's built-in fast profile as the baseline; we will override quality-sensitive
-        // pieces selectively instead of switching the whole player to the heavier default profile.
+        // apply phone-optimized defaults
         MPVLib.setOptionString("profile", "fast")
 
         // vo
@@ -187,8 +185,6 @@ internal class MPVView(context: Context, attrs: AttributeSet) : BaseMPVView(cont
             Property("paused-for-cache", MPV_FORMAT_FLAG),
             Property("speed", MPV_FORMAT_STRING),
             Property("track-list"),
-            Property("video-params/w", MPV_FORMAT_INT64),
-            Property("video-params/h", MPV_FORMAT_INT64),
             Property("video-params/aspect", MPV_FORMAT_DOUBLE),
             Property("video-params/rotate", MPV_FORMAT_DOUBLE),
             Property("playlist-pos", MPV_FORMAT_INT64),
@@ -330,38 +326,6 @@ internal class MPVView(context: Context, attrs: AttributeSet) : BaseMPVView(cont
     fun setAudioSessionId(id: Int) {
         MPVLib.setPropertyInt("audiotrack-session-id", id)
         MPVLib.setPropertyInt("aaudio-session-id", id)
-    }
-
-    /**
-     * mpv renders Android output at the size reported here. For high-resolution still images,
-     * we intentionally render at the image's native resolution (capped to a safe maximum) so
-     * subsequent zooming does not start from a low-resolution buffer.
-     */
-    override fun onSurfaceSizeChanged(width: Int, height: Int) {
-        refreshSurfaceSizeForCurrentMedia()
-    }
-
-    fun refreshSurfaceSizeForCurrentMedia() {
-        val baseSize = currentBaseSurfaceSize() ?: return
-        val isImage = MPVLib.getPropertyString("current-tracks/video/image") == "yes"
-        if (!isImage) {
-            setAndroidSurfaceSize(baseSize.first, baseSize.second)
-            return
-        }
-
-        val sourceW = MPVLib.getPropertyInt("video-params/w") ?: return
-        val sourceH = MPVLib.getPropertyInt("video-params/h") ?: return
-        if (sourceW <= 0 || sourceH <= 0) {
-            setAndroidSurfaceSize(baseSize.first, baseSize.second)
-            return
-        }
-
-        val limit = 8192
-        val longest = maxOf(sourceW, sourceH)
-        val scale = if (longest > limit) limit.toFloat() / longest.toFloat() else 1f
-        val targetW = maxOf(baseSize.first, (sourceW * scale).roundToInt())
-        val targetH = maxOf(baseSize.second, (sourceH * scale).roundToInt())
-        setAndroidSurfaceSize(targetW, targetH)
     }
 
     class TrackDelegate(private val name: String) {

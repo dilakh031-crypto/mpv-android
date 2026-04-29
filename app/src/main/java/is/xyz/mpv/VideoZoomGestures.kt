@@ -11,19 +11,11 @@ import kotlin.math.hypot
 /**
  * High-FPS pinch-to-zoom + pan for mpv output.
  *
- * Design goals (Samsung-like):
- *  - 60fps zoom/pan (compositor-level by transforming the Android view)
+ * Design goals (Samsung Gallery-like):
+ *  - 120fps smooth zoom/pan during gestures (using Android View transformations).
+ *  - Lossless high-res quality when paused (committing exact values to MPV natively after the gesture).
  *  - While zoomed: one-finger pan, double-tap resets, seeking disabled
- *  - Black bars (letter/pillarbox) are treated as "not part of video":
- *      * They remain visible at small zoom.
- *      * They disappear naturally once the zoom reaches the point where the
- *        video content fills the viewport.
- *      * Panning is clamped to the *video content rect*, not the whole view,
- *        so you can't pan into the black bars.
- *
- * IMPORTANT:
- *  - Touch input must come from an UNTRANSFORMED overlay view (gesture layer),
- *    not from the transformed video view itself.
+ *  - Black bars (letter/pillarbox) are treated as "not part of video".
  */
 internal class VideoZoomGestures(
     private val target: View,
@@ -36,10 +28,15 @@ internal class VideoZoomGestures(
 
     private val touchSlop = ViewConfiguration.get(target.context).scaledTouchSlop.toFloat()
 
-    // Linear scale factor (1.0 = normal)
+    // Absolute intended visual values (Combining Native + View)
     private var scale = 1f
     private var tx = 0f
     private var ty = 0f
+
+    // Native values currently applied to MPV
+    private var nativeScale = 1f
+    private var nativeTx = 0f
+    private var nativeTy = 0f
 
     private var downX = 0f
     private var downY = 0f
@@ -48,8 +45,6 @@ internal class VideoZoomGestures(
     private var downTime = 0L
     private var didDrag = false
 
-    // Single-finger pan is applied on vsync to avoid bursty MotionEvent delivery
-    // causing visible micro-stutter.
     private var panFingerDown = false
     private var panPendingX = 0f
     private var panPendingY = 0f
@@ -60,13 +55,13 @@ internal class VideoZoomGestures(
     private var lastTapX = 0f
     private var lastTapY = 0f
 
-    // Coalesce view property updates to vsync.
+    private var commitRunnable: Runnable? = null
+
     private val choreographer: Choreographer = Choreographer.getInstance()
     private var applyScheduled = false
     private val frameCallback = Choreographer.FrameCallback {
         applyScheduled = false
 
-        // Apply pan at a stable cadence (vsync) while zoomed.
         if (panFingerDown && didDrag && isZoomed() && !scaleDetector.isInProgress) {
             val dx = panPendingX - panFrameX
             val dy = panPendingY - panFrameY
@@ -105,14 +100,6 @@ internal class VideoZoomGestures(
                 if (newScale == oldScale)
                     return true
 
-                // Keep pinch focus stable.
-                //
-                // Our transform is: screen = scale * content + translation (pivot at 0,0).
-                // To zoom around focus F (in screen coords) we must update translation as:
-                //   t' = k * t + (1 - k) * F, where k = newScale / oldScale.
-                //
-                // The old implementation used (oldScale - newScale) * F, which becomes
-                // increasingly wrong when already zoomed/panned, causing noticeable drift.
                 val fx = detector.focusX
                 val fy = detector.focusY
                 val k = newScale / oldScale
@@ -125,8 +112,11 @@ internal class VideoZoomGestures(
             }
 
             override fun onScaleEnd(detector: ScaleGestureDetector) {
-                if (scale <= 1f + EPS)
+                if (scale <= 1f + EPS) {
                     reset()
+                } else if (!panFingerDown) {
+                    commitToNative()
+                }
             }
         }
     )
@@ -162,20 +152,62 @@ internal class VideoZoomGestures(
         didDrag = false
         panFingerDown = false
         lastTapTime = 0L
+
+        // Instant reset for MPV and View without delays
+        commitRunnable?.let { target.removeCallbacks(it) }
+        nativeScale = 1f
+        nativeTx = 0f
+        nativeTy = 0f
+
+        try {
+            MPVLib.setPropertyDouble("video-zoom", 0.0)
+            MPVLib.setPropertyDouble("video-pan-x", 0.0)
+            MPVLib.setPropertyDouble("video-pan-y", 0.0)
+        } catch (e: Exception) {}
+
         applyToView()
     }
 
     /**
-     * @return true if the event should be consumed.
-     *         While zoomed: pinch/pan/double-tap are consumed.
-     *         Single tap returns false so the Activity can toggle controls.
+     * Commits the current absolute scale and pan to MPV natively to render the high-res frame.
+     * This is only called when the user stops touching the screen.
      */
+    private fun commitToNative() {
+        if (viewWidth <= 1f || viewHeight <= 1f) return
+        if (nativeScale == scale && nativeTx == tx && nativeTy == ty) return
+
+        val newNativeScale = scale
+        val newNativeTx = tx
+        val newNativeTy = ty
+
+        try {
+            val zoom = kotlin.math.log2(newNativeScale.toDouble())
+            val panX = (newNativeScale - 1f) / 2f + newNativeTx / viewWidth
+            val panY = (newNativeScale - 1f) / 2f + newNativeTy / viewHeight
+
+            MPVLib.setPropertyDouble("video-zoom", zoom)
+            MPVLib.setPropertyDouble("video-pan-x", panX.toDouble())
+            MPVLib.setPropertyDouble("video-pan-y", panY.toDouble())
+        } catch (e: Exception) { return }
+
+        // Delay updating our native state to allow MPV ~75ms to render the sharp high-res frame.
+        // Once rendered, we snap the Android View transform back to 1.0.
+        commitRunnable?.let { target.removeCallbacks(it) }
+        commitRunnable = Runnable {
+            // Ensure the user hasn't started a new gesture during the delay
+            if (!panFingerDown && !scaleDetector.isInProgress) {
+                nativeScale = newNativeScale
+                nativeTx = newNativeTx
+                nativeTy = newNativeTy
+                applyToView()
+            }
+        }
+        target.postDelayed(commitRunnable, 75)
+    }
+
     fun onTouchEvent(e: MotionEvent): Boolean {
-        // Always feed the scale detector first.
         scaleDetector.onTouchEvent(e)
 
-        // Pointer transitions during pinch:
-        // If one finger lifts and another remains down, update lastX/lastY so we don't jump.
         if (e.actionMasked == MotionEvent.ACTION_POINTER_UP && isZoomed()) {
             lastTapTime = 0L
             didDrag = true
@@ -196,7 +228,6 @@ internal class VideoZoomGestures(
             return true
         }
 
-        // Multi-touch (or active pinch) should always be consumed.
         if (e.pointerCount > 1 || scaleDetector.isInProgress) {
             lastTapTime = 0L
             didDrag = true
@@ -225,8 +256,6 @@ internal class VideoZoomGestures(
             MotionEvent.ACTION_MOVE -> {
                 lastX = e.x
                 lastY = e.y
-
-                // Track latest pointer position; actual translation is applied on the next vsync.
                 panPendingX = e.x
                 panPendingY = e.y
 
@@ -244,15 +273,14 @@ internal class VideoZoomGestures(
             MotionEvent.ACTION_UP -> {
                 val now = SystemClock.uptimeMillis()
                 val wasTap = !didDrag && (now - downTime) < DOUBLE_TAP_TIMEOUT
-
                 panFingerDown = false
 
                 if (!wasTap) {
                     lastTapTime = 0L
+                    if (!scaleDetector.isInProgress) commitToNative()
                     return true
                 }
 
-                // Double-tap anywhere while zoomed => reset.
                 val dt = now - lastTapTime
                 val dist = hypot(e.x - lastTapX, e.y - lastTapY)
                 if (lastTapTime != 0L && dt < DOUBLE_TAP_TIMEOUT && dist < touchSlop * 3f) {
@@ -264,12 +292,14 @@ internal class VideoZoomGestures(
                 lastTapTime = now
                 lastTapX = e.x
                 lastTapY = e.y
+                if (!scaleDetector.isInProgress) commitToNative()
                 return false
             }
             MotionEvent.ACTION_CANCEL -> {
                 lastTapTime = 0L
                 didDrag = false
                 panFingerDown = false
+                if (!scaleDetector.isInProgress) commitToNative()
                 return true
             }
         }
@@ -277,9 +307,6 @@ internal class VideoZoomGestures(
         return true
     }
 
-    /**
-     * Compute the content (video) rect within the view at base scale.
-     */
     private fun contentRect(): ContentRect {
         val w = viewWidth
         val h = viewHeight
@@ -291,11 +318,9 @@ internal class VideoZoomGestures(
         val cw: Float
         val ch: Float
         if (ar > viewAr) {
-            // video wider => fit width
             cw = w
             ch = w / ar
         } else {
-            // video taller/narrower => fit height
             ch = h
             cw = h * ar
         }
@@ -315,15 +340,10 @@ internal class VideoZoomGestures(
         }
 
         val c = contentRect()
-
-        // Clamp independently per axis.
-        // Use the transformed content rect (not the transformed whole view) so black bars are never "pan space".
         val contentWScaled = scale * c.w
         val contentHScaled = scale * c.h
 
-        // X axis
         tx = if (contentWScaled <= viewWidth + EPS) {
-            // Content smaller than viewport: keep it centered (no horizontal panning)
             ((viewWidth - contentWScaled) * 0.5f) - scale * c.ox
         } else {
             val minTx = viewWidth - scale * (c.ox + c.w)
@@ -331,9 +351,7 @@ internal class VideoZoomGestures(
             tx.coerceIn(minTx, maxTx)
         }
 
-        // Y axis
         ty = if (contentHScaled <= viewHeight + EPS) {
-            // Content smaller than viewport: keep it centered (no vertical panning)
             ((viewHeight - contentHScaled) * 0.5f) - scale * c.oy
         } else {
             val minTy = viewHeight - scale * (c.oy + c.h)
@@ -343,12 +361,20 @@ internal class VideoZoomGestures(
     }
 
     private fun applyToView() {
+        if (viewWidth <= 1f || viewHeight <= 1f) return
+
+        // Calculate the exact visual difference between the Android View and MPV's native render.
+        // This ensures buttery smooth 120Hz tracking even if MPV is busy rendering 4K frames in the background.
+        val viewScale = scale / nativeScale
+        val viewTx = tx - (nativeTx * viewScale)
+        val viewTy = ty - (nativeTy * viewScale)
+
         target.pivotX = 0f
         target.pivotY = 0f
-        target.scaleX = scale
-        target.scaleY = scale
-        target.translationX = tx
-        target.translationY = ty
+        target.scaleX = viewScale
+        target.scaleY = viewScale
+        target.translationX = viewTx
+        target.translationY = viewTy
     }
 
     private data class ContentRect(val ox: Float, val oy: Float, val w: Float, val h: Float)
@@ -356,7 +382,6 @@ internal class VideoZoomGestures(
     companion object {
         private const val EPS = 0.001f
         private const val MIN_SCALE = 1f
-        // Increased maximum zoom from 6x to 20x.
         private const val MAX_SCALE = 20f
         private const val DOUBLE_TAP_TIMEOUT = 300L
     }
