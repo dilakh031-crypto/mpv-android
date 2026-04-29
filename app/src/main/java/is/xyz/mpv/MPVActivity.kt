@@ -3089,7 +3089,7 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
         when (property) {
             "time-pos" -> updatePlaybackPos(psc.positionSec)
             "playlist-pos", "playlist-count" -> updatePlaylistButtons()
-            "video-params/w", "video-params/h" -> zoomGestures.setVideoPixelSize(player.getVideoPixelSize())
+            "video-params/w", "video-params/h" -> binding.player.notifyVideoSizeChanged()
         }
     }
 
@@ -3101,7 +3101,7 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
                 updateOrientation()
                 updatePiPParams()
                 zoomGestures.setVideoAspect(player.getVideoAspect())
-                zoomGestures.setVideoPixelSize(player.getVideoPixelSize())
+                binding.player.notifyVideoSizeChanged()
             }
         }
     }
