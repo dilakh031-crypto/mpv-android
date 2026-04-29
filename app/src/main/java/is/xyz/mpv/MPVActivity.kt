@@ -97,6 +97,9 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
     private var scrubAsyncCounter = 1L
     private var lastScrubAsyncUserdata = 0L
 
+    // Use a separate userdata range for detached commands that should not block playback.
+    private var detachedCommandUserdata = 1_000_000L
+
     private var gestureScrubActive = false
     private var pendingGestureSeekSec: Int? = null
     private var lastIssuedGestureSeekSec: Int? = null
@@ -1063,6 +1066,14 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
         MPVLib.setPropertyBoolean("keep-open", true)
         return {
             oldValue?.also { MPVLib.setPropertyString("keep-open", it) }
+        }
+    }
+
+    private fun runDetachedMpvCommand(command: Array<out String>) {
+        val userdata = detachedCommandUserdata++
+        val err = MPVLib.commandAsync(command, userdata)
+        if (err < 0) {
+            Log.e(TAG, "Failed to queue async mpv command ($err): ${command.joinToString(" ")}")
         }
     }
 
@@ -2281,13 +2292,16 @@ private fun openTopMenu(existingRestoreState: StateRestoreCallback? = null) {
             translateContentUri(Uri.parse(path))
         else
             path
-        MPVLib.command(arrayOf(cmd, path2, "cached"))
-
-        // Persist the chosen external track per video so it gets reloaded on reopen.
+        // Loading/parsing large ASS subtitles can take noticeable time. Queue subtitle loading
+        // asynchronously so playback continues and the track appears once mpv finishes loading it.
         if (cmd == "sub-add") {
+            runDetachedMpvCommand(arrayOf(cmd, path2, "cached"))
             try { rememberExternalSubtitleForCurrentFile(path2) } catch (_: Throwable) {}
-        } else if (cmd == "audio-add") {
-            try { rememberExternalAudioForCurrentFile(path2) } catch (_: Throwable) {}
+        } else {
+            MPVLib.command(arrayOf(cmd, path2, "cached"))
+            if (cmd == "audio-add") {
+                try { rememberExternalAudioForCurrentFile(path2) } catch (_: Throwable) {}
+            }
         }
     }
 
