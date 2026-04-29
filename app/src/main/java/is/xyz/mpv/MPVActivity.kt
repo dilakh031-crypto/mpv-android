@@ -3069,6 +3069,7 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
             "track-list" -> player.loadTracks()
             "current-tracks/audio/selected", "current-tracks/video/image" -> updateAudioUI()
             "hwdec-current" -> updateDecoderButton()
+            "video-params/w", "video-params/h" -> player.updateRenderSizeFromVideoParams()
         }
         if (metaUpdated)
             updateMetadataDisplay()
@@ -3089,7 +3090,7 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
         when (property) {
             "time-pos" -> updatePlaybackPos(psc.positionSec)
             "playlist-pos", "playlist-count" -> updatePlaylistButtons()
-            "video-params/w", "video-params/h" -> player.updateSourceVideoSize()
+            "video-params/w", "video-params/h" -> player.updateRenderSizeFromVideoParams()
         }
     }
 
@@ -3101,7 +3102,7 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
                 updateOrientation()
                 updatePiPParams()
                 zoomGestures.setVideoAspect(player.getVideoAspect())
-                player.updateSourceVideoSize()
+                player.updateRenderSizeFromVideoParams()
             }
         }
     }
@@ -3222,7 +3223,6 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
             }
 
             zoomGestures.reset()
-            player.setSourceVideoSize(null, null, null)
             try {
                 MPVLib.setPropertyDouble("video-zoom", 0.0)
                 MPVLib.setPropertyDouble("video-pan-x", 0.0)

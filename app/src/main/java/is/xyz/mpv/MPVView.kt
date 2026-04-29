@@ -325,24 +325,22 @@ internal class MPVView(context: Context, attrs: AttributeSet) : BaseMPVView(cont
         }
     }
 
-    /**
-     * Updates TextureView/mpv rendering to use the source image/video resolution.
-     */
-    fun updateSourceVideoSize() {
-        val w = MPVLib.getPropertyInt("video-params/w")
-        val h = MPVLib.getPropertyInt("video-params/h")
+    fun updateRenderSizeFromVideoParams() {
+        val size = getVideoNativeSize()
+        setRenderSurfaceSize(size?.first, size?.second)
+    }
+
+    private fun getVideoNativeSize(): Pair<Int, Int>? {
+        val width = MPVLib.getPropertyInt("video-params/w") ?: return null
+        val height = MPVLib.getPropertyInt("video-params/h") ?: return null
+        if (width <= 0 || height <= 0)
+            return null
+
         val rot = MPVLib.getPropertyInt("video-params/rotate") ?: 0
-        val aspect = getVideoAspect()
-
-        if (w == null || h == null || w <= 0 || h <= 0) {
-            setSourceVideoSize(null, null, null)
-            return
-        }
-
-        if (rot % 180 == 90)
-            setSourceVideoSize(h, w, aspect)
+        return if (rot % 180 == 90)
+            Pair(height, width)
         else
-            setSourceVideoSize(w, h, aspect)
+            Pair(width, height)
     }
 
     fun setAudioSessionId(id: Int) {
