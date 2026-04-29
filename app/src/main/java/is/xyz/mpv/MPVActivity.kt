@@ -1543,6 +1543,18 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
         }
     }
 
+    private fun updateSourceRenderSizeFromMpv() {
+        if (!::binding.isInitialized)
+            return
+
+        val size = player.getSourceRenderSize()
+        if (size == null) {
+            player.setSourceRenderSize(null, null)
+        } else {
+            player.setSourceRenderSize(size.first, size.second)
+        }
+    }
+
     override fun onConfigurationChanged(newConfig: Configuration) {
         super.onConfigurationChanged(newConfig)
 
@@ -3069,7 +3081,6 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
             "track-list" -> player.loadTracks()
             "current-tracks/audio/selected", "current-tracks/video/image" -> updateAudioUI()
             "hwdec-current" -> updateDecoderButton()
-            "video-params/w", "video-params/h" -> player.updateRenderSizeFromVideoParams()
         }
         if (metaUpdated)
             updateMetadataDisplay()
@@ -3090,7 +3101,7 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
         when (property) {
             "time-pos" -> updatePlaybackPos(psc.positionSec)
             "playlist-pos", "playlist-count" -> updatePlaylistButtons()
-            "video-params/w", "video-params/h" -> player.updateRenderSizeFromVideoParams()
+            "video-params/w", "video-params/h" -> updateSourceRenderSizeFromMpv()
         }
     }
 
@@ -3102,7 +3113,7 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
                 updateOrientation()
                 updatePiPParams()
                 zoomGestures.setVideoAspect(player.getVideoAspect())
-                player.updateRenderSizeFromVideoParams()
+                updateSourceRenderSizeFromMpv()
             }
         }
     }
@@ -3206,7 +3217,10 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
         }
 
         if (eventId == MpvEvent.MPV_EVENT_VIDEO_RECONFIG || eventId == MpvEvent.MPV_EVENT_FILE_LOADED) {
-            eventUiHandler.post { hideStartupPreview() }
+            eventUiHandler.post {
+                hideStartupPreview()
+                updateSourceRenderSizeFromMpv()
+            }
         }
 
         if (eventId == MpvEvent.MPV_EVENT_START_FILE) {
@@ -3223,6 +3237,7 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
             }
 
             zoomGestures.reset()
+            player.setSourceRenderSize(null, null)
             try {
                 MPVLib.setPropertyDouble("video-zoom", 0.0)
                 MPVLib.setPropertyDouble("video-pan-x", 0.0)

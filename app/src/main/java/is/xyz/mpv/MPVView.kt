@@ -311,6 +311,24 @@ internal class MPVView(context: Context, attrs: AttributeSet) : BaseMPVView(cont
         get() = MPVLib.getPropertyDouble("estimated-vf-fps")
 
     /**
+     * Returns the source video/image dimensions to use as the native render buffer.
+     * Rotation is taken into account because mpv renders the rotated picture into the
+     * Android surface.
+     */
+    fun getSourceRenderSize(): Pair<Int, Int>? {
+        val w = MPVLib.getPropertyInt("video-params/w") ?: MPVLib.getPropertyInt("width") ?: return null
+        val h = MPVLib.getPropertyInt("video-params/h") ?: MPVLib.getPropertyInt("height") ?: return null
+        if (w <= 0 || h <= 0)
+            return null
+
+        val rot = MPVLib.getPropertyInt("video-params/rotate") ?: 0
+        return if (rot % 180 == 90)
+            Pair(h, w)
+        else
+            Pair(w, h)
+    }
+
+    /**
      * Returns the video aspect ratio. Rotation is taken into account.
      */
     fun getVideoAspect(): Double? {
@@ -323,24 +341,6 @@ internal class MPVView(context: Context, attrs: AttributeSet) : BaseMPVView(cont
             else
                 it
         }
-    }
-
-    fun updateRenderSizeFromVideoParams() {
-        val size = getVideoNativeSize()
-        setRenderSurfaceSize(size?.first, size?.second)
-    }
-
-    private fun getVideoNativeSize(): Pair<Int, Int>? {
-        val width = MPVLib.getPropertyInt("video-params/w") ?: return null
-        val height = MPVLib.getPropertyInt("video-params/h") ?: return null
-        if (width <= 0 || height <= 0)
-            return null
-
-        val rot = MPVLib.getPropertyInt("video-params/rotate") ?: 0
-        return if (rot % 180 == 90)
-            Pair(height, width)
-        else
-            Pair(width, height)
     }
 
     fun setAudioSessionId(id: Int) {
