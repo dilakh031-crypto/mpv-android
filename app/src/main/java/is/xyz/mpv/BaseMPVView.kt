@@ -15,14 +15,8 @@ abstract class BaseMPVView(context: Context, attrs: AttributeSet) : TextureView(
     init {
         // TextureView is part of the normal View hierarchy. This makes high-zoom
         // scale/translation much smoother than transforming a SurfaceView layer.
-        //
-        // Important for original-resolution buffers:
-        // When the SurfaceTexture buffer aspect ratio differs from the view aspect ratio,
-        // we use a TextureView transform matrix to preserve aspect ratio. In that state the
-        // texture does not cover the whole view; if TextureView is marked opaque, Android may
-        // leave the uncovered bars undefined during live buffer-size changes, which appears as
-        // strong black-edge flicker. Keep it non-opaque and paint the background black so the
-        // bars are stable.
+        // Keep the view non-opaque with a black background so bars exposed by the
+        // TextureView matrix are stable instead of undefined during buffer resizes.
         isOpaque = false
         setBackgroundColor(Color.BLACK)
     }
@@ -82,6 +76,12 @@ abstract class BaseMPVView(context: Context, attrs: AttributeSet) : TextureView(
      * Set the first file to be played once the player is ready.
      */
     fun playFile(filePath: String) {
+        // New files must not open directly with a huge source-sized buffer. That was the
+        // crash source in the previous flicker fix on some videos/images. Start safe, then
+        // switch to original resolution lazily only when the user actually enters zoom.
+        highQualityBufferLocked = false
+        updateRenderBufferSize(force = false)
+
         if (attachedSurface != null) {
             MPVLib.command(arrayOf("loadfile", filePath))
             this.filePath = null
@@ -107,24 +107,28 @@ abstract class BaseMPVView(context: Context, attrs: AttributeSet) : TextureView(
     private var surfaceViewHeight = 0
     private var renderBufferWidth = 0
     private var renderBufferHeight = 0
+    private var highQualityBufferLocked = false
     private val textureMatrix = Matrix()
 
     /**
      * Called by VideoZoomGestures.
      *
-     * Previous version switched between screen-sized buffer and original-resolution buffer
-     * exactly when zoom crossed 1x. That is what caused the black bars to flicker while a
-     * video was playing: SurfaceTexture buffer-size changes are not visually atomic.
-     *
-     * The buffer is now independent from the current zoom value. It is kept at the original
-     * video resolution whenever that resolution is known, even before zoom starts. Therefore
-     * zooming in/out only transforms the TextureView; it no longer reallocates the live video
-     * buffer during the pinch gesture.
+     * Normal playback starts with the screen-sized buffer so opening videos/images is safe.
+     * Once zoom really starts, the buffer switches to the original decoded resolution exactly
+     * and then stays locked for the current file, even if the user zooms back out. This avoids
+     * the repeated live resize that caused black-bar flicker on zoom in/out.
      */
-    fun setZoomRenderScale(scale: Float) = Unit
+    fun setZoomRenderScale(scale: Float) {
+        if (scale <= 1f + ZOOM_RENDER_EPS || highQualityBufferLocked)
+            return
+
+        highQualityBufferLocked = true
+        updateRenderBufferSize(force = false)
+    }
 
     fun notifyVideoSizeChanged() {
-        updateRenderBufferSize(force = false)
+        if (highQualityBufferLocked)
+            updateRenderBufferSize(force = false)
     }
 
     private fun attachSurfaceTexture(texture: SurfaceTexture, width: Int, height: Int) {
@@ -170,6 +174,7 @@ abstract class BaseMPVView(context: Context, attrs: AttributeSet) : TextureView(
         attachedTexture = null
         renderBufferWidth = 0
         renderBufferHeight = 0
+        highQualityBufferLocked = false
         textureMatrix.reset()
         setTransform(textureMatrix)
     }
@@ -191,23 +196,29 @@ abstract class BaseMPVView(context: Context, attrs: AttributeSet) : TextureView(
             return false
         }
 
-        // Apply the aspect-preserving transform before and after the resize. This prevents a
-        // transient full-stretch frame in the black bars on devices that redraw immediately when
-        // SurfaceTexture's default buffer size changes.
         renderBufferWidth = size.width
         renderBufferHeight = size.height
         updateTextureTransform()
-        texture.setDefaultBufferSize(renderBufferWidth, renderBufferHeight)
-        updateTextureTransform()
 
-        Log.w(TAG, "mpv texture buffer: ${renderBufferWidth}x${renderBufferHeight}")
+        try {
+            texture.setDefaultBufferSize(renderBufferWidth, renderBufferHeight)
+        } catch (e: RuntimeException) {
+            Log.e(TAG, "failed to set mpv texture buffer ${renderBufferWidth}x${renderBufferHeight}; falling back to view size", e)
+            highQualityBufferLocked = false
+            renderBufferWidth = surfaceViewWidth.coerceAtLeast(1)
+            renderBufferHeight = surfaceViewHeight.coerceAtLeast(1)
+            texture.setDefaultBufferSize(renderBufferWidth, renderBufferHeight)
+        }
+
+        updateTextureTransform()
+        Log.w(TAG, "mpv texture buffer: ${renderBufferWidth}x${renderBufferHeight}, highQuality=$highQualityBufferLocked")
         return true
     }
 
     private fun updateTextureTransform() {
         textureMatrix.reset()
 
-        if (surfaceViewWidth > 1 && surfaceViewHeight > 1 && renderBufferWidth > 1 && renderBufferHeight > 1) {
+        if (highQualityBufferLocked && surfaceViewWidth > 1 && surfaceViewHeight > 1 && renderBufferWidth > 1 && renderBufferHeight > 1) {
             val viewAr = surfaceViewWidth.toFloat() / surfaceViewHeight.toFloat()
             val bufferAr = renderBufferWidth.toFloat() / renderBufferHeight.toFloat()
             val cx = surfaceViewWidth * 0.5f
@@ -234,9 +245,12 @@ abstract class BaseMPVView(context: Context, attrs: AttributeSet) : TextureView(
         val viewW = surfaceViewWidth.coerceAtLeast(1)
         val viewH = surfaceViewHeight.coerceAtLeast(1)
 
-        // Always use the original decoded video resolution exactly when it is known.
-        // No safety cap, no fitting to screen, no scale factor.
-        // This avoids reallocating when zoom starts/ends, which fixes the flicker.
+        if (!highQualityBufferLocked)
+            return RenderSize(viewW, viewH)
+
+        // During zoom, use the original decoded video resolution exactly.
+        // No fitting to the screen, no scale factor, and no max-dimension clamp.
+        // If mpv has not exposed source dimensions yet, stay on the safe view-sized buffer.
         return currentVideoSizeForDisplay() ?: RenderSize(viewW, viewH)
     }
 
@@ -277,5 +291,6 @@ abstract class BaseMPVView(context: Context, attrs: AttributeSet) : TextureView(
 
     companion object {
         private const val TAG = "mpv"
+        private const val ZOOM_RENDER_EPS = 0.01f
     }
 }
