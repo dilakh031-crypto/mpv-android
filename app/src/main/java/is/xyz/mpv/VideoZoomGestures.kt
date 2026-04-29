@@ -7,7 +7,6 @@ import android.view.ScaleGestureDetector
 import android.view.View
 import android.view.ViewConfiguration
 import kotlin.math.hypot
-import kotlin.math.log2
 
 /**
  * High-FPS pinch-to-zoom + pan for mpv output.
@@ -26,21 +25,8 @@ import kotlin.math.log2
  *  - Touch input must come from an UNTRANSFORMED overlay view (gesture layer),
  *    not from the transformed video view itself.
  */
-/**
- * Callback invoked on every zoom/pan change.
- * [zoom]  = log2 scale factor  (0.0 = unzoomed)
- * [panX]  = mpv video-pan-x    (0.0 = centered)
- * [panY]  = mpv video-pan-y    (0.0 = centered)
- *
- * When provided, zoom/pan is applied via mpv properties so the full source
- * resolution is used for rendering (no pixelation on high-res images/video).
- * When null, the legacy Android view-transform path is used.
- */
-typealias ZoomPanCallback = (zoom: Double, panX: Double, panY: Double) -> Unit
-
 internal class VideoZoomGestures(
     private val target: View,
-    private val onZoomPan: ZoomPanCallback? = null,
 ) {
     private var viewWidth = 0f
     private var viewHeight = 0f
@@ -176,8 +162,6 @@ internal class VideoZoomGestures(
         didDrag = false
         panFingerDown = false
         lastTapTime = 0L
-        // Reset mpv properties as well (no-op when callback is null).
-        onZoomPan?.invoke(0.0, 0.0, 0.0)
         applyToView()
     }
 
@@ -359,43 +343,12 @@ internal class VideoZoomGestures(
     }
 
     private fun applyToView() {
-        val cb = onZoomPan
-        if (cb != null) {
-            // --- High-quality path: let mpv render using source resolution ---
-            // Convert the current (scale, tx, ty) view-transform into mpv's
-            // video-zoom / video-pan-x / video-pan-y coordinate space so that
-            // mpv samples directly from the original pixels instead of
-            // up-scaling a pre-rendered texture (which would look pixelated).
-            //
-            // video-zoom  = log2(scale)
-            // video-pan-X = 2 * ( viewCenter * (scale-1) + t ) / (scale * contentSize)
-            //               (derived from matching visible-center between both models)
-            val c = contentRect()
-            val mpvZoom = log2(scale.toDouble())
-            val mpvPanX = if (c.w > 0f)
-                2.0 * (viewWidth  / 2f * (scale - 1f) + tx) / (scale * c.w)
-            else 0.0
-            val mpvPanY = if (c.h > 0f)
-                2.0 * (viewHeight / 2f * (scale - 1f) + ty) / (scale * c.h)
-            else 0.0
-            cb(mpvZoom, mpvPanX, mpvPanY)
-
-            // Keep the view itself at identity — mpv drives the output.
-            target.pivotX = 0f
-            target.pivotY = 0f
-            target.scaleX = 1f
-            target.scaleY = 1f
-            target.translationX = 0f
-            target.translationY = 0f
-        } else {
-            // --- Legacy path: Android view-transform (may look pixelated at high zoom) ---
-            target.pivotX = 0f
-            target.pivotY = 0f
-            target.scaleX = scale
-            target.scaleY = scale
-            target.translationX = tx
-            target.translationY = ty
-        }
+        target.pivotX = 0f
+        target.pivotY = 0f
+        target.scaleX = scale
+        target.scaleY = scale
+        target.translationX = tx
+        target.translationY = ty
     }
 
     private data class ContentRect(val ox: Float, val oy: Float, val w: Float, val h: Float)
