@@ -103,6 +103,9 @@ internal class MPVView(context: Context, attrs: AttributeSet) : BaseMPVView(cont
         MPVLib.setOptionString("tls-verify", "yes")
         MPVLib.setOptionString("tls-ca-file", "${this.context.filesDir.path}/cacert.pem")
         MPVLib.setOptionString("input-default-bindings", "yes")
+        // Keep still images open indefinitely instead of letting mpv advance/end them
+        // after its default image display timeout.
+        MPVLib.setOptionString("image-display-duration", "inf")
         // Limit demuxer cache since the defaults are too high for mobile devices
         val cacheMegs = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O_MR1) 64 else 32
         MPVLib.setOptionString("demuxer-max-bytes", "${cacheMegs * 1024 * 1024}")
@@ -325,22 +328,13 @@ internal class MPVView(context: Context, attrs: AttributeSet) : BaseMPVView(cont
         }
     }
 
-    fun updateRenderSizeFromVideoParams() {
-        val size = getVideoNativeSize()
-        setRenderSurfaceSize(size?.first, size?.second, getVideoAspect())
-    }
-
-    private fun getVideoNativeSize(): Pair<Int, Int>? {
-        val width = MPVLib.getPropertyInt("video-params/w") ?: return null
-        val height = MPVLib.getPropertyInt("video-params/h") ?: return null
-        if (width <= 0 || height <= 0)
+    fun getVideoPixelSize(): Pair<Int, Int>? {
+        val w = MPVLib.getPropertyInt("video-params/w") ?: return null
+        val h = MPVLib.getPropertyInt("video-params/h") ?: return null
+        if (w <= 0 || h <= 0)
             return null
-
         val rot = MPVLib.getPropertyInt("video-params/rotate") ?: 0
-        return if (rot % 180 == 90)
-            Pair(height, width)
-        else
-            Pair(width, height)
+        return if (rot % 180 == 90) h to w else w to h
     }
 
     fun setAudioSessionId(id: Int) {

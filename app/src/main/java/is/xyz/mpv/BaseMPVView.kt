@@ -146,17 +146,7 @@ abstract class BaseMPVView(context: Context, attrs: AttributeSet) : TextureView(
         if (renderSurfaceWidth <= 0 || renderSurfaceHeight <= 0)
             return
 
-        try {
-            texture.setDefaultBufferSize(renderSurfaceWidth, renderSurfaceHeight)
-        } catch (e: RuntimeException) {
-            Log.e(TAG, "failed to set mpv texture buffer ${renderSurfaceWidth}x${renderSurfaceHeight}; falling back to view size", e)
-
-            customRenderSurfaceSize = false
-            renderSurfaceWidth = width.coerceAtLeast(1)
-            renderSurfaceHeight = height.coerceAtLeast(1)
-            texture.setDefaultBufferSize(renderSurfaceWidth, renderSurfaceHeight)
-        }
-
+        texture.setDefaultBufferSize(renderSurfaceWidth, renderSurfaceHeight)
         MPVLib.setPropertyString("android-surface-size", "${renderSurfaceWidth}x${renderSurfaceHeight}")
     }
 
