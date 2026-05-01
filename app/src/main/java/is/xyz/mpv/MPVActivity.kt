@@ -941,34 +941,26 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
     private fun md5Hex(input: String): String {
         val bytes = MessageDigest.getInstance("MD5").digest(input.toByteArray(Charsets.UTF_8))
         val sb = StringBuilder(bytes.size * 2)
-        for (b in bytes) sb.append(String.format("%02X", b))
+        for (b in bytes) sb.append(String.format("%02X", b.toInt() and 0xff))
         return sb.toString()
     }
 
     /**
-     * When playback reaches EOF, mpv can leave an old watch-later entry behind.
-     * That makes the next open resume from an old/random position. Save the
-     * current watch-later state, then change only the saved `start` value to 0
-     * so all other per-file options, such as subtitle delay and video filters,
-     * remain intact.
+     * Reaching EOF should clear only the resume time for the ended file.
+     *
+     * Do not call write-watch-later-config here: after EOF mpv may have already
+     * reset some per-file runtime options to defaults, and writing the whole
+     * watch-later file at that point can wipe values such as subtitle delay,
+     * contrast, brightness, selected tracks, etc. Instead, edit the existing
+     * watch-later file in-place and change/add only the `start` option.
      */
     private fun resetEndedFileWatchLaterPosition() {
         if (!shouldSavePosition)
             return
-
-        val path = MPVLib.getPropertyString("path") ?: return
         if (MPVLib.getPropertyBoolean("eof-reached") != true)
             return
 
-        // Save current per-file state first, then sanitize only the resume time.
-        // This avoids dropping other watch-later options that mpv stores with
-        // the same file, such as subtitle delay, brightness/contrast, etc.
-        try {
-            MPVLib.command(arrayOf("write-watch-later-config"))
-        } catch (e: Exception) {
-            Log.w(TAG, "failed to write watch-later config before clearing start", e)
-        }
-
+        val path = MPVLib.getPropertyString("path") ?: return
         val watchLaterDir = File(filesDir, "watch_later")
         if (!watchLaterDir.isDirectory)
             return
@@ -976,7 +968,7 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
         val candidates = linkedSetOf<File>()
         candidates.add(File(watchLaterDir, md5Hex(path)))
 
-        // Respect users who enabled ignore-path-in-watch-later-config in mpv.conf.
+        // mpv can be configured to hash only the basename.
         val basename = try { File(path).name } catch (_: Throwable) { "" }
         if (basename.isNotEmpty())
             candidates.add(File(watchLaterDir, md5Hex(basename)))
@@ -985,11 +977,13 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
         for (file in candidates)
             changed = setWatchLaterStartToBeginning(file) || changed
 
+        // If write-filename-in-watch-later-config is enabled, use the comment
+        // header as a fallback for paths whose hashed key differs from above.
         if (!changed)
             changed = setWatchLaterStartToBeginningFromCommentedFile(watchLaterDir, path)
 
         if (changed)
-            Log.d(TAG, "reset saved watch-later start for ended file")
+            Log.d(TAG, "reset only saved watch-later start for ended file")
     }
 
     private fun setWatchLaterStartToBeginningFromCommentedFile(watchLaterDir: File, path: String): Boolean {
@@ -1017,6 +1011,7 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
         return try {
             val original = file.readText(Charsets.UTF_8)
             val eol = if (original.contains("\r\n")) "\r\n" else "\n"
+            val endsWithNewline = original.endsWith("\n")
             val lines = original.split("\n").toMutableList()
             var foundStart = false
 
@@ -1034,7 +1029,7 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
 
             val updated = if (foundStart) {
                 lines.joinToString("\n")
-            } else if (original.endsWith("\n") || original.isEmpty()) {
+            } else if (endsWithNewline || original.isEmpty()) {
                 original + "start=0$eol"
             } else {
                 original + "${eol}start=0$eol"
