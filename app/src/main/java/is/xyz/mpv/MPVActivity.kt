@@ -928,26 +928,13 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
         super.onResume()
     }
 
-    private fun clearSavedPosition() {
-        try {
-            Log.d(TAG, "player reached EOF, deleting watch-later config")
-            MPVLib.command(arrayOf("delete-watch-later-config"))
-        } catch (e: Throwable) {
-            Log.w(TAG, "failed to delete watch-later config", e)
-        }
-    }
-
     private fun savePosition() {
-        val eofReached = MPVLib.getPropertyBoolean("eof-reached")
-        if (eofReached != false) {
-            if (eofReached == true)
-                clearSavedPosition()
-            else
-                Log.d(TAG, "player EOF state is unknown, not saving watch-later config")
-            return
-        }
         if (!shouldSavePosition)
             return
+        if (MPVLib.getPropertyBoolean("eof-reached") ?: true) {
+            Log.d(TAG, "player indicates EOF, not saving watch-later config")
+            return
+        }
         MPVLib.command(arrayOf("write-watch-later-config"))
     }
 
@@ -3203,10 +3190,21 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
         if (eventId == MpvEvent.MPV_EVENT_SHUTDOWN)
             finishWithResult(if (playbackHasStarted) RESULT_OK else RESULT_CANCELED)
         if (eventId == MpvEvent.MPV_EVENT_END_FILE) {
-            if (MPVLib.getPropertyBoolean("eof-reached") == true)
-                clearSavedPosition()
             psc.eof()
             updateMediaSession()
+            // When a video finishes naturally, reset the saved playback position to 0
+            // so the next open starts from the beginning.
+            // We only reset time-pos and rewrite the config (not delete it) so that
+            // other per-file settings like sub-delay and audio-delay are preserved.
+            if (shouldSavePosition) {
+                try {
+                    MPVLib.setPropertyDouble("time-pos", 0.0)
+                    MPVLib.command(arrayOf("write-watch-later-config"))
+                    Log.d(TAG, "EOF reached: reset watch-later position to 0")
+                } catch (_: Throwable) {
+                    Log.d(TAG, "EOF reached: failed to reset watch-later position, ignoring")
+                }
+            }
         }
 
         if (eventId == MpvEvent.MPV_EVENT_PLAYBACK_RESTART) {

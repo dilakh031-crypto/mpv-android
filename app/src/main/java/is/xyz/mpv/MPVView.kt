@@ -119,10 +119,7 @@ internal class MPVView(context: Context, attrs: AttributeSet) : BaseMPVView(cont
     }
 
     override fun postInitOptions() {
-        // We write watch-later manually from MPVActivity. Keep the watch-later file limited
-        // to the playback start position only, so deleting it at EOF resets only resume
-        // position and does not wipe audio/subtitle choices or other options.
-        MPVLib.setOptionString("watch-later-options", "start")
+        // we need to call write-watch-later manually
         MPVLib.setOptionString("save-position-on-quit", "no")
     }
 
