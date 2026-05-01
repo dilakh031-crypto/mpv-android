@@ -3295,6 +3295,11 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
     /** 0 = initial, 1 = paused, 2 = was already paused */
     private var pausedForSeek = 0
 
+    // Keeps gesture seeking responsive after hitting either edge of the video.
+    // Any drag distance beyond 0/duration is folded into this offset, so the
+    // next 1-second movement in the opposite direction immediately leaves the edge.
+    private var gestureSeekDeltaOffsetSec = 0
+
     private fun fadeGestureText() {
         fadeHandler.removeCallbacks(fadeRunnable3)
         binding.gestureTextView.visibility = View.VISIBLE
@@ -3322,6 +3327,7 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
                 if (!isPlayingAudio)
                     maxVolume = 0 // disallow volume gesture if no audio
                 pausedForSeek = 0
+                gestureSeekDeltaOffsetSec = 0
 
                 fadeHandler.removeCallbacks(fadeRunnable3)
                 gestureTextView.visibility = View.VISIBLE
@@ -3347,11 +3353,28 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
                     scrubSeekHandler.removeCallbacks(gestureIdleSeekRunnable)
                 }
 
-                // Quantize to 1 second steps.
+                // Quantize to 1 second steps. When the gesture reaches the
+                // start/end of the video, absorb any extra drag into an offset.
+                // This prevents "overscroll debt": moving 1 second back from
+                // the edge should require the same small reverse movement as it
+                // does anywhere else in the video.
                 val startPos = initialSeek.roundToInt()
-                val deltaSec = diff.roundToInt()
-                val newPos = (startPos + deltaSec).coerceIn(0, duration.roundToInt())
-                val newDiff = newPos - startPos
+                val durationSec = duration.roundToInt()
+                val rawDeltaSec = diff.roundToInt()
+                val minDeltaSec = -startPos
+                val maxDeltaSec = durationSec - startPos
+                var deltaSec = rawDeltaSec - gestureSeekDeltaOffsetSec
+
+                if (deltaSec > maxDeltaSec) {
+                    gestureSeekDeltaOffsetSec = rawDeltaSec - maxDeltaSec
+                    deltaSec = maxDeltaSec
+                } else if (deltaSec < minDeltaSec) {
+                    gestureSeekDeltaOffsetSec = rawDeltaSec - minDeltaSec
+                    deltaSec = minDeltaSec
+                }
+
+                val newPos = startPos + deltaSec
+                val newDiff = deltaSec
 
                 // IMPORTANT: Do NOT seek while the finger is moving.
                 // We keep the current frame frozen, and only perform an exact seek once the
@@ -3409,6 +3432,7 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
                 }
 
                 pendingGestureSeekSec = null
+                gestureSeekDeltaOffsetSec = 0
                 gestureTextView.visibility = View.GONE
             }
 
