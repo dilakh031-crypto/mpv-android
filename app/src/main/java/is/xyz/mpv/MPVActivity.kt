@@ -386,79 +386,135 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
     private var playbackHasStarted = false
     private var onloadCommands = mutableListOf<Array<String>>()
 
-    private data class RestartPreservedOptions(
-        val path: String,
-        val doubleProperties: Map<String, Double>,
-        val stringProperties: Map<String, String>
-    )
+    // mpv resets many runtime options when it starts a file again (loop-file/replay after EOF).
+    // Treat values changed during this Activity as sticky session overrides and replay them after
+    // every subsequent file-load stage. This is deliberately shallow: we do not try to change
+    // mpv's option lifetime rules, we simply put the user's values back after mpv resets them.
+    private val preservedPlaybackIntProps = linkedMapOf<String, Int>()
+    private val preservedPlaybackDoubleProps = linkedMapOf<String, Double>()
+    private val preservedPlaybackStringProps = linkedMapOf<String, String>()
 
-    private val restartPreservedDoubleProperties = arrayOf(
-        "contrast",
-        "brightness",
-        "gamma",
-        "saturation",
+    private var applyingPreservedPlaybackSettings = false
+    private var ignorePreservedPlaybackPropertyUpdatesUntilMs = 0L
+    private var replayPreservedSettingsForNextLoad = false
+    private var replayPreservedSettingsForCurrentLoad = false
+
+    private val preserveIntPropertyNames = setOf(
+        "contrast", "brightness", "gamma", "saturation"
+    )
+    private val preserveDoublePropertyNames = setOf(
         "audio-delay",
         "sub-delay",
         "secondary-sub-delay",
         "panscan",
         "video-zoom",
         "video-pan-x",
-        "video-pan-y",
-        "speed"
+        "video-pan-y"
+    )
+    private val preserveStringPropertyNames = setOf(
+        "speed", "video-aspect-override"
     )
 
-    private val restartPreservedStringProperties = arrayOf(
-        "video-aspect-override"
-    )
-
-    private var restartPreservedOptions: RestartPreservedOptions? = null
-
-    private fun getMpvStringPropertySafe(property: String): String? = try {
-        MPVLib.getPropertyString(property)
-    } catch (_: Throwable) {
-        null
+    private fun hasPreservedPlaybackSettings(): Boolean {
+        return preservedPlaybackIntProps.isNotEmpty() ||
+            preservedPlaybackDoubleProps.isNotEmpty() ||
+            preservedPlaybackStringProps.isNotEmpty()
     }
 
-    private fun getMpvDoublePropertySafe(property: String): Double? = try {
-        MPVLib.getPropertyDouble(property)
-    } catch (_: Throwable) {
-        null
+    private fun shouldIgnorePreservedPlaybackPropertyUpdates(): Boolean {
+        return applyingPreservedPlaybackSettings ||
+            SystemClock.uptimeMillis() < ignorePreservedPlaybackPropertyUpdatesUntilMs
     }
 
-    private fun captureRestartPreservedOptionsForCurrentFile() {
-        val path = getMpvStringPropertySafe("path") ?: return
-
-        val doubleValues = mutableMapOf<String, Double>()
-        for (property in restartPreservedDoubleProperties) {
-            getMpvDoublePropertySafe(property)?.let { doubleValues[property] = it }
-        }
-
-        val stringValues = mutableMapOf<String, String>()
-        for (property in restartPreservedStringProperties) {
-            getMpvStringPropertySafe(property)?.let { stringValues[property] = it }
-        }
-
-        restartPreservedOptions = RestartPreservedOptions(path, doubleValues, stringValues)
-    }
-
-    private fun isRestartingSameFileAfterEof(path: String?): Boolean {
-        val preserved = restartPreservedOptions ?: return false
-        return path != null && preserved.path == path
-    }
-
-    private fun restoreRestartPreservedOptions(path: String?) {
-        val preserved = restartPreservedOptions ?: return
-        if (path == null || preserved.path != path) {
-            restartPreservedOptions = null
+    private fun rememberPreservedPlaybackProperty(property: String, value: Int) {
+        if (property !in preserveIntPropertyNames || shouldIgnorePreservedPlaybackPropertyUpdates())
             return
-        }
+        preservedPlaybackIntProps[property] = value
+    }
 
-        for ((property, value) in preserved.doubleProperties) {
-            try { MPVLib.setPropertyDouble(property, value) } catch (_: Throwable) {}
+    private fun rememberPreservedPlaybackProperty(property: String, value: Double) {
+        if (property !in preserveDoublePropertyNames || shouldIgnorePreservedPlaybackPropertyUpdates())
+            return
+        if (value.isNaN() || value.isInfinite())
+            return
+        preservedPlaybackDoubleProps[property] = value
+    }
+
+    private fun rememberPreservedPlaybackProperty(property: String, value: String) {
+        if (property !in preserveStringPropertyNames || shouldIgnorePreservedPlaybackPropertyUpdates())
+            return
+        preservedPlaybackStringProps[property] = value
+    }
+
+    private fun rememberLivePlaybackSettings() {
+        for (property in preserveIntPropertyNames) {
+            MPVLib.getPropertyInt(property)?.let { preservedPlaybackIntProps[property] = it }
         }
-        for ((property, value) in preserved.stringProperties) {
-            try { MPVLib.setPropertyString(property, value) } catch (_: Throwable) {}
+        for (property in preserveDoublePropertyNames) {
+            MPVLib.getPropertyDouble(property)?.let { value ->
+                if (!value.isNaN() && !value.isInfinite())
+                    preservedPlaybackDoubleProps[property] = value
+            }
         }
+        for (property in preserveStringPropertyNames) {
+            MPVLib.getPropertyString(property)?.let { preservedPlaybackStringProps[property] = it }
+        }
+    }
+
+    private fun applyPreservedPlaybackSettingsNow() {
+        if (!hasPreservedPlaybackSettings())
+            return
+
+        applyingPreservedPlaybackSettings = true
+        try {
+            // Aspect string must be restored before panscan/video transforms.
+            preservedPlaybackStringProps["video-aspect-override"]?.let {
+                try { MPVLib.setPropertyString("video-aspect-override", it) } catch (_: Throwable) {}
+            }
+
+            for ((property, value) in preservedPlaybackIntProps) {
+                try { MPVLib.setPropertyInt(property, value) } catch (_: Throwable) {}
+            }
+
+            // Keep transform-ish values last; they are the most likely to be overwritten while video
+            // parameters are still settling. Delayed replays below repeat this order.
+            for ((property, value) in preservedPlaybackDoubleProps) {
+                try { MPVLib.setPropertyDouble(property, value) } catch (_: Throwable) {}
+            }
+
+            preservedPlaybackStringProps["speed"]?.let {
+                try { MPVLib.setPropertyString("speed", it) } catch (_: Throwable) {}
+            }
+        } finally {
+            applyingPreservedPlaybackSettings = false
+        }
+    }
+
+    private fun replayPreservedPlaybackSettings() {
+        if (!hasPreservedPlaybackSettings())
+            return
+
+        // Ignore mpv's transient reset notifications while the file is starting. Otherwise a reset
+        // event like contrast=0 could replace the user's cached contrast before we restore it.
+        ignorePreservedPlaybackPropertyUpdatesUntilMs = SystemClock.uptimeMillis() + 2500L
+        applyPreservedPlaybackSettingsNow()
+
+        // mpv and track selection can overwrite some options after START_FILE, so replay on a few
+        // short delays too. These calls are cheap and make loop/reload behavior deterministic.
+        for (delay in longArrayOf(60L, 180L, 420L, 900L, 1600L, 2500L)) {
+            eventUiHandler.postDelayed({ applyPreservedPlaybackSettingsNow() }, delay)
+        }
+        eventUiHandler.postDelayed({
+            replayPreservedSettingsForNextLoad = false
+            replayPreservedSettingsForCurrentLoad = false
+        }, 4000L)
+    }
+
+    private fun markPreservedPlaybackReplayNeeded() {
+        rememberLivePlaybackSettings()
+        replayPreservedSettingsForNextLoad = hasPreservedPlaybackSettings()
+        if (replayPreservedSettingsForNextLoad)
+            ignorePreservedPlaybackPropertyUpdatesUntilMs = SystemClock.uptimeMillis() + 2500L
     }
 
     // Activity lifetime
@@ -3239,6 +3295,7 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
     override fun eventProperty(property: String, value: Long) {
         if (psc.update(property, value))
             updateMediaSession()
+        rememberPreservedPlaybackProperty(property, value.toInt())
 
         if (!activityIsForeground) return
         eventUiHandler.post { eventPropertyUi(property, value) }
@@ -3247,6 +3304,7 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
     override fun eventProperty(property: String, value: Double) {
         if (psc.update(property, value))
             updateMediaSession()
+        rememberPreservedPlaybackProperty(property, value)
 
         if (!activityIsForeground) return
         eventUiHandler.post { eventPropertyUi(property, value) }
@@ -3256,6 +3314,7 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
         val metaUpdated = psc.update(property, value)
         if (metaUpdated)
             updateMediaSession()
+        rememberPreservedPlaybackProperty(property, value)
 
         if (!activityIsForeground) return
         eventUiHandler.post { eventPropertyUi(property, value, metaUpdated) }
@@ -3265,10 +3324,8 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
         if (eventId == MpvEvent.MPV_EVENT_SHUTDOWN)
             finishWithResult(if (playbackHasStarted) RESULT_OK else RESULT_CANCELED)
         if (eventId == MpvEvent.MPV_EVENT_END_FILE) {
-            // mpv resets many runtime/file-local options when a file starts again.
-            // Capture the current values at EOF so looping the same file does not
-            // lose user adjustments such as contrast, delays, aspect/panscan or speed.
-            captureRestartPreservedOptionsForCurrentFile()
+            // Take one last snapshot before mpv starts emitting file-reset property changes.
+            markPreservedPlaybackReplayNeeded()
             psc.eof()
             updateMediaSession()
         }
@@ -3281,41 +3338,38 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
                 resumeAfterScrubSeek = false
                 eventUiHandler.post { player.paused = false }
             }
+            if (replayPreservedSettingsForCurrentLoad)
+                replayPreservedPlaybackSettings()
         }
 
         if (eventId == MpvEvent.MPV_EVENT_VIDEO_RECONFIG || eventId == MpvEvent.MPV_EVENT_FILE_LOADED) {
             eventUiHandler.post { hideStartupPreview() }
-        }
-
-        if (eventId == MpvEvent.MPV_EVENT_FILE_LOADED) {
-            val currentPath = getMpvStringPropertySafe("path")
-            if (isRestartingSameFileAfterEof(currentPath))
-                restoreRestartPreservedOptions(currentPath)
-            else if (currentPath != null)
-                restartPreservedOptions = null
+            if (replayPreservedSettingsForCurrentLoad)
+                replayPreservedPlaybackSettings()
         }
 
         if (eventId == MpvEvent.MPV_EVENT_START_FILE) {
-            val currentPath = getMpvStringPropertySafe("path")
-            val restartingSameFileAfterEof = isRestartingSameFileAfterEof(currentPath)
-
             val cmds = onloadCommands.toTypedArray()
             onloadCommands.clear()
-            for (c in cmds)
-                MPVLib.command(c)
+
+            // Re-apply the user's runtime settings after any subsequent file start. This covers
+            // loop-file, replay-after-EOF, playlist advance, and manual reload paths.
+            val shouldReplaySettings = playbackHasStarted &&
+                (replayPreservedSettingsForNextLoad || hasPreservedPlaybackSettings())
+            replayPreservedSettingsForCurrentLoad = shouldReplaySettings
+            if (shouldReplaySettings)
+                ignorePreservedPlaybackPropertyUpdatesUntilMs = SystemClock.uptimeMillis() + 2500L
 
             // Apply orientation as early as possible for playlist items, so we don't show the wrong orientation first.
             // Must run on the UI thread.
             if (autoRotationMode == "auto") {
-                val p = currentPath
+                val p = MPVLib.getPropertyString("path")
                 if (p != null) eventUiHandler.post { try { applyOrientationFromMetadata(p) } catch (_: Throwable) {} }
             }
 
-            // Reset view-level zoom/pan only for a genuinely new file. When the same file
-            // restarts because it reached EOF/looped, preserve the user's in-video settings.
-            if (!restartingSameFileAfterEof) {
-                if (currentPath != null)
-                    restartPreservedOptions = null
+            // Reset view-level/mpv zoom only for a genuinely fresh start. When we got here because
+            // the previous playback ended and mpv is restarting/reloading, leave the user's view as-is.
+            if (!shouldReplaySettings) {
                 zoomGestures.reset()
                 try {
                     MPVLib.setPropertyDouble("video-zoom", 0.0)
@@ -3327,11 +3381,15 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
                 }
             }
 
+            for (c in cmds)
+                MPVLib.command(c)
+
             // Restore the user's previously chosen subtitle and audio track for this video.
             try { restoreSubtitleSelectionForCurrentFile() } catch (_: Throwable) {}
             try { restoreAudioSelectionForCurrentFile() } catch (_: Throwable) {}
-            if (restartingSameFileAfterEof)
-                restoreRestartPreservedOptions(currentPath)
+
+            if (shouldReplaySettings)
+                replayPreservedPlaybackSettings()
 
             if (this.statsLuaMode > 0 && !playbackHasStarted) {
                 MPVLib.command(arrayOf("script-binding", "stats/display-page-${this.statsLuaMode}-toggle"))
