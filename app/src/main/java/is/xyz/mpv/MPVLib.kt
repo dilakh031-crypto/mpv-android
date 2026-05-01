@@ -98,9 +98,14 @@ object MPVLib {
 
     @JvmStatic
     fun event(eventId: Int) {
+        event(eventId, 0L, 0)
+    }
+
+    @JvmStatic
+    fun event(eventId: Int, replyUserdata: Long, error: Int) {
         synchronized(observers) {
             for (o in observers)
-                o.event(eventId)
+                o.event(eventId, replyUserdata, error)
         }
     }
 
@@ -135,6 +140,9 @@ object MPVLib {
         fun eventProperty(property: String, value: String)
         fun eventProperty(property: String, value: Double)
         fun event(eventId: Int)
+        fun event(eventId: Int, replyUserdata: Long, error: Int) {
+            event(eventId)
+        }
     }
 
     interface LogObserver {
