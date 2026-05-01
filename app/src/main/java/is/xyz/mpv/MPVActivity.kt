@@ -928,13 +928,26 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
         super.onResume()
     }
 
+    private fun clearSavedPosition() {
+        try {
+            Log.d(TAG, "player reached EOF, deleting watch-later config")
+            MPVLib.command(arrayOf("delete-watch-later-config"))
+        } catch (e: Throwable) {
+            Log.w(TAG, "failed to delete watch-later config", e)
+        }
+    }
+
     private fun savePosition() {
-        if (!shouldSavePosition)
-            return
-        if (MPVLib.getPropertyBoolean("eof-reached") ?: true) {
-            Log.d(TAG, "player indicates EOF, not saving watch-later config")
+        val eofReached = MPVLib.getPropertyBoolean("eof-reached")
+        if (eofReached != false) {
+            if (eofReached == true)
+                clearSavedPosition()
+            else
+                Log.d(TAG, "player EOF state is unknown, not saving watch-later config")
             return
         }
+        if (!shouldSavePosition)
+            return
         MPVLib.command(arrayOf("write-watch-later-config"))
     }
 
@@ -3190,6 +3203,8 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
         if (eventId == MpvEvent.MPV_EVENT_SHUTDOWN)
             finishWithResult(if (playbackHasStarted) RESULT_OK else RESULT_CANCELED)
         if (eventId == MpvEvent.MPV_EVENT_END_FILE) {
+            if (MPVLib.getPropertyBoolean("eof-reached") == true)
+                clearSavedPosition()
             psc.eof()
             updateMediaSession()
         }
