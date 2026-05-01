@@ -386,6 +386,81 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
     private var playbackHasStarted = false
     private var onloadCommands = mutableListOf<Array<String>>()
 
+    private data class RestartPreservedOptions(
+        val path: String,
+        val doubleProperties: Map<String, Double>,
+        val stringProperties: Map<String, String>
+    )
+
+    private val restartPreservedDoubleProperties = arrayOf(
+        "contrast",
+        "brightness",
+        "gamma",
+        "saturation",
+        "audio-delay",
+        "sub-delay",
+        "secondary-sub-delay",
+        "panscan",
+        "video-zoom",
+        "video-pan-x",
+        "video-pan-y",
+        "speed"
+    )
+
+    private val restartPreservedStringProperties = arrayOf(
+        "video-aspect-override"
+    )
+
+    private var restartPreservedOptions: RestartPreservedOptions? = null
+
+    private fun getMpvStringPropertySafe(property: String): String? = try {
+        MPVLib.getPropertyString(property)
+    } catch (_: Throwable) {
+        null
+    }
+
+    private fun getMpvDoublePropertySafe(property: String): Double? = try {
+        MPVLib.getPropertyDouble(property)
+    } catch (_: Throwable) {
+        null
+    }
+
+    private fun captureRestartPreservedOptionsForCurrentFile() {
+        val path = getMpvStringPropertySafe("path") ?: return
+
+        val doubleValues = mutableMapOf<String, Double>()
+        for (property in restartPreservedDoubleProperties) {
+            getMpvDoublePropertySafe(property)?.let { doubleValues[property] = it }
+        }
+
+        val stringValues = mutableMapOf<String, String>()
+        for (property in restartPreservedStringProperties) {
+            getMpvStringPropertySafe(property)?.let { stringValues[property] = it }
+        }
+
+        restartPreservedOptions = RestartPreservedOptions(path, doubleValues, stringValues)
+    }
+
+    private fun isRestartingSameFileAfterEof(path: String?): Boolean {
+        val preserved = restartPreservedOptions ?: return false
+        return path != null && preserved.path == path
+    }
+
+    private fun restoreRestartPreservedOptions(path: String?) {
+        val preserved = restartPreservedOptions ?: return
+        if (path == null || preserved.path != path) {
+            restartPreservedOptions = null
+            return
+        }
+
+        for ((property, value) in preserved.doubleProperties) {
+            try { MPVLib.setPropertyDouble(property, value) } catch (_: Throwable) {}
+        }
+        for ((property, value) in preserved.stringProperties) {
+            try { MPVLib.setPropertyString(property, value) } catch (_: Throwable) {}
+        }
+    }
+
     // Activity lifetime
 
         override fun onCreate(icicle: Bundle?) {
@@ -936,115 +1011,6 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
             return
         }
         MPVLib.command(arrayOf("write-watch-later-config"))
-    }
-
-    private fun md5Hex(input: String): String {
-        val bytes = MessageDigest.getInstance("MD5").digest(input.toByteArray(Charsets.UTF_8))
-        val sb = StringBuilder(bytes.size * 2)
-        for (b in bytes) sb.append(String.format("%02X", b.toInt() and 0xff))
-        return sb.toString()
-    }
-
-    /**
-     * Reaching EOF should clear only the resume time for the ended file.
-     *
-     * Do not call write-watch-later-config here: after EOF mpv may have already
-     * reset some per-file runtime options to defaults, and writing the whole
-     * watch-later file at that point can wipe values such as subtitle delay,
-     * contrast, brightness, selected tracks, etc. Instead, edit the existing
-     * watch-later file in-place and change/add only the `start` option.
-     */
-    private fun resetEndedFileWatchLaterPosition() {
-        if (!shouldSavePosition)
-            return
-        if (MPVLib.getPropertyBoolean("eof-reached") != true)
-            return
-
-        val path = MPVLib.getPropertyString("path") ?: return
-        val watchLaterDir = File(filesDir, "watch_later")
-        if (!watchLaterDir.isDirectory)
-            return
-
-        val candidates = linkedSetOf<File>()
-        candidates.add(File(watchLaterDir, md5Hex(path)))
-
-        // mpv can be configured to hash only the basename.
-        val basename = try { File(path).name } catch (_: Throwable) { "" }
-        if (basename.isNotEmpty())
-            candidates.add(File(watchLaterDir, md5Hex(basename)))
-
-        var changed = false
-        for (file in candidates)
-            changed = setWatchLaterStartToBeginning(file) || changed
-
-        // If write-filename-in-watch-later-config is enabled, use the comment
-        // header as a fallback for paths whose hashed key differs from above.
-        if (!changed)
-            changed = setWatchLaterStartToBeginningFromCommentedFile(watchLaterDir, path)
-
-        if (changed)
-            Log.d(TAG, "reset only saved watch-later start for ended file")
-    }
-
-    private fun setWatchLaterStartToBeginningFromCommentedFile(watchLaterDir: File, path: String): Boolean {
-        val files = watchLaterDir.listFiles() ?: return false
-        for (file in files) {
-            if (!file.isFile)
-                continue
-            try {
-                val firstComment = file.useLines(Charsets.UTF_8) { lines ->
-                    lines.firstOrNull { it.startsWith("# ") }
-                }
-                if (firstComment == "# $path" && setWatchLaterStartToBeginning(file))
-                    return true
-            } catch (e: Exception) {
-                Log.w(TAG, "failed to inspect watch-later file", e)
-            }
-        }
-        return false
-    }
-
-    private fun setWatchLaterStartToBeginning(file: File): Boolean {
-        if (!file.isFile)
-            return false
-
-        return try {
-            val original = file.readText(Charsets.UTF_8)
-            val eol = if (original.contains("\r\n")) "\r\n" else "\n"
-            val endsWithNewline = original.endsWith("\n")
-            val lines = original.split("\n").toMutableList()
-            var foundStart = false
-
-            for (i in lines.indices) {
-                val rawLine = lines[i]
-                val hadCarriageReturn = rawLine.endsWith("\r")
-                val line = if (hadCarriageReturn) rawLine.dropLast(1) else rawLine
-                val leadingWhitespace = line.takeWhile { it == ' ' || it == '\t' }
-
-                if (line.trimStart().startsWith("start=")) {
-                    lines[i] = leadingWhitespace + "start=0" + if (hadCarriageReturn) "\r" else ""
-                    foundStart = true
-                }
-            }
-
-            val updated = if (foundStart) {
-                lines.joinToString("\n")
-            } else if (endsWithNewline || original.isEmpty()) {
-                original + "start=0$eol"
-            } else {
-                original + "${eol}start=0$eol"
-            }
-
-            if (updated == original) {
-                false
-            } else {
-                file.writeText(updated, Charsets.UTF_8)
-                true
-            }
-        } catch (e: Exception) {
-            Log.w(TAG, "failed to reset watch-later start", e)
-            false
-        }
     }
 
     /**
@@ -3299,7 +3265,10 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
         if (eventId == MpvEvent.MPV_EVENT_SHUTDOWN)
             finishWithResult(if (playbackHasStarted) RESULT_OK else RESULT_CANCELED)
         if (eventId == MpvEvent.MPV_EVENT_END_FILE) {
-            resetEndedFileWatchLaterPosition()
+            // mpv resets many runtime/file-local options when a file starts again.
+            // Capture the current values at EOF so looping the same file does not
+            // lose user adjustments such as contrast, delays, aspect/panscan or speed.
+            captureRestartPreservedOptionsForCurrentFile()
             psc.eof()
             updateMediaSession()
         }
@@ -3318,35 +3287,52 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
             eventUiHandler.post { hideStartupPreview() }
         }
 
+        if (eventId == MpvEvent.MPV_EVENT_FILE_LOADED) {
+            val currentPath = getMpvStringPropertySafe("path")
+            if (isRestartingSameFileAfterEof(currentPath))
+                restoreRestartPreservedOptions(currentPath)
+            else if (currentPath != null)
+                restartPreservedOptions = null
+        }
+
         if (eventId == MpvEvent.MPV_EVENT_START_FILE) {
+            val currentPath = getMpvStringPropertySafe("path")
+            val restartingSameFileAfterEof = isRestartingSameFileAfterEof(currentPath)
+
             val cmds = onloadCommands.toTypedArray()
             onloadCommands.clear()
             for (c in cmds)
-            // Reset any view-level zoom/pan when a new file starts.
+                MPVLib.command(c)
 
             // Apply orientation as early as possible for playlist items, so we don't show the wrong orientation first.
             // Must run on the UI thread.
             if (autoRotationMode == "auto") {
-                val p = MPVLib.getPropertyString("path")
+                val p = currentPath
                 if (p != null) eventUiHandler.post { try { applyOrientationFromMetadata(p) } catch (_: Throwable) {} }
             }
 
-            zoomGestures.reset()
-            try {
-                MPVLib.setPropertyDouble("video-zoom", 0.0)
-                MPVLib.setPropertyDouble("video-pan-x", 0.0)
-                MPVLib.setPropertyDouble("video-pan-y", 0.0)
-                MPVLib.setPropertyDouble("panscan", 0.0)
-            } catch (_: Throwable) {
-                // ignore
+            // Reset view-level zoom/pan only for a genuinely new file. When the same file
+            // restarts because it reached EOF/looped, preserve the user's in-video settings.
+            if (!restartingSameFileAfterEof) {
+                if (currentPath != null)
+                    restartPreservedOptions = null
+                zoomGestures.reset()
+                try {
+                    MPVLib.setPropertyDouble("video-zoom", 0.0)
+                    MPVLib.setPropertyDouble("video-pan-x", 0.0)
+                    MPVLib.setPropertyDouble("video-pan-y", 0.0)
+                    MPVLib.setPropertyDouble("panscan", 0.0)
+                } catch (_: Throwable) {
+                    // ignore
+                }
             }
-
-            for (c in onloadCommands)
-                MPVLib.command(c)
 
             // Restore the user's previously chosen subtitle and audio track for this video.
             try { restoreSubtitleSelectionForCurrentFile() } catch (_: Throwable) {}
             try { restoreAudioSelectionForCurrentFile() } catch (_: Throwable) {}
+            if (restartingSameFileAfterEof)
+                restoreRestartPreservedOptions(currentPath)
+
             if (this.statsLuaMode > 0 && !playbackHasStarted) {
                 MPVLib.command(arrayOf("script-binding", "stats/display-page-${this.statsLuaMode}-toggle"))
             }
