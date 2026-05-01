@@ -946,10 +946,11 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
     }
 
     /**
-     * When playback reaches EOF, mpv leaves any old watch-later file untouched.
-     * That can make the next open resume from an old/random position. We only
-     * remove the saved `start` option so the file starts from the beginning,
-     * while keeping any other per-file options stored in the same resume file.
+     * When playback reaches EOF, mpv can leave an old watch-later entry behind.
+     * That makes the next open resume from an old/random position. Save the
+     * current watch-later state, then change only the saved `start` value to 0
+     * so all other per-file options, such as subtitle delay and video filters,
+     * remain intact.
      */
     private fun resetEndedFileWatchLaterPosition() {
         if (!shouldSavePosition)
@@ -958,6 +959,16 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
         val path = MPVLib.getPropertyString("path") ?: return
         if (MPVLib.getPropertyBoolean("eof-reached") != true)
             return
+
+        // Save current per-file state first, then sanitize only the resume time.
+        // This avoids dropping other watch-later options that mpv stores with
+        // the same file, such as subtitle delay, brightness/contrast, etc.
+        try {
+            MPVLib.command(arrayOf("write-watch-later-config"))
+        } catch (e: Exception) {
+            Log.w(TAG, "failed to write watch-later config before clearing start", e)
+        }
+
         val watchLaterDir = File(filesDir, "watch_later")
         if (!watchLaterDir.isDirectory)
             return
@@ -972,16 +983,16 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
 
         var changed = false
         for (file in candidates)
-            changed = stripWatchLaterStart(file) || changed
+            changed = setWatchLaterStartToBeginning(file) || changed
 
         if (!changed)
-            changed = stripWatchLaterStartFromCommentedFile(watchLaterDir, path)
+            changed = setWatchLaterStartToBeginningFromCommentedFile(watchLaterDir, path)
 
         if (changed)
-            Log.d(TAG, "cleared saved watch-later start for ended file")
+            Log.d(TAG, "reset saved watch-later start for ended file")
     }
 
-    private fun stripWatchLaterStartFromCommentedFile(watchLaterDir: File, path: String): Boolean {
+    private fun setWatchLaterStartToBeginningFromCommentedFile(watchLaterDir: File, path: String): Boolean {
         val files = watchLaterDir.listFiles() ?: return false
         for (file in files) {
             if (!file.isFile)
@@ -990,7 +1001,7 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
                 val firstComment = file.useLines(Charsets.UTF_8) { lines ->
                     lines.firstOrNull { it.startsWith("# ") }
                 }
-                if (firstComment == "# $path" && stripWatchLaterStart(file))
+                if (firstComment == "# $path" && setWatchLaterStartToBeginning(file))
                     return true
             } catch (e: Exception) {
                 Log.w(TAG, "failed to inspect watch-later file", e)
@@ -999,24 +1010,44 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
         return false
     }
 
-    private fun stripWatchLaterStart(file: File): Boolean {
+    private fun setWatchLaterStartToBeginning(file: File): Boolean {
         if (!file.isFile)
             return false
 
         return try {
             val original = file.readText(Charsets.UTF_8)
-            val filtered = original.splitToSequence('\n')
-                .filterNot { line -> line.trimStart().startsWith("start=") }
-                .joinToString("\n")
+            val eol = if (original.contains("\r\n")) "\r\n" else "\n"
+            val lines = original.split("\n").toMutableList()
+            var foundStart = false
 
-            if (filtered == original) {
+            for (i in lines.indices) {
+                val rawLine = lines[i]
+                val hadCarriageReturn = rawLine.endsWith("\r")
+                val line = if (hadCarriageReturn) rawLine.dropLast(1) else rawLine
+                val leadingWhitespace = line.takeWhile { it == ' ' || it == '\t' }
+
+                if (line.trimStart().startsWith("start=")) {
+                    lines[i] = leadingWhitespace + "start=0" + if (hadCarriageReturn) "\r" else ""
+                    foundStart = true
+                }
+            }
+
+            val updated = if (foundStart) {
+                lines.joinToString("\n")
+            } else if (original.endsWith("\n") || original.isEmpty()) {
+                original + "start=0$eol"
+            } else {
+                original + "${eol}start=0$eol"
+            }
+
+            if (updated == original) {
                 false
             } else {
-                file.writeText(filtered, Charsets.UTF_8)
+                file.writeText(updated, Charsets.UTF_8)
                 true
             }
         } catch (e: Exception) {
-            Log.w(TAG, "failed to clear watch-later start", e)
+            Log.w(TAG, "failed to reset watch-later start", e)
             false
         }
     }
