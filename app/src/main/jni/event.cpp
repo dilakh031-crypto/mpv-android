@@ -42,7 +42,7 @@ static void sendPropertyUpdateToJava(JNIEnv *env, mpv_event_property *prop)
 
 static void sendEventToJava(JNIEnv *env, mpv_event *event)
 {
-    env->CallStaticVoidMethod(mpv_MPVLib, mpv_MPVLib_event,
+    env->CallStaticVoidMethod(mpv_MPVLib, mpv_MPVLib_event_IJI,
         (jint) event->event_id,
         (jlong) event->reply_userdata,
         (jint) event->error);
