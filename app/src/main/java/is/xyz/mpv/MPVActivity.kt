@@ -938,6 +938,89 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
         MPVLib.command(arrayOf("write-watch-later-config"))
     }
 
+    private fun md5Hex(input: String): String {
+        val bytes = MessageDigest.getInstance("MD5").digest(input.toByteArray(Charsets.UTF_8))
+        val sb = StringBuilder(bytes.size * 2)
+        for (b in bytes) sb.append(String.format("%02X", b))
+        return sb.toString()
+    }
+
+    /**
+     * When playback reaches EOF, mpv leaves any old watch-later file untouched.
+     * That can make the next open resume from an old/random position. We only
+     * remove the saved `start` option so the file starts from the beginning,
+     * while keeping any other per-file options stored in the same resume file.
+     */
+    private fun resetEndedFileWatchLaterPosition() {
+        if (!shouldSavePosition)
+            return
+
+        val path = MPVLib.getPropertyString("path") ?: return
+        if (MPVLib.getPropertyBoolean("eof-reached") != true)
+            return
+        val watchLaterDir = File(filesDir, "watch_later")
+        if (!watchLaterDir.isDirectory)
+            return
+
+        val candidates = linkedSetOf<File>()
+        candidates.add(File(watchLaterDir, md5Hex(path)))
+
+        // Respect users who enabled ignore-path-in-watch-later-config in mpv.conf.
+        val basename = try { File(path).name } catch (_: Throwable) { "" }
+        if (basename.isNotEmpty())
+            candidates.add(File(watchLaterDir, md5Hex(basename)))
+
+        var changed = false
+        for (file in candidates)
+            changed = stripWatchLaterStart(file) || changed
+
+        if (!changed)
+            changed = stripWatchLaterStartFromCommentedFile(watchLaterDir, path)
+
+        if (changed)
+            Log.d(TAG, "cleared saved watch-later start for ended file")
+    }
+
+    private fun stripWatchLaterStartFromCommentedFile(watchLaterDir: File, path: String): Boolean {
+        val files = watchLaterDir.listFiles() ?: return false
+        for (file in files) {
+            if (!file.isFile)
+                continue
+            try {
+                val firstComment = file.useLines(Charsets.UTF_8) { lines ->
+                    lines.firstOrNull { it.startsWith("# ") }
+                }
+                if (firstComment == "# $path" && stripWatchLaterStart(file))
+                    return true
+            } catch (e: Exception) {
+                Log.w(TAG, "failed to inspect watch-later file", e)
+            }
+        }
+        return false
+    }
+
+    private fun stripWatchLaterStart(file: File): Boolean {
+        if (!file.isFile)
+            return false
+
+        return try {
+            val original = file.readText(Charsets.UTF_8)
+            val filtered = original.splitToSequence('\n')
+                .filterNot { line -> line.trimStart().startsWith("start=") }
+                .joinToString("\n")
+
+            if (filtered == original) {
+                false
+            } else {
+                file.writeText(filtered, Charsets.UTF_8)
+                true
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "failed to clear watch-later start", e)
+            false
+        }
+    }
+
     /**
      * Requests or abandons audio focus and noisy receiver depending on the playback state.
      * @warning Call from event thread, not UI thread
@@ -3190,21 +3273,9 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
         if (eventId == MpvEvent.MPV_EVENT_SHUTDOWN)
             finishWithResult(if (playbackHasStarted) RESULT_OK else RESULT_CANCELED)
         if (eventId == MpvEvent.MPV_EVENT_END_FILE) {
+            resetEndedFileWatchLaterPosition()
             psc.eof()
             updateMediaSession()
-            // When a video finishes naturally, reset the saved playback position to 0
-            // so the next open starts from the beginning.
-            // We only reset time-pos and rewrite the config (not delete it) so that
-            // other per-file settings like sub-delay and audio-delay are preserved.
-            if (shouldSavePosition) {
-                try {
-                    MPVLib.setPropertyDouble("time-pos", 0.0)
-                    MPVLib.command(arrayOf("write-watch-later-config"))
-                    Log.d(TAG, "EOF reached: reset watch-later position to 0")
-                } catch (_: Throwable) {
-                    Log.d(TAG, "EOF reached: failed to reset watch-later position, ignoring")
-                }
-            }
         }
 
         if (eventId == MpvEvent.MPV_EVENT_PLAYBACK_RESTART) {
