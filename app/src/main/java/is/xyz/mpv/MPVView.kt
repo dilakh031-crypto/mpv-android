@@ -349,10 +349,16 @@ internal class MPVView(context: Context, attrs: AttributeSet) : BaseMPVView(cont
             return v?.toIntOrNull() ?: -1
         }
         operator fun setValue(thisRef: Any?, property: KProperty<*>, value: Int) {
-            if (value == -1)
-                MPVLib.setPropertyString(name, "no")
-            else
-                MPVLib.setPropertyInt(name, value)
+            // Changing subtitle/audio/video track properties can trigger mpv to load or unload
+            // complex assets (e.g., large ASS subtitle files). Performing this synchronously on
+            // the UI thread can cause noticeable stutters. Dispatch the property change on a
+            // background thread so that the UI remains responsive.
+            Thread {
+                if (value == -1)
+                    MPVLib.setPropertyString(name, "no")
+                else
+                    MPVLib.setPropertyInt(name, value)
+            }.start()
         }
     }
 

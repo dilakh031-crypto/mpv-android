@@ -928,24 +928,13 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
         super.onResume()
     }
 
-    private fun clearSavedPositionIfEOF() {
-        if (MPVLib.getPropertyBoolean("eof-reached") != true)
-            return
-
-        // Reaching EOF means the file was watched completely. If we only skip
-        // write-watch-later-config here, an older watch-later file can remain on
-        // disk and make the next playback resume from that stale position.
-        Log.d(TAG, "player reached EOF, deleting watch-later config")
-        MPVLib.command(arrayOf("delete-watch-later-config"))
-    }
-
     private fun savePosition() {
-        if (MPVLib.getPropertyBoolean("eof-reached") == true) {
-            clearSavedPositionIfEOF()
-            return
-        }
         if (!shouldSavePosition)
             return
+        if (MPVLib.getPropertyBoolean("eof-reached") ?: true) {
+            Log.d(TAG, "player indicates EOF, not saving watch-later config")
+            return
+        }
         MPVLib.command(arrayOf("write-watch-later-config"))
     }
 
@@ -1784,11 +1773,17 @@ private fun restoreSubtitleSelectionForCurrentFile() {
     if (kind1 == null && kind2 == null) return
 
     // Restore primary first (or leave mpv's default selection if the user never chose anything).
-    when (kind1) {
+        when (kind1) {
         PREF_SUB_KIND_EXTERNAL -> {
             if (!ext1.isNullOrEmpty()) {
                 // "cached" will select the subtitle; if it already exists, it will be reused.
-                MPVLib.command(arrayOf("sub-add", ext1, "cached"))
+                // Use asynchronous command to avoid blocking the UI when loading large external subtitle files.
+                try {
+                    MPVLib.commandAsync(arrayOf("sub-add", ext1, "cached"), 0)
+                } catch (_: Throwable) {
+                    // fallback to synchronous command if async fails
+                    try { MPVLib.command(arrayOf("sub-add", ext1, "cached")) } catch (_: Throwable) {}
+                }
             }
         }
         PREF_SUB_KIND_SID -> {
@@ -1811,7 +1806,17 @@ private fun restoreSubtitleSelectionForCurrentFile() {
                 var sid = findExternalSubSidForFilename(ext2)
                 if (sid == null) {
                     // Add without selecting as primary.
-                    MPVLib.command(arrayOf("sub-add", ext2, "auto"))
+                    // Use asynchronous command to avoid blocking the UI when loading large external subtitle files.
+                    var asyncFailed = false
+                    try {
+                        MPVLib.commandAsync(arrayOf("sub-add", ext2, "auto"), 0)
+                    } catch (_: Throwable) {
+                        asyncFailed = true
+                    }
+                    if (asyncFailed) {
+                        // Fallback to synchronous command if async fails
+                        try { MPVLib.command(arrayOf("sub-add", ext2, "auto")) } catch (_: Throwable) {}
+                    }
                     sid = waitForExternalSubSid(ext2)
                 }
 
@@ -2305,24 +2310,32 @@ private fun genericMenu(
 private fun openTopMenu(existingRestoreState: StateRestoreCallback? = null) {
     val restoreState = existingRestoreState ?: pauseForDialog()
 
-    fun addExternalThing(cmd: String, result: Int, data: Intent?) {
-        if (result != RESULT_OK)
-            return
-        // file picker may return a content URI or a bare file path
-        val path = data!!.getStringExtra("path")!!
-        val path2 = if (path.startsWith("content://"))
-            translateContentUri(Uri.parse(path))
-        else
-            path
-        MPVLib.command(arrayOf(cmd, path2, "cached"))
+        fun addExternalThing(cmd: String, result: Int, data: Intent?) {
+            if (result != RESULT_OK)
+                return
+            // file picker may return a content URI or a bare file path
+            val path = data!!.getStringExtra("path")!!
+            val path2 = if (path.startsWith("content://"))
+                translateContentUri(Uri.parse(path))
+            else
+                path
 
-        // Persist the chosen external track per video so it gets reloaded on reopen.
-        if (cmd == "sub-add") {
-            try { rememberExternalSubtitleForCurrentFile(path2) } catch (_: Throwable) {}
-        } else if (cmd == "audio-add") {
-            try { rememberExternalAudioForCurrentFile(path2) } catch (_: Throwable) {}
+            // Adding large external tracks (subtitles/audio) can block the UI when executed
+            // synchronously. Use the asynchronous command API to avoid freezing the UI.
+            try {
+                MPVLib.commandAsync(arrayOf(cmd, path2, "cached"), 0)
+            } catch (_: Throwable) {
+                // Fallback to synchronous command if async fails for some reason
+                try { MPVLib.command(arrayOf(cmd, path2, "cached")) } catch (_: Throwable) {}
+            }
+
+            // Persist the chosen external track per video so it gets reloaded on reopen.
+            if (cmd == "sub-add") {
+                try { rememberExternalSubtitleForCurrentFile(path2) } catch (_: Throwable) {}
+            } else if (cmd == "audio-add") {
+                try { rememberExternalAudioForCurrentFile(path2) } catch (_: Throwable) {}
+            }
         }
-    }
 
     fun openChapterListDialog() {
         val chapters = player.loadChapters()
@@ -3201,7 +3214,6 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
         if (eventId == MpvEvent.MPV_EVENT_SHUTDOWN)
             finishWithResult(if (playbackHasStarted) RESULT_OK else RESULT_CANCELED)
         if (eventId == MpvEvent.MPV_EVENT_END_FILE) {
-            try { clearSavedPositionIfEOF() } catch (e: Throwable) { Log.w(TAG, "failed to delete watch-later config at EOF", e) }
             psc.eof()
             updateMediaSession()
         }
