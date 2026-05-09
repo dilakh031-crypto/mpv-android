@@ -1773,17 +1773,11 @@ private fun restoreSubtitleSelectionForCurrentFile() {
     if (kind1 == null && kind2 == null) return
 
     // Restore primary first (or leave mpv's default selection if the user never chose anything).
-        when (kind1) {
+    when (kind1) {
         PREF_SUB_KIND_EXTERNAL -> {
             if (!ext1.isNullOrEmpty()) {
                 // "cached" will select the subtitle; if it already exists, it will be reused.
-                // Use asynchronous command to avoid blocking the UI when loading large external subtitle files.
-                try {
-                    MPVLib.commandAsync(arrayOf("sub-add", ext1, "cached"), 0)
-                } catch (_: Throwable) {
-                    // fallback to synchronous command if async fails
-                    try { MPVLib.command(arrayOf("sub-add", ext1, "cached")) } catch (_: Throwable) {}
-                }
+                MPVLib.command(arrayOf("sub-add", ext1, "cached"))
             }
         }
         PREF_SUB_KIND_SID -> {
@@ -1806,17 +1800,7 @@ private fun restoreSubtitleSelectionForCurrentFile() {
                 var sid = findExternalSubSidForFilename(ext2)
                 if (sid == null) {
                     // Add without selecting as primary.
-                    // Use asynchronous command to avoid blocking the UI when loading large external subtitle files.
-                    var asyncFailed = false
-                    try {
-                        MPVLib.commandAsync(arrayOf("sub-add", ext2, "auto"), 0)
-                    } catch (_: Throwable) {
-                        asyncFailed = true
-                    }
-                    if (asyncFailed) {
-                        // Fallback to synchronous command if async fails
-                        try { MPVLib.command(arrayOf("sub-add", ext2, "auto")) } catch (_: Throwable) {}
-                    }
+                    MPVLib.command(arrayOf("sub-add", ext2, "auto"))
                     sid = waitForExternalSubSid(ext2)
                 }
 
@@ -2310,32 +2294,24 @@ private fun genericMenu(
 private fun openTopMenu(existingRestoreState: StateRestoreCallback? = null) {
     val restoreState = existingRestoreState ?: pauseForDialog()
 
-        fun addExternalThing(cmd: String, result: Int, data: Intent?) {
-            if (result != RESULT_OK)
-                return
-            // file picker may return a content URI or a bare file path
-            val path = data!!.getStringExtra("path")!!
-            val path2 = if (path.startsWith("content://"))
-                translateContentUri(Uri.parse(path))
-            else
-                path
+    fun addExternalThing(cmd: String, result: Int, data: Intent?) {
+        if (result != RESULT_OK)
+            return
+        // file picker may return a content URI or a bare file path
+        val path = data!!.getStringExtra("path")!!
+        val path2 = if (path.startsWith("content://"))
+            translateContentUri(Uri.parse(path))
+        else
+            path
+        MPVLib.command(arrayOf(cmd, path2, "cached"))
 
-            // Adding large external tracks (subtitles/audio) can block the UI when executed
-            // synchronously. Use the asynchronous command API to avoid freezing the UI.
-            try {
-                MPVLib.commandAsync(arrayOf(cmd, path2, "cached"), 0)
-            } catch (_: Throwable) {
-                // Fallback to synchronous command if async fails for some reason
-                try { MPVLib.command(arrayOf(cmd, path2, "cached")) } catch (_: Throwable) {}
-            }
-
-            // Persist the chosen external track per video so it gets reloaded on reopen.
-            if (cmd == "sub-add") {
-                try { rememberExternalSubtitleForCurrentFile(path2) } catch (_: Throwable) {}
-            } else if (cmd == "audio-add") {
-                try { rememberExternalAudioForCurrentFile(path2) } catch (_: Throwable) {}
-            }
+        // Persist the chosen external track per video so it gets reloaded on reopen.
+        if (cmd == "sub-add") {
+            try { rememberExternalSubtitleForCurrentFile(path2) } catch (_: Throwable) {}
+        } else if (cmd == "audio-add") {
+            try { rememberExternalAudioForCurrentFile(path2) } catch (_: Throwable) {}
         }
+    }
 
     fun openChapterListDialog() {
         val chapters = player.loadChapters()
