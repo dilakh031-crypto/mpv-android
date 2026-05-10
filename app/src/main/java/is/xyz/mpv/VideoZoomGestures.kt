@@ -39,6 +39,34 @@ internal class VideoZoomGestures(
     private var videoPixelWidth = 0
     private var videoPixelHeight = 0
 
+    /**
+     * Returns true if the current video orientation (based on the reported
+     * aspect ratio) does not match the device orientation. A mismatch is
+     * defined as one of the following:
+     *  - the video is wider than it is tall (landscape) while the view
+     *    dimensions indicate a portrait device layout, or
+     *  - the video is taller than it is wide (portrait) while the view
+     *    dimensions indicate a landscape device layout.
+     *
+     * When a mismatch occurs, the video needs to be treated as if it were
+     * rotated to match the device’s orientation for the purposes of
+     * calculating the base content rectangle and render surface size. This
+     * ensures that pinch-to-zoom continues to operate on the full source
+     * resolution even when the user manually rotates the video to an
+     * orientation opposite to that of the device. See issue description in
+     * user prompt for details.
+     */
+    private val isOrientationMismatch: Boolean
+        get() {
+            // A zero or unknown aspect ratio should not trigger any special handling.
+            if (videoAspect <= 0.0) return false
+            // Determine whether the video is currently reported as landscape or portrait.
+            val videoIsLandscape = videoAspect >= 1.0
+            // Determine the device orientation based on the current view dimensions.
+            val deviceIsLandscape = viewWidth > viewHeight
+            return videoIsLandscape != deviceIsLandscape
+        }
+
     private val touchSlop = ViewConfiguration.get(target.context).scaledTouchSlop.toFloat()
     private val panStartSlop = max(1f, min(2.5f, touchSlop * 0.22f))
 
@@ -404,23 +432,41 @@ internal class VideoZoomGestures(
         }
     }
 
-    /** Compute the content/video rect within the view at base scale. */
+    /** Compute the content/video rect within the view at base scale.
+     *
+     * This method takes into account a possible orientation mismatch between
+     * the video and the device. If a mismatch is detected, the video aspect
+     * ratio is inverted (i.e. width and height swapped) before calculating
+     * the rectangle. This ensures that the base content rectangle matches
+     * the rotated orientation the user intends, avoiding quality loss when
+     * pinch‑zooming after rotating the video to an orientation opposite to
+     * that of the device.
+     */
     private fun contentRect(): ContentRect {
         val w = viewWidth
         val h = viewHeight
         if (w <= 1f || h <= 1f)
             return ContentRect(0f, 0f, w, h)
 
-        val ar = if (videoAspect > 0.001) videoAspect.toFloat() else (w / h)
+        // Determine the aspect ratio to use. If the video aspect ratio is valid
+        // and there is an orientation mismatch between the video and the device,
+        // invert it so the content rect uses the swapped orientation.
+        val baseAspect = if (videoAspect > 0.001) {
+            val ar = videoAspect.toFloat()
+            if (isOrientationMismatch) (1f / ar) else ar
+        } else {
+            w / h
+        }
+
         val viewAr = w / h
         val cw: Float
         val ch: Float
-        if (ar > viewAr) {
+        if (baseAspect > viewAr) {
             cw = w
-            ch = w / ar
+            ch = w / baseAspect
         } else {
             ch = h
-            cw = h * ar
+            cw = h * baseAspect
         }
         val ox = (w - cw) * 0.5f
         val oy = (h - ch) * 0.5f
@@ -494,69 +540,53 @@ internal class VideoZoomGestures(
             return
         }
 
-        // If the phone orientation is opposite to the media orientation, do not
-        // allocate a full view-aspect buffer. Most of that buffer would be black
-        // bars (for example 16:9 media on a 9:16 screen), which makes some
-        // devices/compositors blur the texture when it is later zoomed.
+        // Do not set the buffer to raw sourceWidth x sourceHeight directly.
+        // That changes the mpv viewport aspect to the video aspect, while
+        // TextureView still stretches the whole buffer into the screen view,
+        // which looks like panscan/crop.
         //
-        // In that case render into a source-aspect buffer and let TextureView map
-        // that texture into the exact same content rect that mpv would have used.
-        // Matching-orientation playback stays on the old path below.
-        if (isPhoneOrientationOppositeToVideo()) {
-            val source = sourceAspectRenderSize()
-            player.setRenderSurfaceSize(source.first, source.second)
-            player.setTextureContentRect(c.ox, c.oy, c.w, c.h)
-            originalRenderSurfaceActive = true
-            return
+        // Instead, keep the buffer aspect identical to the on-screen view,
+        // but choose its scale so the *video content rect inside it* is
+        // rendered at the original source resolution. Black-bar space is
+        // included in the buffer when needed. There is still no safety cap:
+        // the source pixels are kept 1:1 in the visible video area.
+        // Determine the effective video pixel size. If the video orientation is
+        // opposite to the device’s orientation, swap width and height. This
+        // allows the computed buffer scale to match the rotated orientation
+        // and avoids resolution loss when zooming a rotated video or image.
+        val effectiveVideoW: Float
+        val effectiveVideoH: Float
+        if (isOrientationMismatch) {
+            effectiveVideoW = videoPixelHeight.toFloat()
+            effectiveVideoH = videoPixelWidth.toFloat()
+        } else {
+            effectiveVideoW = videoPixelWidth.toFloat()
+            effectiveVideoH = videoPixelHeight.toFloat()
         }
 
-        // Matching orientation: keep the previous behavior unchanged. The buffer
-        // aspect remains identical to the on-screen view, but the scale is chosen
-        // so the visible video content is rendered at source resolution.
-        player.resetTextureTransform()
-        val scaleX = videoPixelWidth.toFloat() / c.w
-        val scaleY = videoPixelHeight.toFloat() / c.h
+        // Compute the scale factors for the content rectangle. The larger of the
+        // two scales determines how big the buffer needs to be so that the
+        // content area is rendered at full source resolution.
+        val scaleX = effectiveVideoW / c.w
+        val scaleY = effectiveVideoH / c.h
         val bufferScale = max(scaleX, scaleY).coerceAtLeast(1f)
 
-        val bufferWidth = (viewWidth * bufferScale).roundToInt().coerceAtLeast(1)
-        val bufferHeight = (viewHeight * bufferScale).roundToInt().coerceAtLeast(1)
+        // When orientations mismatch, swap view dimensions when computing the
+        // buffer size. This produces a buffer whose aspect ratio matches the
+        // rotated orientation while still filling the view. Without this swap
+        // the scale factors would be inverted, causing blurry zoom on rotated
+        // videos or images.
+        val bufferWidth: Int
+        val bufferHeight: Int
+        if (isOrientationMismatch) {
+            bufferWidth = (viewHeight * bufferScale).roundToInt().coerceAtLeast(1)
+            bufferHeight = (viewWidth * bufferScale).roundToInt().coerceAtLeast(1)
+        } else {
+            bufferWidth = (viewWidth * bufferScale).roundToInt().coerceAtLeast(1)
+            bufferHeight = (viewHeight * bufferScale).roundToInt().coerceAtLeast(1)
+        }
         player.setRenderSurfaceSize(bufferWidth, bufferHeight)
         originalRenderSurfaceActive = true
-    }
-
-
-    private fun isPhoneOrientationOppositeToVideo(): Boolean {
-        if (viewWidth <= 1f || viewHeight <= 1f)
-            return false
-
-        val ar = when {
-            videoAspect > 0.001 -> videoAspect.toFloat()
-            videoPixelWidth > 1 && videoPixelHeight > 1 -> videoPixelWidth.toFloat() / videoPixelHeight.toFloat()
-            else -> return false
-        }
-
-        // Near-square media has no meaningful portrait/landscape direction.
-        if (ar in (1f / ASPECT_RATIO_MIN)..ASPECT_RATIO_MIN)
-            return false
-
-        val videoIsLandscape = ar > 1f
-        val phoneIsLandscape = viewWidth > viewHeight
-        return videoIsLandscape != phoneIsLandscape
-    }
-
-    private fun sourceAspectRenderSize(): Pair<Int, Int> {
-        val sourceAspect = when {
-            videoAspect > 0.001 -> videoAspect.toFloat()
-            videoPixelWidth > 1 && videoPixelHeight > 1 -> videoPixelWidth.toFloat() / videoPixelHeight.toFloat()
-            else -> 1f
-        }.coerceAtLeast(0.001f)
-
-        val pixelAspect = videoPixelWidth.toFloat() / videoPixelHeight.toFloat()
-        return if (sourceAspect > pixelAspect) {
-            (videoPixelHeight * sourceAspect).roundToInt().coerceAtLeast(1) to videoPixelHeight.coerceAtLeast(1)
-        } else {
-            videoPixelWidth.coerceAtLeast(1) to (videoPixelWidth / sourceAspect).roundToInt().coerceAtLeast(1)
-        }
     }
 
     private fun filterParamsForCurrentScale(): FilterParams {
@@ -654,7 +684,6 @@ internal class VideoZoomGestures(
         private const val MIN_SCALE = 1f
         private const val MAX_SCALE = 20f
         private const val DOUBLE_TAP_TIMEOUT = 300L
-        private const val ASPECT_RATIO_MIN = 1.2f
 
         private const val DEFAULT_FRAME_DT = 1f / 60f
         private const val MIN_FILTER_DT = 1f / 240f
