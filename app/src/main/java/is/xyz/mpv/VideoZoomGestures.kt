@@ -20,10 +20,9 @@ import kotlin.math.roundToInt
  *  - Unzoomed view uses the normal view-sized mpv surface so mpv, not Android's
  *    TextureView compositor, performs the huge downscale. This avoids moire /
  *    false-color artifacts on high-frequency scans at 720p.
- *  - As soon as the user starts zooming, the render surface switches to a
- *    media-aspect buffer sized from the rotated source pixels, and BaseMPVView
- *    fits that buffer into the view without stretching. This keeps full detail
- *    even when the phone orientation is opposite to the media aspect.
+ *  - As soon as the user starts zooming, the render surface switches to the
+ *    original-resolution/aspect-preserving buffer used by the previous fix, so
+ *    zoom keeps full source detail and remains smooth.
  *
  * We do not use mpv video-pan/video-zoom for finger movement.
  */
@@ -495,22 +494,22 @@ internal class VideoZoomGestures(
             return
         }
 
-        // Keep the render surface at the media aspect, not the screen aspect.
-        // The old opposite-orientation path padded the buffer with black bars
-        // to match the portrait/landscape view, creating a much larger surface
-        // than the actual media. Some devices then reduced the effective detail
-        // during zoom.
+        // Do not set the buffer to raw sourceWidth x sourceHeight directly.
+        // That changes the mpv viewport aspect to the video aspect, while
+        // TextureView still stretches the whole buffer into the screen view,
+        // which looks like panscan/crop.
         //
-        // The visible video area is still rendered at least at the larger of:
-        //  - the media's rotated pixel size, and
-        //  - the unzoomed on-screen content size.
-        // BaseMPVView fits this media-aspect buffer into the view with a
-        // TextureView matrix, so there is no stretching and no padded surface.
+        // Instead, keep the buffer aspect identical to the on-screen view,
+        // but choose its scale so the *video content rect inside it* is
+        // rendered at the original source resolution. Black-bar space is
+        // included in the buffer when needed. There is still no safety cap:
+        // the source pixels are kept 1:1 in the visible video area.
         val scaleX = videoPixelWidth.toFloat() / c.w
         val scaleY = videoPixelHeight.toFloat() / c.h
-        val bufferScale = max(max(scaleX, scaleY), 1f)
-        val bufferWidth = (c.w * bufferScale).roundToInt().coerceAtLeast(1)
-        val bufferHeight = (c.h * bufferScale).roundToInt().coerceAtLeast(1)
+        val bufferScale = max(scaleX, scaleY).coerceAtLeast(1f)
+
+        val bufferWidth = (viewWidth * bufferScale).roundToInt().coerceAtLeast(1)
+        val bufferHeight = (viewHeight * bufferScale).roundToInt().coerceAtLeast(1)
         player.setRenderSurfaceSize(bufferWidth, bufferHeight)
         originalRenderSurfaceActive = true
     }

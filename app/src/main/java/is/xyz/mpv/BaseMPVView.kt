@@ -1,7 +1,6 @@
 package `is`.xyz.mpv
 
 import android.content.Context
-import android.graphics.Matrix
 import android.graphics.SurfaceTexture
 import android.util.AttributeSet
 import android.util.Log
@@ -99,47 +98,39 @@ abstract class BaseMPVView(context: Context, attrs: AttributeSet) : TextureView(
     private var renderSurfaceWidth = 0
     private var renderSurfaceHeight = 0
     private var customRenderSurfaceSize = false
-    private var textureTransformPendingUntilFrame = false
 
     /**
      * Set the real SurfaceTexture buffer size used by mpv without changing the
      * TextureView's on-screen size.
      *
-     * When this size has a different aspect ratio from the view, the TextureView
-     * content is fitted with a transform instead of stretching the video. This lets
-     * zoomed playback use the media's own pixel dimensions directly, without adding
-     * huge black-bar padding to the render surface.
+     * This intentionally accepts the requested size as-is. The caller decides the
+     * size, so high-resolution media can be rendered at its original resolution
+     * instead of being reduced to the display resolution before Android zooms it.
      */
     fun setRenderSurfaceSize(width: Int, height: Int) {
         val safeWidth = width.coerceAtLeast(1)
         val safeHeight = height.coerceAtLeast(1)
-        val modeChanged = !customRenderSurfaceSize
         customRenderSurfaceSize = true
 
-        if (!modeChanged && safeWidth == renderSurfaceWidth && safeHeight == renderSurfaceHeight) {
-            applyTextureTransform()
+        if (safeWidth == renderSurfaceWidth && safeHeight == renderSurfaceHeight)
             return
-        }
 
         renderSurfaceWidth = safeWidth
         renderSurfaceHeight = safeHeight
-        applyRenderSurfaceSize(waitForNextFrame = true)
+        applyRenderSurfaceSize()
     }
 
     fun resetRenderSurfaceSize() {
-        val modeChanged = customRenderSurfaceSize
         customRenderSurfaceSize = false
         val safeWidth = width.coerceAtLeast(1)
         val safeHeight = height.coerceAtLeast(1)
 
-        if (!modeChanged && safeWidth == renderSurfaceWidth && safeHeight == renderSurfaceHeight) {
-            applyTextureTransform()
+        if (safeWidth == renderSurfaceWidth && safeHeight == renderSurfaceHeight)
             return
-        }
 
         renderSurfaceWidth = safeWidth
         renderSurfaceHeight = safeHeight
-        applyRenderSurfaceSize(waitForNextFrame = true)
+        applyRenderSurfaceSize()
     }
 
     private fun ensureRenderSurfaceSize(width: Int, height: Int) {
@@ -150,57 +141,13 @@ abstract class BaseMPVView(context: Context, attrs: AttributeSet) : TextureView(
         renderSurfaceHeight = height.coerceAtLeast(1)
     }
 
-    private fun applyRenderSurfaceSize(waitForNextFrame: Boolean = false) {
+    private fun applyRenderSurfaceSize() {
         val texture = attachedTexture ?: return
         if (renderSurfaceWidth <= 0 || renderSurfaceHeight <= 0)
             return
 
         texture.setDefaultBufferSize(renderSurfaceWidth, renderSurfaceHeight)
         MPVLib.setPropertyString("android-surface-size", "${renderSurfaceWidth}x${renderSurfaceHeight}")
-
-        if (waitForNextFrame) {
-            // setDefaultBufferSize/android-surface-size is asynchronous: the old
-            // frame may remain visible for one display refresh.  If the
-            // TextureView matrix is changed immediately, that stale frame is
-            // fitted using the new aspect ratio and appears as a one-frame tear
-            // when entering or leaving zoom.  Keep the current matrix until mpv
-            // publishes a frame for the new surface size.
-            textureTransformPendingUntilFrame = true
-        } else {
-            textureTransformPendingUntilFrame = false
-            applyTextureTransform()
-        }
-    }
-
-    private fun applyTextureTransform() {
-        val viewWidth = width.toFloat()
-        val viewHeight = height.toFloat()
-        if (viewWidth <= 1f || viewHeight <= 1f || renderSurfaceWidth <= 0 || renderSurfaceHeight <= 0)
-            return
-
-        if (!customRenderSurfaceSize) {
-            setTransform(null)
-            invalidate()
-            return
-        }
-
-        val bufferAspect = renderSurfaceWidth.toFloat() / renderSurfaceHeight.toFloat()
-        val viewAspect = viewWidth / viewHeight
-        val scaleX: Float
-        val scaleY: Float
-
-        if (bufferAspect > viewAspect) {
-            scaleX = 1f
-            scaleY = viewAspect / bufferAspect
-        } else {
-            scaleX = bufferAspect / viewAspect
-            scaleY = 1f
-        }
-
-        val matrix = Matrix()
-        matrix.setScale(scaleX, scaleY, viewWidth * 0.5f, viewHeight * 0.5f)
-        setTransform(matrix)
-        invalidate()
     }
 
     private fun attachSurfaceTexture(texture: SurfaceTexture, width: Int, height: Int) {
@@ -210,7 +157,6 @@ abstract class BaseMPVView(context: Context, attrs: AttributeSet) : TextureView(
         attachedTexture = texture
         ensureRenderSurfaceSize(width, height)
         texture.setDefaultBufferSize(renderSurfaceWidth, renderSurfaceHeight)
-        applyTextureTransform()
 
         Log.w(TAG, "attaching texture surface ${renderSurfaceWidth}x${renderSurfaceHeight}")
         val surface = Surface(texture)
@@ -257,24 +203,12 @@ abstract class BaseMPVView(context: Context, attrs: AttributeSet) : TextureView(
         applyRenderSurfaceSize()
     }
 
-    override fun onSizeChanged(width: Int, height: Int, oldWidth: Int, oldHeight: Int) {
-        super.onSizeChanged(width, height, oldWidth, oldHeight)
-        if (!customRenderSurfaceSize)
-            ensureRenderSurfaceSize(width, height)
-        applyRenderSurfaceSize()
-    }
-
     override fun onSurfaceTextureDestroyed(surface: SurfaceTexture): Boolean {
         detachSurfaceTexture()
         return true
     }
 
-    override fun onSurfaceTextureUpdated(surface: SurfaceTexture) {
-        if (textureTransformPendingUntilFrame) {
-            textureTransformPendingUntilFrame = false
-            applyTextureTransform()
-        }
-    }
+    override fun onSurfaceTextureUpdated(surface: SurfaceTexture) = Unit
 
     companion object {
         private const val TAG = "mpv"
