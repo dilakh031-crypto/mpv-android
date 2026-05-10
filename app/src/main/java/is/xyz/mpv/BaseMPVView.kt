@@ -99,6 +99,7 @@ abstract class BaseMPVView(context: Context, attrs: AttributeSet) : TextureView(
     private var renderSurfaceWidth = 0
     private var renderSurfaceHeight = 0
     private var customRenderSurfaceSize = false
+    private var textureTransformPendingUntilFrame = false
 
     /**
      * Set the real SurfaceTexture buffer size used by mpv without changing the
@@ -122,7 +123,7 @@ abstract class BaseMPVView(context: Context, attrs: AttributeSet) : TextureView(
 
         renderSurfaceWidth = safeWidth
         renderSurfaceHeight = safeHeight
-        applyRenderSurfaceSize()
+        applyRenderSurfaceSize(waitForNextFrame = true)
     }
 
     fun resetRenderSurfaceSize() {
@@ -138,7 +139,7 @@ abstract class BaseMPVView(context: Context, attrs: AttributeSet) : TextureView(
 
         renderSurfaceWidth = safeWidth
         renderSurfaceHeight = safeHeight
-        applyRenderSurfaceSize()
+        applyRenderSurfaceSize(waitForNextFrame = true)
     }
 
     private fun ensureRenderSurfaceSize(width: Int, height: Int) {
@@ -149,14 +150,26 @@ abstract class BaseMPVView(context: Context, attrs: AttributeSet) : TextureView(
         renderSurfaceHeight = height.coerceAtLeast(1)
     }
 
-    private fun applyRenderSurfaceSize() {
+    private fun applyRenderSurfaceSize(waitForNextFrame: Boolean = false) {
         val texture = attachedTexture ?: return
         if (renderSurfaceWidth <= 0 || renderSurfaceHeight <= 0)
             return
 
         texture.setDefaultBufferSize(renderSurfaceWidth, renderSurfaceHeight)
         MPVLib.setPropertyString("android-surface-size", "${renderSurfaceWidth}x${renderSurfaceHeight}")
-        applyTextureTransform()
+
+        if (waitForNextFrame) {
+            // setDefaultBufferSize/android-surface-size is asynchronous: the old
+            // frame may remain visible for one display refresh.  If the
+            // TextureView matrix is changed immediately, that stale frame is
+            // fitted using the new aspect ratio and appears as a one-frame tear
+            // when entering or leaving zoom.  Keep the current matrix until mpv
+            // publishes a frame for the new surface size.
+            textureTransformPendingUntilFrame = true
+        } else {
+            textureTransformPendingUntilFrame = false
+            applyTextureTransform()
+        }
     }
 
     private fun applyTextureTransform() {
@@ -256,7 +269,12 @@ abstract class BaseMPVView(context: Context, attrs: AttributeSet) : TextureView(
         return true
     }
 
-    override fun onSurfaceTextureUpdated(surface: SurfaceTexture) = Unit
+    override fun onSurfaceTextureUpdated(surface: SurfaceTexture) {
+        if (textureTransformPendingUntilFrame) {
+            textureTransformPendingUntilFrame = false
+            applyTextureTransform()
+        }
+    }
 
     companion object {
         private const val TAG = "mpv"
