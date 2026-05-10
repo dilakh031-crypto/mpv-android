@@ -160,8 +160,23 @@ internal class VideoZoomGestures(
     }
 
     fun setVideoPixelSize(size: Pair<Int, Int>?) {
+        // Update the pixel dimensions reported by mpv. These values reflect the
+        // final image dimensions after any rotation or aspect corrections. If
+        // both dimensions are valid (>0), recompute the videoAspect from them.
         videoPixelWidth = size?.first ?: 0
         videoPixelHeight = size?.second ?: 0
+
+        // Some media can be rotated manually (e.g. via the "video-rotate" property)
+        // without affecting the underlying width/height reported by mpv’s
+        // "video-params/aspect". When this happens, relying solely on the
+        // aspect property yields an incorrect aspect ratio and leads to wrong
+        // calculations in contentRect(), which in turn degrades quality when
+        // zooming. Recompute the aspect from the pixel dimensions whenever
+        // available so it always reflects the actual orientation on screen.
+        if (videoPixelWidth > 0 && videoPixelHeight > 0) {
+            videoAspect = videoPixelWidth.toDouble() / videoPixelHeight.toDouble()
+        }
+
         if (isZoomed() || scaleDetector.isInProgress)
             requestOriginalRenderSurfaceSize(force = true)
         else
@@ -411,14 +426,26 @@ internal class VideoZoomGestures(
         if (w <= 1f || h <= 1f)
             return ContentRect(0f, 0f, w, h)
 
-        val ar = if (videoAspect > 0.001) videoAspect.toFloat() else (w / h)
+        // Compute the video aspect ratio using the most reliable source:
+        //  1. The pixel dimensions reported by mpv (already rotated if needed).
+        //  2. The aspect reported by mpv if no valid pixel size is known.
+        //  3. Fall back to the view aspect ratio.
+        val ar: Float = when {
+            videoPixelWidth > 0 && videoPixelHeight > 0 ->
+                videoPixelWidth.toFloat() / videoPixelHeight.toFloat()
+            videoAspect > 0.001 -> videoAspect.toFloat()
+            else -> w / h
+        }
+
         val viewAr = w / h
         val cw: Float
         val ch: Float
         if (ar > viewAr) {
+            // Video is wider than the view; letterbox top and bottom
             cw = w
             ch = w / ar
         } else {
+            // Video is taller than the view; pillarbox left and right
             ch = h
             cw = h * ar
         }
