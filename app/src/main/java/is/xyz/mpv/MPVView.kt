@@ -314,20 +314,50 @@ internal class MPVView(context: Context, attrs: AttributeSet) : BaseMPVView(cont
         get() = MPVLib.getPropertyDouble("estimated-vf-fps")
 
     /**
-     * Returns the video aspect ratio. Rotation is taken into account.
+     * Returns the video aspect ratio. Prefer the post‑rotation display size if available.
+     *
+     * mpv exposes multiple sets of properties for video dimensions:
+     *  - ``video-params`` reflects the raw stream dimensions and rotation metadata.
+     *  - ``video-out-params`` reflects the dimensions after rotation has been applied but before scaling【616303343540506†L470-L660】.
+     *
+     * When a user rotates the video manually using ``--video-rotate`` or when mpv applies
+     * rotation metadata, the ``video-params/rotate`` value indicates the rotation to be applied
+     * but the raw width/height (``video-params/w`` and ``video-params/h``) remain unchanged【616303343540506†L470-L660】.
+     * Relying solely on these properties requires manually swapping dimensions when the rotation
+     * angle is 90 or 270 degrees, which breaks when rotation has already been applied (e.g. via
+     * filters or ``video-rotate``).  Instead, prefer ``video-out-params/dw`` and ``video-out-params/dh``
+     * which represent the displayed width/height after rotation has been applied【616303343540506†L470-L660】.
+     *
+     * If these properties are unavailable, fall back to ``video-params/aspect`` and
+     * handle rotation manually to preserve existing behaviour.
      */
     fun getVideoAspect(): Double? {
-        return MPVLib.getPropertyDouble("video-params/aspect")?.let {
-            if (it < 0.001)
-                return 0.0
-            val rot = MPVLib.getPropertyInt("video-params/rotate") ?: 0
-            if (rot % 180 == 90)
-                1.0 / it
-            else
-                it
+        // Try to use video-out-params which reflect the rotated image size.
+        val dw = MPVLib.getPropertyInt("video-out-params/dw")
+        val dh = MPVLib.getPropertyInt("video-out-params/dh")
+        if (dw != null && dh != null && dw > 0 && dh > 0) {
+            return dw.toDouble() / dh.toDouble()
         }
+
+        // Fall back to the old behaviour using video-params and rotation property.
+        val aspect = MPVLib.getPropertyDouble("video-params/aspect") ?: return null
+        if (aspect < 0.001) return 0.0
+        val rot = MPVLib.getPropertyInt("video-params/rotate") ?: 0
+        return if (rot % 180 == 90) 1.0 / aspect else aspect
     }
 
+    /**
+     * Returns the video pixel size as a Pair(width, height).
+     *
+     * Note: this implementation deliberately avoids inspecting the
+     * ``video-out-params`` properties.  It relies solely on the raw
+     * video dimensions (``video-params/w`` and ``video-params/h``) and
+     * rotation metadata.  Using the post-rotation ``video-out-params``
+     * can change the orientation of the reported size and break the
+     * zoom gesture logic.  When rotation metadata indicates a 90° or
+     * 270° rotation, the width and height are swapped to reflect the
+     * rotated dimensions.
+     */
     fun getVideoPixelSize(): Pair<Int, Int>? {
         val w = MPVLib.getPropertyInt("video-params/w") ?: return null
         val h = MPVLib.getPropertyInt("video-params/h") ?: return null
