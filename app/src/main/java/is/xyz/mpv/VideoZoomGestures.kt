@@ -22,10 +22,12 @@ import kotlin.math.roundToInt
  *    false-color artifacts on high-frequency scans at 720p.
  *  - As soon as the user starts zooming, the render surface switches to an
  *    original-detail buffer so zoom keeps full source detail.
- *  - While zooming, if the phone orientation is opposite to the media orientation,
- *    we use a media-aspect render surface and compensate with the normal View
- *    transform. At normal size both portrait and landscape return to the same
- *    base mpv surface, so Android's original-detail surface is used only for zoom.
+ *  - Zoom now uses the same view-aspect original-detail surface in both portrait
+ *    and landscape. Keeping the TextureView aspect stable prevents the one-frame
+ *    tear that happened when opposite-orientation playback switched to a
+ *    media-aspect surface at the start of pinch.
+ *  - At normal size both portrait and landscape return to the same base mpv
+ *    surface, so Android's original-detail surface is used only for zoom.
  *
  * We do not use mpv video-pan/video-zoom for finger movement.
  */
@@ -554,10 +556,15 @@ internal class VideoZoomGestures(
             return
         }
 
-        if (usesMediaAspectRenderSurface())
-            requestMediaAspectRenderSurfaceSize(force)
-        else
-            requestViewAspectOriginalRenderSurfaceSize(force)
+        // Use the same zoom surface path for matching and opposite orientations.
+        // The previous opposite-orientation MEDIA_ASPECT_ORIGINAL path changed
+        // both the SurfaceTexture buffer aspect and the View transform exactly
+        // when pinch began. That is why landscape video on a portrait phone could
+        // tear on the first zoom frame, while landscape-on-landscape worked fine.
+        // A view-aspect buffer keeps the TextureView geometry stable; mpv still
+        // renders into a high-detail Android buffer for zoom, and reset() returns
+        // to the normal mpv/base surface when the gesture reaches 1x.
+        requestViewAspectOriginalRenderSurfaceSize(force)
     }
 
     private fun requestBaseRenderSurfaceSize(force: Boolean) {
