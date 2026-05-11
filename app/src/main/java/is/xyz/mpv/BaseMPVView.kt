@@ -1,6 +1,7 @@
 package `is`.xyz.mpv
 
 import android.content.Context
+import android.graphics.Matrix
 import android.graphics.SurfaceTexture
 import android.util.AttributeSet
 import android.util.Log
@@ -103,17 +104,20 @@ abstract class BaseMPVView(context: Context, attrs: AttributeSet) : TextureView(
      * Set the real SurfaceTexture buffer size used by mpv without changing the
      * TextureView's on-screen size.
      *
-     * This intentionally accepts the requested size as-is. The caller decides the
-     * size, so high-resolution media can be rendered at its original resolution
-     * instead of being reduced to the display resolution before Android zooms it.
+     * The buffer may use either the view aspect ratio or the media aspect ratio.
+     * When those two aspect ratios differ, fit the TextureView content with its
+     * own matrix so Android does not stretch a landscape buffer into a portrait
+     * view, or a portrait buffer into a landscape view.
      */
     fun setRenderSurfaceSize(width: Int, height: Int) {
         val safeWidth = width.coerceAtLeast(1)
         val safeHeight = height.coerceAtLeast(1)
         customRenderSurfaceSize = true
 
-        if (safeWidth == renderSurfaceWidth && safeHeight == renderSurfaceHeight)
+        if (safeWidth == renderSurfaceWidth && safeHeight == renderSurfaceHeight) {
+            applyTextureTransform()
             return
+        }
 
         renderSurfaceWidth = safeWidth
         renderSurfaceHeight = safeHeight
@@ -125,8 +129,10 @@ abstract class BaseMPVView(context: Context, attrs: AttributeSet) : TextureView(
         val safeWidth = width.coerceAtLeast(1)
         val safeHeight = height.coerceAtLeast(1)
 
-        if (safeWidth == renderSurfaceWidth && safeHeight == renderSurfaceHeight)
+        if (safeWidth == renderSurfaceWidth && safeHeight == renderSurfaceHeight) {
+            applyTextureTransform()
             return
+        }
 
         renderSurfaceWidth = safeWidth
         renderSurfaceHeight = safeHeight
@@ -148,6 +154,35 @@ abstract class BaseMPVView(context: Context, attrs: AttributeSet) : TextureView(
 
         texture.setDefaultBufferSize(renderSurfaceWidth, renderSurfaceHeight)
         MPVLib.setPropertyString("android-surface-size", "${renderSurfaceWidth}x${renderSurfaceHeight}")
+        applyTextureTransform()
+    }
+
+    private fun applyTextureTransform() {
+        val viewWidth = width.toFloat()
+        val viewHeight = height.toFloat()
+        if (viewWidth <= 1f || viewHeight <= 1f || renderSurfaceWidth <= 0 || renderSurfaceHeight <= 0)
+            return
+
+        if (!customRenderSurfaceSize) {
+            setTransform(null)
+            invalidate()
+            return
+        }
+
+        val bufferAspect = renderSurfaceWidth.toFloat() / renderSurfaceHeight.toFloat()
+        val viewAspect = viewWidth / viewHeight
+        val matrix = Matrix()
+
+        if (bufferAspect > viewAspect) {
+            val scaleY = viewAspect / bufferAspect
+            matrix.setScale(1f, scaleY, viewWidth * 0.5f, viewHeight * 0.5f)
+        } else {
+            val scaleX = bufferAspect / viewAspect
+            matrix.setScale(scaleX, 1f, viewWidth * 0.5f, viewHeight * 0.5f)
+        }
+
+        setTransform(matrix)
+        invalidate()
     }
 
     private fun attachSurfaceTexture(texture: SurfaceTexture, width: Int, height: Int) {
@@ -157,6 +192,7 @@ abstract class BaseMPVView(context: Context, attrs: AttributeSet) : TextureView(
         attachedTexture = texture
         ensureRenderSurfaceSize(width, height)
         texture.setDefaultBufferSize(renderSurfaceWidth, renderSurfaceHeight)
+        applyTextureTransform()
 
         Log.w(TAG, "attaching texture surface ${renderSurfaceWidth}x${renderSurfaceHeight}")
         val surface = Surface(texture)
@@ -200,6 +236,13 @@ abstract class BaseMPVView(context: Context, attrs: AttributeSet) : TextureView(
 
     override fun onSurfaceTextureSizeChanged(surface: SurfaceTexture, width: Int, height: Int) {
         ensureRenderSurfaceSize(width, height)
+        applyRenderSurfaceSize()
+    }
+
+    override fun onSizeChanged(width: Int, height: Int, oldWidth: Int, oldHeight: Int) {
+        super.onSizeChanged(width, height, oldWidth, oldHeight)
+        if (!customRenderSurfaceSize)
+            ensureRenderSurfaceSize(width, height)
         applyRenderSurfaceSize()
     }
 

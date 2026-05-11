@@ -17,12 +17,16 @@ import kotlin.math.roundToInt
  * Pinch-to-zoom + pan for mpv output.
  *
  * Important quality detail:
- *  - Unzoomed view uses the normal view-sized mpv surface so mpv, not Android's
- *    TextureView compositor, performs the huge downscale. This avoids moire /
- *    false-color artifacts on high-frequency scans at 720p.
- *  - As soon as the user starts zooming, the render surface switches to the
- *    original-resolution/aspect-preserving buffer used by the previous fix, so
- *    zoom keeps full source detail and remains smooth.
+ *  - When the media and screen have the same orientation, keep the existing
+ *    behaviour: normal view-sized rendering at rest, then switch to the
+ *    full-detail surface only while zoomed.
+ *  - When the media and screen orientations are opposite, keep a media-aspect
+ *    full-detail surface prepared while unzoomed. Zoom then changes only the
+ *    View transform, so there is no SurfaceTexture resize at zoom start/reset.
+ *
+ * BaseMPVView fits media-aspect buffers into the view, so this path keeps the
+ * original aspect ratio and does not stretch a landscape video in portrait mode
+ * or a portrait video in landscape mode.
  *
  * We do not use mpv video-pan/video-zoom for finger movement.
  */
@@ -38,34 +42,6 @@ internal class VideoZoomGestures(
     private var videoAspect = 0.0
     private var videoPixelWidth = 0
     private var videoPixelHeight = 0
-
-    /**
-     * Returns true if the current video orientation (based on the reported
-     * aspect ratio) does not match the device orientation. A mismatch is
-     * defined as one of the following:
-     *  - the video is wider than it is tall (landscape) while the view
-     *    dimensions indicate a portrait device layout, or
-     *  - the video is taller than it is wide (portrait) while the view
-     *    dimensions indicate a landscape device layout.
-     *
-     * When a mismatch occurs, the video needs to be treated as if it were
-     * rotated to match the device’s orientation for the purposes of
-     * calculating the base content rectangle and render surface size. This
-     * ensures that pinch-to-zoom continues to operate on the full source
-     * resolution even when the user manually rotates the video to an
-     * orientation opposite to that of the device. See issue description in
-     * user prompt for details.
-     */
-    private val isOrientationMismatch: Boolean
-        get() {
-            // A zero or unknown aspect ratio should not trigger any special handling.
-            if (videoAspect <= 0.0) return false
-            // Determine whether the video is currently reported as landscape or portrait.
-            val videoIsLandscape = videoAspect >= 1.0
-            // Determine the device orientation based on the current view dimensions.
-            val deviceIsLandscape = viewWidth > viewHeight
-            return videoIsLandscape != deviceIsLandscape
-        }
 
     private val touchSlop = ViewConfiguration.get(target.context).scaledTouchSlop.toFloat()
     private val panStartSlop = max(1f, min(2.5f, touchSlop * 0.22f))
@@ -99,6 +75,7 @@ internal class VideoZoomGestures(
     private val panFilterY = OneEuroFilter()
 
     private var originalRenderSurfaceActive = false
+    private var orientationAwareRenderSurfaceActive = false
 
     // Coalesce view property updates to vsync. We do not animate here; we only avoid
     // writing View properties multiple times in one display frame.
@@ -118,10 +95,10 @@ internal class VideoZoomGestures(
                 panActive = false
                 canBeTap = false
 
-                // Switch to the original-detail buffer before the first visible zoom step.
-                // This keeps early zoom stages sharp without forcing Android to downscale
-                // the original-size texture while the image is still unzoomed.
-                requestOriginalRenderSurfaceSize(force = true)
+                // In opposite-orientation cases this surface is already active, so
+                // zoom does not resize the SurfaceTexture. In matching-orientation
+                // cases, keep the existing switch-on-zoom behaviour.
+                updateRenderSurfaceForCurrentOrientation(force = true)
 
                 resetPanFilters(detector.focusX, detector.focusY, SystemClock.uptimeMillis())
                 return true
@@ -149,7 +126,7 @@ internal class VideoZoomGestures(
 
                 clampTranslationToVideoContent()
                 resetPanFilters(detector.focusX, detector.focusY, SystemClock.uptimeMillis())
-                requestOriginalRenderSurfaceSize(force = false)
+                updateRenderSurfaceForCurrentOrientation(force = false)
                 scheduleApply()
                 return true
             }
@@ -159,7 +136,7 @@ internal class VideoZoomGestures(
                     reset()
                 else {
                     resetPanFilters(detector.focusX, detector.focusY, SystemClock.uptimeMillis())
-                    requestOriginalRenderSurfaceSize(force = true)
+                    updateRenderSurfaceForCurrentOrientation(force = true)
                 }
             }
         }
@@ -169,20 +146,18 @@ internal class VideoZoomGestures(
         viewWidth = width
         viewHeight = height
         refreshMetricsFromTarget()
+        updateRenderSurfaceForCurrentOrientation(force = true)
         if (isZoomed() || scaleDetector.isInProgress) {
             clampTranslationToVideoContent()
-            requestOriginalRenderSurfaceSize(force = true)
             scheduleApply()
-        } else {
-            requestBaseRenderSurfaceSize(force = true)
         }
     }
 
     fun setVideoAspect(aspect: Double?) {
         videoAspect = aspect ?: 0.0
+        updateRenderSurfaceForCurrentOrientation(force = true)
         if (isZoomed() || scaleDetector.isInProgress) {
             clampTranslationToVideoContent()
-            requestOriginalRenderSurfaceSize(force = true)
             scheduleApply()
         }
     }
@@ -190,10 +165,7 @@ internal class VideoZoomGestures(
     fun setVideoPixelSize(size: Pair<Int, Int>?) {
         videoPixelWidth = size?.first ?: 0
         videoPixelHeight = size?.second ?: 0
-        if (isZoomed() || scaleDetector.isInProgress)
-            requestOriginalRenderSurfaceSize(force = true)
-        else
-            requestBaseRenderSurfaceSize(force = true)
+        updateRenderSurfaceForCurrentOrientation(force = true)
     }
 
     fun isZoomed(): Boolean = scale > 1f + EPS
@@ -218,10 +190,10 @@ internal class VideoZoomGestures(
         resetPanFilters(0f, 0f, SystemClock.uptimeMillis())
         applyToView()
 
-        // Critical for scan quality: after returning to normal size, do not keep
-        // the original-resolution texture and let Android minify it. Let mpv draw
-        // directly to the view-sized surface instead.
-        requestBaseRenderSurfaceSize(force = true)
+        // In matching-orientation mode, return to the normal view-sized surface.
+        // In opposite-orientation mode, keep the full-detail media-aspect surface
+        // prepared so entering/leaving zoom never resizes the SurfaceTexture.
+        updateRenderSurfaceForCurrentOrientation(force = true)
     }
 
     /**
@@ -495,18 +467,101 @@ internal class VideoZoomGestures(
         target.translationY = ty.toFloat()
     }
 
+    private fun updateRenderSurfaceForCurrentOrientation(force: Boolean) {
+        if (shouldUseOrientationAwareRenderSurface()) {
+            requestOrientationAwareRenderSurfaceSize(force)
+        } else if (isZoomed() || scaleDetector.isInProgress) {
+            orientationAwareRenderSurfaceActive = false
+            requestOriginalRenderSurfaceSize(force)
+        } else {
+            orientationAwareRenderSurfaceActive = false
+            requestBaseRenderSurfaceSize(force)
+        }
+    }
+
+    private fun shouldUseOrientationAwareRenderSurface(): Boolean {
+        refreshMetricsFromTarget()
+        if (viewWidth <= 1f || viewHeight <= 1f || videoPixelWidth <= 1 || videoPixelHeight <= 1)
+            return false
+
+        // Wait for mpv's display aspect ratio. Using only raw pixel width/height
+        // can be wrong for rotated files or non-square pixels and can make the
+        // unzoomed image look stretched.
+        if (videoAspect <= 0.001)
+            return false
+
+        val mediaAspect = videoAspect.toFloat()
+        val viewAspect = viewWidth / viewHeight
+
+        if (mediaAspect in (1f - ORIENTATION_EPS)..(1f + ORIENTATION_EPS))
+            return false
+        if (viewAspect in (1f - ORIENTATION_EPS)..(1f + ORIENTATION_EPS))
+            return false
+
+        return (mediaAspect > 1f) != (viewAspect > 1f)
+    }
+
+    private fun requestOrientationAwareRenderSurfaceSize(force: Boolean) {
+        val player = renderTarget ?: return
+        refreshMetricsFromTarget()
+
+        if (!force && orientationAwareRenderSurfaceActive)
+            return
+
+        if (viewWidth <= 1f || viewHeight <= 1f || videoPixelWidth <= 1 || videoPixelHeight <= 1 || videoAspect <= 0.001) {
+            requestBaseRenderSurfaceSize(force = true)
+            return
+        }
+
+        val c = contentRect()
+        if (c.w <= 1f || c.h <= 1f) {
+            requestBaseRenderSurfaceSize(force = true)
+            return
+        }
+
+        val ar = videoAspect.toFloat()
+        val pixelAspect = videoPixelWidth.toFloat() / videoPixelHeight.toFloat()
+
+        // Build a full-detail buffer with the *display* aspect ratio of the
+        // media, not the phone screen. If raw pixels and display aspect differ
+        // (rotation/SAR), expand one axis rather than shrinking the other so the
+        // video does not lose source detail.
+        val baseWidth: Float
+        val baseHeight: Float
+        if (ar > pixelAspect) {
+            baseHeight = videoPixelHeight.toFloat()
+            baseWidth = baseHeight * ar
+        } else {
+            baseWidth = videoPixelWidth.toFloat()
+            baseHeight = baseWidth / ar
+        }
+
+        // If the on-screen unzoomed video is larger than the source, keep at
+        // least that many pixels too. Usually this remains 1.0 for real videos,
+        // but it avoids making small images blurrier at rest.
+        val surfaceScale = max(max(c.w / baseWidth, c.h / baseHeight), 1f)
+        val bufferWidth = (baseWidth * surfaceScale).roundToInt().coerceAtLeast(1)
+        val bufferHeight = (baseHeight * surfaceScale).roundToInt().coerceAtLeast(1)
+
+        player.setRenderSurfaceSize(bufferWidth, bufferHeight)
+        originalRenderSurfaceActive = true
+        orientationAwareRenderSurfaceActive = true
+    }
+
     private fun requestBaseRenderSurfaceSize(force: Boolean) {
         val player = renderTarget ?: return
         if (!force && !originalRenderSurfaceActive)
             return
 
         originalRenderSurfaceActive = false
+        orientationAwareRenderSurfaceActive = false
         player.resetRenderSurfaceSize()
     }
 
     private fun requestOriginalRenderSurfaceSize(force: Boolean) {
         val player = renderTarget ?: return
         refreshMetricsFromTarget()
+        orientationAwareRenderSurfaceActive = false
 
         if (!force && originalRenderSurfaceActive)
             return
@@ -637,6 +692,7 @@ internal class VideoZoomGestures(
         private const val MIN_SCALE = 1f
         private const val MAX_SCALE = 20f
         private const val DOUBLE_TAP_TIMEOUT = 300L
+        private const val ORIENTATION_EPS = 0.01f
 
         private const val DEFAULT_FRAME_DT = 1f / 60f
         private const val MIN_FILTER_DT = 1f / 240f
