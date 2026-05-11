@@ -22,10 +22,10 @@ import kotlin.math.roundToInt
  *    false-color artifacts on high-frequency scans at 720p.
  *  - As soon as the user starts zooming, the render surface switches to an
  *    original-detail buffer so zoom keeps full source detail.
- *  - If the phone orientation is opposite to the media orientation, we keep a
- *    media-aspect render surface and compensate with the normal View transform.
- *    This avoids the oversized black-bar buffer that loses zoom quality without
- *    using TextureView#setTransform, so playback does not tear at zoom/reset.
+ *  - While zooming, if the phone orientation is opposite to the media orientation,
+ *    we use a media-aspect render surface and compensate with the normal View
+ *    transform. At normal size both portrait and landscape return to the same
+ *    base mpv surface, so Android's original-detail surface is used only for zoom.
  *
  * We do not use mpv video-pan/video-zoom for finger movement.
  */
@@ -77,8 +77,8 @@ internal class VideoZoomGestures(
 
     // When a pinch returns close enough to normal size, finish it through the
     // same delayed reset path as double-tap. Calling reset() directly from
-    // onScaleEnd still sees ScaleGestureDetector as in-progress on some devices,
-    // which keeps the original-detail Android surface selected for that frame.
+    // onScaleEnd can still see ScaleGestureDetector as in-progress on some devices,
+    // which keeps the Android zoom surface selected for that frame.
     private var pendingPinchDoubleTapReset = false
 
     // Coalesce view property updates to vsync. We do not animate here; we only avoid
@@ -213,9 +213,9 @@ internal class VideoZoomGestures(
 
         // Critical for scan quality: after returning to normal size, do not keep
         // the original-resolution texture and let Android minify it. Let mpv draw
-        // directly to the view-sized surface instead. The only exception is the
-        // opposite-orientation case: there we keep a media-aspect surface so zoom
-        // can start/stop without a surface-aspect switch or a one-frame tear.
+        // directly to the view-sized surface instead. This is intentionally the
+        // same for portrait and landscape; the Android original-detail surface is
+        // reserved for active zoom/pinch only.
         updateRenderSurfaceForCurrentState(force = true)
         applyToView()
     }
@@ -232,7 +232,7 @@ internal class VideoZoomGestures(
 
             // This is intentionally the same reset action used by double-tap,
             // but deferred until the pinch detector has fully ended so surface
-            // selection follows the smooth double-tap path.
+            // selection follows the smooth double-tap path in every orientation.
             reset()
         }
     }
@@ -527,11 +527,15 @@ internal class VideoZoomGestures(
     }
 
     private fun updateRenderSurfaceForCurrentState(force: Boolean) {
-        when {
-            usesMediaAspectRenderSurface() -> requestMediaAspectRenderSurfaceSize(force)
-            isZoomed() || scaleDetector.isInProgress -> requestViewAspectOriginalRenderSurfaceSize(force)
-            else -> requestBaseRenderSurfaceSize(force)
+        if (!isZoomed() && !scaleDetector.isInProgress) {
+            requestBaseRenderSurfaceSize(force)
+            return
         }
+
+        if (usesMediaAspectRenderSurface())
+            requestMediaAspectRenderSurfaceSize(force)
+        else
+            requestViewAspectOriginalRenderSurfaceSize(force)
     }
 
     private fun requestBaseRenderSurfaceSize(force: Boolean) {
