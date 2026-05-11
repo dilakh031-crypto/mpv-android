@@ -432,41 +432,23 @@ internal class VideoZoomGestures(
         }
     }
 
-    /** Compute the content/video rect within the view at base scale.
-     *
-     * This method takes into account a possible orientation mismatch between
-     * the video and the device. If a mismatch is detected, the video aspect
-     * ratio is inverted (i.e. width and height swapped) before calculating
-     * the rectangle. This ensures that the base content rectangle matches
-     * the rotated orientation the user intends, avoiding quality loss when
-     * pinch‑zooming after rotating the video to an orientation opposite to
-     * that of the device.
-     */
+    /** Compute the content/video rect within the view at base scale. */
     private fun contentRect(): ContentRect {
         val w = viewWidth
         val h = viewHeight
         if (w <= 1f || h <= 1f)
             return ContentRect(0f, 0f, w, h)
 
-        // Determine the aspect ratio to use. If the video aspect ratio is valid
-        // and there is an orientation mismatch between the video and the device,
-        // invert it so the content rect uses the swapped orientation.
-        val baseAspect = if (videoAspect > 0.001) {
-            val ar = videoAspect.toFloat()
-            if (isOrientationMismatch) (1f / ar) else ar
-        } else {
-            w / h
-        }
-
+        val ar = if (videoAspect > 0.001) videoAspect.toFloat() else (w / h)
         val viewAr = w / h
         val cw: Float
         val ch: Float
-        if (baseAspect > viewAr) {
+        if (ar > viewAr) {
             cw = w
-            ch = w / baseAspect
+            ch = w / ar
         } else {
             ch = h
-            cw = h * baseAspect
+            cw = h * ar
         }
         val ox = (w - cw) * 0.5f
         val oy = (h - ch) * 0.5f
@@ -550,41 +532,12 @@ internal class VideoZoomGestures(
         // rendered at the original source resolution. Black-bar space is
         // included in the buffer when needed. There is still no safety cap:
         // the source pixels are kept 1:1 in the visible video area.
-        // Determine the effective video pixel size. If the video orientation is
-        // opposite to the device’s orientation, swap width and height. This
-        // allows the computed buffer scale to match the rotated orientation
-        // and avoids resolution loss when zooming a rotated video or image.
-        val effectiveVideoW: Float
-        val effectiveVideoH: Float
-        if (isOrientationMismatch) {
-            effectiveVideoW = videoPixelHeight.toFloat()
-            effectiveVideoH = videoPixelWidth.toFloat()
-        } else {
-            effectiveVideoW = videoPixelWidth.toFloat()
-            effectiveVideoH = videoPixelHeight.toFloat()
-        }
-
-        // Compute the scale factors for the content rectangle. The larger of the
-        // two scales determines how big the buffer needs to be so that the
-        // content area is rendered at full source resolution.
-        val scaleX = effectiveVideoW / c.w
-        val scaleY = effectiveVideoH / c.h
+        val scaleX = videoPixelWidth.toFloat() / c.w
+        val scaleY = videoPixelHeight.toFloat() / c.h
         val bufferScale = max(scaleX, scaleY).coerceAtLeast(1f)
 
-        // When orientations mismatch, swap view dimensions when computing the
-        // buffer size. This produces a buffer whose aspect ratio matches the
-        // rotated orientation while still filling the view. Without this swap
-        // the scale factors would be inverted, causing blurry zoom on rotated
-        // videos or images.
-        val bufferWidth: Int
-        val bufferHeight: Int
-        if (isOrientationMismatch) {
-            bufferWidth = (viewHeight * bufferScale).roundToInt().coerceAtLeast(1)
-            bufferHeight = (viewWidth * bufferScale).roundToInt().coerceAtLeast(1)
-        } else {
-            bufferWidth = (viewWidth * bufferScale).roundToInt().coerceAtLeast(1)
-            bufferHeight = (viewHeight * bufferScale).roundToInt().coerceAtLeast(1)
-        }
+        val bufferWidth = (viewWidth * bufferScale).roundToInt().coerceAtLeast(1)
+        val bufferHeight = (viewHeight * bufferScale).roundToInt().coerceAtLeast(1)
         player.setRenderSurfaceSize(bufferWidth, bufferHeight)
         originalRenderSurfaceActive = true
     }
