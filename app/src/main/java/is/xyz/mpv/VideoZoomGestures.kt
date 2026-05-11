@@ -75,6 +75,12 @@ internal class VideoZoomGestures(
 
     private var renderSurfaceMode = RenderSurfaceMode.BASE
 
+    // When a pinch returns close enough to normal size, finish it through the
+    // same delayed reset path as double-tap. Calling reset() directly from
+    // onScaleEnd still sees ScaleGestureDetector as in-progress on some devices,
+    // which keeps the original-detail Android surface selected for that frame.
+    private var pendingPinchDoubleTapReset = false
+
     // Coalesce view property updates to vsync. We do not animate here; we only avoid
     // writing View properties multiple times in one display frame.
     private val choreographer: Choreographer = Choreographer.getInstance()
@@ -90,6 +96,7 @@ internal class VideoZoomGestures(
         object : ScaleGestureDetector.SimpleOnScaleGestureListener() {
             override fun onScaleBegin(detector: ScaleGestureDetector): Boolean {
                 lastTapTime = 0L
+                pendingPinchDoubleTapReset = false
                 panActive = false
                 canBeTap = false
 
@@ -110,6 +117,18 @@ internal class VideoZoomGestures(
                 val oldScale = scale
                 val requested = oldScale * detector.scaleFactor
                 val newScale = requested.coerceIn(MIN_SCALE, MAX_SCALE)
+
+                if (newScale <= PINCH_DOUBLE_TAP_RESET_SCALE) {
+                    scale = 1f
+                    tx = 0.0
+                    ty = 0.0
+                    pendingPinchDoubleTapReset = true
+                    resetPanFilters(detector.focusX, detector.focusY, SystemClock.uptimeMillis())
+                    scheduleApply()
+                    return true
+                }
+
+                pendingPinchDoubleTapReset = false
                 if (newScale == oldScale)
                     return true
 
@@ -130,12 +149,9 @@ internal class VideoZoomGestures(
             }
 
             override fun onScaleEnd(detector: ScaleGestureDetector) {
-                if (shouldSnapBackToBaseScale()) {
-                    // onScaleEnd() can be delivered while ScaleGestureDetector still reports
-                    // isInProgress=true. A normal reset would then immediately pick the
-                    // high-resolution Android zoom surface again. Force the base mpv surface
-                    // when the pinch gesture returns to normal size.
-                    resetToBaseSurface()
+                if (pendingPinchDoubleTapReset || scale <= PINCH_DOUBLE_TAP_RESET_SCALE) {
+                    pendingPinchDoubleTapReset = true
+                    resetLikeDoubleTapAfterPinch()
                 } else {
                     resetPanFilters(detector.focusX, detector.focusY, SystemClock.uptimeMillis())
                     updateRenderSurfaceForCurrentState(force = true)
@@ -176,14 +192,10 @@ internal class VideoZoomGestures(
     fun isZoomed(): Boolean = scale > 1f + EPS
 
     fun shouldBlockOtherGestures(e: MotionEvent): Boolean {
-        return isZoomed() || scaleDetector.isInProgress || e.pointerCount > 1
+        return isZoomed() || pendingPinchDoubleTapReset || scaleDetector.isInProgress || e.pointerCount > 1
     }
 
     fun reset() {
-        resetToBaseSurface()
-    }
-
-    private fun resetToBaseSurface() {
         if (applyScheduled) {
             choreographer.removeFrameCallback(frameCallback)
             applyScheduled = false
@@ -196,14 +208,33 @@ internal class VideoZoomGestures(
         panActive = false
         canBeTap = false
         lastTapTime = 0L
+        pendingPinchDoubleTapReset = false
         resetPanFilters(0f, 0f, SystemClock.uptimeMillis())
 
         // Critical for scan quality: after returning to normal size, do not keep
-        // the original-resolution Android zoom surface and let Android minify it.
-        // Let mpv draw directly to the normal view-sized surface instead. This is
-        // required for both double-tap reset and pinch-back-to-1x reset.
-        requestBaseRenderSurfaceSize(force = true)
+        // the original-resolution texture and let Android minify it. Let mpv draw
+        // directly to the view-sized surface instead. The only exception is the
+        // opposite-orientation case: there we keep a media-aspect surface so zoom
+        // can start/stop without a surface-aspect switch or a one-frame tear.
+        updateRenderSurfaceForCurrentState(force = true)
         applyToView()
+    }
+
+    private fun resetLikeDoubleTapAfterPinch() {
+        target.post {
+            if (scaleDetector.isInProgress) {
+                resetLikeDoubleTapAfterPinch()
+                return@post
+            }
+
+            if (!pendingPinchDoubleTapReset && scale > PINCH_DOUBLE_TAP_RESET_SCALE)
+                return@post
+
+            // This is intentionally the same reset action used by double-tap,
+            // but deferred until the pinch detector has fully ended so surface
+            // selection follows the smooth double-tap path.
+            reset()
+        }
     }
 
     /**
@@ -251,7 +282,7 @@ internal class VideoZoomGestures(
         }
 
         if (!isZoomed())
-            return false
+            return pendingPinchDoubleTapReset
 
         when (e.actionMasked) {
             MotionEvent.ACTION_DOWN -> {
@@ -496,10 +527,9 @@ internal class VideoZoomGestures(
     }
 
     private fun updateRenderSurfaceForCurrentState(force: Boolean) {
-        val needsAndroidZoomSurface = isZoomed() || scaleDetector.isInProgress
         when {
-            needsAndroidZoomSurface && usesMediaAspectRenderSurface() -> requestMediaAspectRenderSurfaceSize(force)
-            needsAndroidZoomSurface -> requestViewAspectOriginalRenderSurfaceSize(force)
+            usesMediaAspectRenderSurface() -> requestMediaAspectRenderSurfaceSize(force)
+            isZoomed() || scaleDetector.isInProgress -> requestViewAspectOriginalRenderSurfaceSize(force)
             else -> requestBaseRenderSurfaceSize(force)
         }
     }
@@ -576,8 +606,6 @@ internal class VideoZoomGestures(
         player.setRenderSurfaceSize(bufferWidth, bufferHeight)
         renderSurfaceMode = RenderSurfaceMode.MEDIA_ASPECT_ORIGINAL
     }
-
-    private fun shouldSnapBackToBaseScale(): Boolean = scale <= 1f + RESET_TO_BASE_EPS
 
     private fun usesMediaAspectRenderSurface(): Boolean {
         if (viewWidth <= 1f || viewHeight <= 1f || videoAspect <= 0.001)
@@ -706,9 +734,9 @@ internal class VideoZoomGestures(
 
     companion object {
         private const val EPS = 0.001f
-        private const val RESET_TO_BASE_EPS = 0.01f
         private const val MIN_SCALE = 1f
         private const val MAX_SCALE = 20f
+        private const val PINCH_DOUBLE_TAP_RESET_SCALE = 1.01f
         private const val DOUBLE_TAP_TIMEOUT = 300L
         private const val MEDIA_ORIENTATION_THRESHOLD = 1.08
         private const val VIEW_ORIENTATION_THRESHOLD = 1.08f
