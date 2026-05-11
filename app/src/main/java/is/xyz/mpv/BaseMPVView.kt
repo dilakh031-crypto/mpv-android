@@ -3,6 +3,7 @@ package `is`.xyz.mpv
 import android.content.Context
 import android.graphics.Matrix
 import android.graphics.SurfaceTexture
+import android.os.SystemClock
 import android.util.AttributeSet
 import android.util.Log
 import android.view.Surface
@@ -99,6 +100,8 @@ abstract class BaseMPVView(context: Context, attrs: AttributeSet) : TextureView(
     private var renderSurfaceWidth = 0
     private var renderSurfaceHeight = 0
     private var customRenderSurfaceSize = false
+    private var appliedRenderSurfaceWidth = 0
+    private var appliedRenderSurfaceHeight = 0
 
     private val textureTransform = Matrix()
     private var customTextureContentRect = false
@@ -106,6 +109,19 @@ abstract class BaseMPVView(context: Context, attrs: AttributeSet) : TextureView(
     private var textureContentTop = 0f
     private var textureContentWidth = 0f
     private var textureContentHeight = 0f
+
+    // When the render buffer aspect changes while video is actively presenting
+    // frames, applying TextureView's content-rect matrix immediately can briefly
+    // compose one old-size frame with the new matrix. That is the small "tear" at
+    // the exact transition from normal view to the first zoom step. Keep the old
+    // matrix until the next frame from mpv is latched; static images/paused video
+    // fall back quickly so their zoom quality is unchanged.
+    private var lastTextureUpdateTime = 0L
+    private var deferTextureTransformUntilFrame = false
+    private var pendingTextureTransform = false
+    private val deferredTextureTransformRunnable = Runnable {
+        finishDeferredTextureTransform()
+    }
 
     /**
      * Set the real SurfaceTexture buffer size used by mpv without changing the
@@ -156,7 +172,7 @@ abstract class BaseMPVView(context: Context, attrs: AttributeSet) : TextureView(
     }
 
     fun resetTextureTransform() {
-        if (!customTextureContentRect)
+        if (!customTextureContentRect && !pendingTextureTransform)
             return
 
         customTextureContentRect = false
@@ -165,17 +181,20 @@ abstract class BaseMPVView(context: Context, attrs: AttributeSet) : TextureView(
 
     fun resetRenderSurfaceSize() {
         customRenderSurfaceSize = false
-        resetTextureTransform()
 
         val safeWidth = width.coerceAtLeast(1)
         val safeHeight = height.coerceAtLeast(1)
 
-        if (safeWidth == renderSurfaceWidth && safeHeight == renderSurfaceHeight)
-            return
+        if (safeWidth != renderSurfaceWidth || safeHeight != renderSurfaceHeight) {
+            renderSurfaceWidth = safeWidth
+            renderSurfaceHeight = safeHeight
+            applyRenderSurfaceSize()
+        }
 
-        renderSurfaceWidth = safeWidth
-        renderSurfaceHeight = safeHeight
-        applyRenderSurfaceSize()
+        // If the buffer size changed, reset the TextureView matrix only after the
+        // first matching frame arrives. This makes the source-aspect <-> view-aspect
+        // switch visually continuous during active playback.
+        resetTextureTransform()
     }
 
     private fun ensureRenderSurfaceSize(width: Int, height: Int) {
@@ -191,11 +210,53 @@ abstract class BaseMPVView(context: Context, attrs: AttributeSet) : TextureView(
         if (renderSurfaceWidth <= 0 || renderSurfaceHeight <= 0)
             return
 
+        val sizeChanged = renderSurfaceWidth != appliedRenderSurfaceWidth ||
+            renderSurfaceHeight != appliedRenderSurfaceHeight
+
         texture.setDefaultBufferSize(renderSurfaceWidth, renderSurfaceHeight)
+        appliedRenderSurfaceWidth = renderSurfaceWidth
+        appliedRenderSurfaceHeight = renderSurfaceHeight
         MPVLib.setPropertyString("android-surface-size", "${renderSurfaceWidth}x${renderSurfaceHeight}")
+
+        if (sizeChanged)
+            deferTextureTransformIfVideoIsUpdating()
+    }
+
+    private fun deferTextureTransformIfVideoIsUpdating() {
+        val now = SystemClock.uptimeMillis()
+        val frameIsActive = lastTextureUpdateTime > 0L &&
+            now - lastTextureUpdateTime <= ACTIVE_FRAME_UPDATE_WINDOW_MS
+
+        if (frameIsActive)
+            deferTextureTransformUntilFrame = true
     }
 
     private fun applyTextureTransform() {
+        if (deferTextureTransformUntilFrame) {
+            pendingTextureTransform = true
+            removeCallbacks(deferredTextureTransformRunnable)
+            postDelayed(deferredTextureTransformRunnable, DEFERRED_TEXTURE_TRANSFORM_FALLBACK_MS)
+            return
+        }
+
+        removeCallbacks(deferredTextureTransformRunnable)
+        pendingTextureTransform = false
+        applyTextureTransformNow()
+    }
+
+    private fun finishDeferredTextureTransform() {
+        if (!pendingTextureTransform) {
+            deferTextureTransformUntilFrame = false
+            return
+        }
+
+        deferTextureTransformUntilFrame = false
+        pendingTextureTransform = false
+        removeCallbacks(deferredTextureTransformRunnable)
+        applyTextureTransformNow()
+    }
+
+    private fun applyTextureTransformNow() {
         textureTransform.reset()
 
         if (customTextureContentRect) {
@@ -218,7 +279,9 @@ abstract class BaseMPVView(context: Context, attrs: AttributeSet) : TextureView(
         attachedTexture = texture
         ensureRenderSurfaceSize(width, height)
         texture.setDefaultBufferSize(renderSurfaceWidth, renderSurfaceHeight)
-        applyTextureTransform()
+        appliedRenderSurfaceWidth = renderSurfaceWidth
+        appliedRenderSurfaceHeight = renderSurfaceHeight
+        applyTextureTransformNow()
 
         Log.w(TAG, "attaching texture surface ${renderSurfaceWidth}x${renderSurfaceHeight}")
         val surface = Surface(texture)
@@ -250,6 +313,11 @@ abstract class BaseMPVView(context: Context, attrs: AttributeSet) : TextureView(
         // setting a property will wait for VO deinit.
         MPVLib.detachSurface()
         surface.release()
+        removeCallbacks(deferredTextureTransformRunnable)
+        pendingTextureTransform = false
+        deferTextureTransformUntilFrame = false
+        appliedRenderSurfaceWidth = 0
+        appliedRenderSurfaceHeight = 0
         attachedSurface = null
         attachedTexture = null
     }
@@ -271,9 +339,15 @@ abstract class BaseMPVView(context: Context, attrs: AttributeSet) : TextureView(
         return true
     }
 
-    override fun onSurfaceTextureUpdated(surface: SurfaceTexture) = Unit
+    override fun onSurfaceTextureUpdated(surface: SurfaceTexture) {
+        lastTextureUpdateTime = SystemClock.uptimeMillis()
+        if (deferTextureTransformUntilFrame)
+            finishDeferredTextureTransform()
+    }
 
     companion object {
         private const val TAG = "mpv"
+        private const val ACTIVE_FRAME_UPDATE_WINDOW_MS = 120L
+        private const val DEFERRED_TEXTURE_TRANSFORM_FALLBACK_MS = 60L
     }
 }
