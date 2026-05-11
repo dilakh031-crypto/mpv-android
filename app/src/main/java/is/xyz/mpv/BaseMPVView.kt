@@ -100,39 +100,78 @@ abstract class BaseMPVView(context: Context, attrs: AttributeSet) : TextureView(
     private var renderSurfaceHeight = 0
     private var customRenderSurfaceSize = false
 
+    private val textureTransform = Matrix()
+    private var customTextureContentRect = false
+    private var textureContentLeft = 0f
+    private var textureContentTop = 0f
+    private var textureContentWidth = 0f
+    private var textureContentHeight = 0f
+
     /**
      * Set the real SurfaceTexture buffer size used by mpv without changing the
      * TextureView's on-screen size.
      *
-     * The buffer may use either the view aspect ratio or the media aspect ratio.
-     * When those two aspect ratios differ, fit the TextureView content with its
-     * own matrix so Android does not stretch a landscape buffer into a portrait
-     * view, or a portrait buffer into a landscape view.
+     * This intentionally accepts the requested size as-is. The caller decides the
+     * size, so high-resolution media can be rendered at its original resolution
+     * instead of being reduced to the display resolution before Android zooms it.
      */
     fun setRenderSurfaceSize(width: Int, height: Int) {
         val safeWidth = width.coerceAtLeast(1)
         val safeHeight = height.coerceAtLeast(1)
         customRenderSurfaceSize = true
 
-        if (safeWidth == renderSurfaceWidth && safeHeight == renderSurfaceHeight) {
-            applyTextureTransform()
+        if (safeWidth == renderSurfaceWidth && safeHeight == renderSurfaceHeight)
             return
-        }
 
         renderSurfaceWidth = safeWidth
         renderSurfaceHeight = safeHeight
         applyRenderSurfaceSize()
     }
 
+    /**
+     * Letterbox/pillarbox a source-aspect render buffer inside this TextureView.
+     *
+     * Used only by zoom mode when the phone orientation is opposite to the media
+     * orientation. In that case allocating a full view-aspect buffer wastes most
+     * pixels on black bars (for example 16:9 media on a 9:16 screen), and some
+     * devices downscale or blur the result. Rendering into a source-aspect buffer
+     * and mapping that texture into the same on-screen content rect keeps the
+     * zoomed image at full detail.
+     */
+    fun setTextureContentRect(left: Float, top: Float, width: Float, height: Float) {
+        val safeWidth = width.coerceAtLeast(1f)
+        val safeHeight = height.coerceAtLeast(1f)
+
+        if (customTextureContentRect &&
+            textureContentLeft == left && textureContentTop == top &&
+            textureContentWidth == safeWidth && textureContentHeight == safeHeight
+        ) return
+
+        customTextureContentRect = true
+        textureContentLeft = left
+        textureContentTop = top
+        textureContentWidth = safeWidth
+        textureContentHeight = safeHeight
+        applyTextureTransform()
+    }
+
+    fun resetTextureTransform() {
+        if (!customTextureContentRect)
+            return
+
+        customTextureContentRect = false
+        applyTextureTransform()
+    }
+
     fun resetRenderSurfaceSize() {
         customRenderSurfaceSize = false
+        resetTextureTransform()
+
         val safeWidth = width.coerceAtLeast(1)
         val safeHeight = height.coerceAtLeast(1)
 
-        if (safeWidth == renderSurfaceWidth && safeHeight == renderSurfaceHeight) {
-            applyTextureTransform()
+        if (safeWidth == renderSurfaceWidth && safeHeight == renderSurfaceHeight)
             return
-        }
 
         renderSurfaceWidth = safeWidth
         renderSurfaceHeight = safeHeight
@@ -154,35 +193,22 @@ abstract class BaseMPVView(context: Context, attrs: AttributeSet) : TextureView(
 
         texture.setDefaultBufferSize(renderSurfaceWidth, renderSurfaceHeight)
         MPVLib.setPropertyString("android-surface-size", "${renderSurfaceWidth}x${renderSurfaceHeight}")
-        applyTextureTransform()
     }
 
     private fun applyTextureTransform() {
-        val viewWidth = width.toFloat()
-        val viewHeight = height.toFloat()
-        if (viewWidth <= 1f || viewHeight <= 1f || renderSurfaceWidth <= 0 || renderSurfaceHeight <= 0)
-            return
+        textureTransform.reset()
 
-        if (!customRenderSurfaceSize) {
-            setTransform(null)
-            invalidate()
-            return
+        if (customTextureContentRect) {
+            val viewWidth = width.toFloat().coerceAtLeast(1f)
+            val viewHeight = height.toFloat().coerceAtLeast(1f)
+            textureTransform.setScale(
+                textureContentWidth / viewWidth,
+                textureContentHeight / viewHeight,
+            )
+            textureTransform.postTranslate(textureContentLeft, textureContentTop)
         }
 
-        val bufferAspect = renderSurfaceWidth.toFloat() / renderSurfaceHeight.toFloat()
-        val viewAspect = viewWidth / viewHeight
-        val matrix = Matrix()
-
-        if (bufferAspect > viewAspect) {
-            val scaleY = viewAspect / bufferAspect
-            matrix.setScale(1f, scaleY, viewWidth * 0.5f, viewHeight * 0.5f)
-        } else {
-            val scaleX = bufferAspect / viewAspect
-            matrix.setScale(scaleX, 1f, viewWidth * 0.5f, viewHeight * 0.5f)
-        }
-
-        setTransform(matrix)
-        invalidate()
+        setTransform(textureTransform)
     }
 
     private fun attachSurfaceTexture(texture: SurfaceTexture, width: Int, height: Int) {
@@ -237,13 +263,7 @@ abstract class BaseMPVView(context: Context, attrs: AttributeSet) : TextureView(
     override fun onSurfaceTextureSizeChanged(surface: SurfaceTexture, width: Int, height: Int) {
         ensureRenderSurfaceSize(width, height)
         applyRenderSurfaceSize()
-    }
-
-    override fun onSizeChanged(width: Int, height: Int, oldWidth: Int, oldHeight: Int) {
-        super.onSizeChanged(width, height, oldWidth, oldHeight)
-        if (!customRenderSurfaceSize)
-            ensureRenderSurfaceSize(width, height)
-        applyRenderSurfaceSize()
+        applyTextureTransform()
     }
 
     override fun onSurfaceTextureDestroyed(surface: SurfaceTexture): Boolean {
