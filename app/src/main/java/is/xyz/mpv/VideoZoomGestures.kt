@@ -22,10 +22,10 @@ import kotlin.math.roundToInt
  *    false-color artifacts on high-frequency scans at 720p.
  *  - As soon as the user starts zooming, the render surface switches to an
  *    original-detail buffer so zoom keeps full source detail.
- *  - If the phone orientation is opposite to the media orientation, we keep a
- *    media-aspect render surface and compensate with the normal View transform.
- *    This avoids the oversized black-bar buffer that loses zoom quality without
- *    using TextureView#setTransform, so playback does not tear at zoom/reset.
+ *  - While zooming, if the phone orientation is opposite to the media orientation,
+ *    we use a media-aspect render surface and compensate with the normal View
+ *    transform. At normal size both portrait and landscape return to the same
+ *    base mpv surface, so Android's original-detail surface is used only for zoom.
  *
  * We do not use mpv video-pan/video-zoom for finger movement.
  */
@@ -75,11 +75,10 @@ internal class VideoZoomGestures(
 
     private var renderSurfaceMode = RenderSurfaceMode.BASE
 
-    // Pinch reset must follow the exact same reset action as double-tap, but it
-    // has to run after ScaleGestureDetector is fully out of its in-progress state.
-    // This is especially important when media/view orientation is opposite, where
-    // the media-aspect surface must stay selected until the normal double-tap reset
-    // path has a clean frame to settle.
+    // When a pinch returns close enough to normal size, finish it through the
+    // same reset action as double-tap. The action is delayed until all pinch
+    // fingers are released, matching the clean touch state of a real double-tap
+    // and avoiding torn surface switches in opposite-orientation playback.
     private var pendingPinchDoubleTapReset = false
 
     // Coalesce view property updates to vsync. We do not animate here; we only avoid
@@ -120,10 +119,6 @@ internal class VideoZoomGestures(
                 val newScale = requested.coerceIn(MIN_SCALE, MAX_SCALE)
 
                 if (shouldResetPinchAtScale(newScale)) {
-                    // Match the visual state of a double-tap reset immediately, but
-                    // defer the actual reset action until the pinch detector ends.
-                    // This avoids the torn intermediate surface switch in the
-                    // opposite-orientation case.
                     scale = 1f
                     tx = 0.0
                     ty = 0.0
@@ -156,7 +151,7 @@ internal class VideoZoomGestures(
             override fun onScaleEnd(detector: ScaleGestureDetector) {
                 if (pendingPinchDoubleTapReset || shouldResetPinchAtScale(scale)) {
                     pendingPinchDoubleTapReset = true
-                    resetLikeDoubleTapAfterPinch()
+                    resetPanFilters(detector.focusX, detector.focusY, SystemClock.uptimeMillis())
                 } else {
                     resetPanFilters(detector.focusX, detector.focusY, SystemClock.uptimeMillis())
                     updateRenderSurfaceForCurrentState(force = true)
@@ -218,35 +213,32 @@ internal class VideoZoomGestures(
 
         // Critical for scan quality: after returning to normal size, do not keep
         // the original-resolution texture and let Android minify it. Let mpv draw
-        // directly to the view-sized surface instead. The only exception is the
-        // opposite-orientation case: there we keep a media-aspect surface so zoom
-        // can start/stop without a surface-aspect switch or a one-frame tear.
+        // directly to the view-sized surface instead. This is intentionally the
+        // same for portrait and landscape; the Android original-detail surface is
+        // reserved for active zoom/pinch only.
         updateRenderSurfaceForCurrentState(force = true)
         applyToView()
     }
 
     private fun shouldResetPinchAtScale(value: Float): Boolean {
-        // One shared threshold for both same-orientation and opposite-orientation
-        // playback. Do not special-case MEDIA_ASPECT_ORIGINAL here; in that mode
-        // reset() must keep using the same surface-selection path as double-tap.
         return value <= PINCH_DOUBLE_TAP_RESET_SCALE
     }
 
     private fun resetLikeDoubleTapAfterPinch() {
-        target.post {
-            if (scaleDetector.isInProgress) {
-                resetLikeDoubleTapAfterPinch()
-                return@post
+        target.postOnAnimation {
+            target.post {
+                if (scaleDetector.isInProgress) {
+                    resetLikeDoubleTapAfterPinch()
+                    return@post
+                }
+
+                if (!pendingPinchDoubleTapReset && !shouldResetPinchAtScale(scale))
+                    return@post
+
+                // Exactly the same action used by double-tap. The difference is
+                // only timing: pinch waits until all fingers are up, then resets.
+                reset()
             }
-
-            if (!pendingPinchDoubleTapReset && !shouldResetPinchAtScale(scale))
-                return@post
-
-            // Exactly the same action used by double-tap. The only difference is
-            // timing: pinch queues it and lets it run after ScaleGestureDetector
-            // has ended, so the opposite-orientation media-aspect path does not
-            // tear during the transition.
-            reset()
         }
     }
 
@@ -261,16 +253,21 @@ internal class VideoZoomGestures(
         // Always feed the scale detector first.
         scaleDetector.onTouchEvent(e)
 
-        // Safety net: on some opposite-orientation touch streams the last scale
-        // sample reaches the 1% reset threshold before onScaleEnd has fully
-        // unwound. Queue the same double-tap reset as soon as fingers start
-        // lifting, instead of relying on a direct surface switch.
-        if (pendingPinchDoubleTapReset &&
-            (e.actionMasked == MotionEvent.ACTION_POINTER_UP ||
-                e.actionMasked == MotionEvent.ACTION_UP ||
-                e.actionMasked == MotionEvent.ACTION_CANCEL)
-        ) {
-            resetLikeDoubleTapAfterPinch()
+        if (pendingPinchDoubleTapReset) {
+            when (e.actionMasked) {
+                MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                    resetLikeDoubleTapAfterPinch()
+                    return true
+                }
+
+                MotionEvent.ACTION_POINTER_UP -> {
+                    // A pinch usually ends when one of two fingers lifts, but one
+                    // finger is still touching the screen. A real double-tap reset
+                    // happens after ACTION_UP, so wait for that clean state instead
+                    // of switching surfaces during the pointer transition.
+                    return true
+                }
+            }
         }
 
         // Pointer transitions during pinch:
@@ -552,11 +549,15 @@ internal class VideoZoomGestures(
     }
 
     private fun updateRenderSurfaceForCurrentState(force: Boolean) {
-        when {
-            usesMediaAspectRenderSurface() -> requestMediaAspectRenderSurfaceSize(force)
-            isZoomed() || scaleDetector.isInProgress -> requestViewAspectOriginalRenderSurfaceSize(force)
-            else -> requestBaseRenderSurfaceSize(force)
+        if (!isZoomed() && !scaleDetector.isInProgress) {
+            requestBaseRenderSurfaceSize(force)
+            return
         }
+
+        if (usesMediaAspectRenderSurface())
+            requestMediaAspectRenderSurfaceSize(force)
+        else
+            requestViewAspectOriginalRenderSurfaceSize(force)
     }
 
     private fun requestBaseRenderSurfaceSize(force: Boolean) {
