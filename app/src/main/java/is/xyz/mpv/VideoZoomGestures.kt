@@ -22,14 +22,9 @@ import kotlin.math.roundToInt
  *    false-color artifacts on high-frequency scans at 720p.
  *  - As soon as the user starts zooming, the render surface switches to an
  *    original-detail buffer so zoom keeps full source detail.
- *  - In the normal unzoomed state we always keep mpv rendering directly to the
- *    view-sized surface, even when the phone orientation and media orientation
- *    do not match. The Android-sized/original-detail surface is used only while
- *    the user is zooming.
- *  - During zoom in the opposite-orientation case, we keep a media-aspect render
- *    surface and compensate with the normal View transform. This avoids the
- *    oversized black-bar buffer that loses zoom quality without using
- *    TextureView#setTransform.
+ *  - Opposite phone/media orientation still uses the normal view-sized mpv
+ *    surface while unzoomed. The media-aspect render surface is only selected
+ *    while zooming, so Android scaling is limited to zoom mode.
  *
  * We do not use mpv video-pan/video-zoom for finger movement.
  */
@@ -107,7 +102,7 @@ internal class VideoZoomGestures(
                 // Switch to the original-detail buffer before the first visible zoom step.
                 // This keeps early zoom stages sharp without forcing Android to downscale
                 // the original-size texture while the image is still unzoomed.
-                updateRenderSurfaceForCurrentState(force = true)
+                updateRenderSurfaceForCurrentState(force = true, zoomSurfaceNeeded = true)
 
                 resetPanFilters(detector.focusX, detector.focusY, SystemClock.uptimeMillis())
                 return true
@@ -216,9 +211,9 @@ internal class VideoZoomGestures(
         resetPanFilters(0f, 0f, SystemClock.uptimeMillis())
 
         // Critical for scan quality: after returning to normal size, do not keep
-        // the original-resolution texture and let Android minify it. Let mpv draw
-        // directly to the view-sized surface instead, including the case where
-        // the phone orientation and media orientation do not match.
+        // an original/media-aspect texture and let Android minify it. Let mpv draw
+        // directly to the view-sized surface instead, including opposite-orientation
+        // phone/media combinations.
         updateRenderSurfaceForCurrentState(force = true)
         applyToView()
     }
@@ -529,10 +524,12 @@ internal class VideoZoomGestures(
         )
     }
 
-    private fun updateRenderSurfaceForCurrentState(force: Boolean) {
-        val needsZoomRenderSurface = isZoomed() || scaleDetector.isInProgress
+    private fun updateRenderSurfaceForCurrentState(
+        force: Boolean,
+        zoomSurfaceNeeded: Boolean = isZoomed() || scaleDetector.isInProgress,
+    ) {
         when {
-            !needsZoomRenderSurface -> requestBaseRenderSurfaceSize(force)
+            !zoomSurfaceNeeded -> requestBaseRenderSurfaceSize(force)
             usesMediaAspectRenderSurface() -> requestMediaAspectRenderSurfaceSize(force)
             else -> requestViewAspectOriginalRenderSurfaceSize(force)
         }
