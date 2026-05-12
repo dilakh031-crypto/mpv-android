@@ -1,6 +1,5 @@
 package `is`.xyz.mpv
 
-import android.graphics.Matrix
 import android.os.SystemClock
 import android.view.Choreographer
 import android.view.MotionEvent
@@ -12,19 +11,19 @@ import kotlin.math.abs
 import kotlin.math.hypot
 import kotlin.math.max
 import kotlin.math.min
-import kotlin.math.ceil
+import kotlin.math.roundToInt
 
 /**
  * Pinch-to-zoom + pan for mpv output.
  *
  * Important quality detail:
- *  - Normal view and zoomed view use the same original-resolution,
- *    aspect-preserving render surface. TextureView's matrix does the
- *    fit-center / letterbox step visually instead of spending buffer pixels
- *    on black bars.
- *  - Keeping one render pipeline avoids the one-frame stretch/tear that can
- *    happen when switching between a view-sized buffer and a source-sized
- *    buffer while video frames are still being produced.
+ *  - Unzoomed view uses the normal view-sized mpv surface so mpv, not Android's
+ *    TextureView compositor, performs the huge downscale. This avoids moire /
+ *    false-color artifacts on high-frequency scans at 720p.
+ *  - As soon as the user starts zooming, the render surface switches to a
+ *    media-resolution buffer. The TextureView transform keeps that buffer fitted
+ *    inside the view, so opposite screen/video orientations do not require a
+ *    huge padded buffer and do not lose detail.
  *
  * We do not use mpv video-pan/video-zoom for finger movement.
  */
@@ -92,9 +91,9 @@ internal class VideoZoomGestures(
                 panActive = false
                 canBeTap = false
 
-                // The original-detail buffer is kept active even at scale=1.
-                // Re-apply it here in case media/view metrics changed just before
-                // the gesture started, but do not switch render pipelines.
+                // Switch to the original-detail buffer before the first visible zoom step.
+                // This keeps early zoom stages sharp without forcing Android to downscale
+                // the original-size texture while the image is still unzoomed.
                 requestOriginalRenderSurfaceSize(force = true)
 
                 resetPanFilters(detector.focusX, detector.focusY, SystemClock.uptimeMillis())
@@ -143,22 +142,31 @@ internal class VideoZoomGestures(
         viewWidth = width
         viewHeight = height
         refreshMetricsFromTarget()
-        clampTranslationToVideoContent()
-        requestOriginalRenderSurfaceSize(force = true)
-        scheduleApply()
+        if (isZoomed() || scaleDetector.isInProgress) {
+            clampTranslationToVideoContent()
+            requestOriginalRenderSurfaceSize(force = true)
+            scheduleApply()
+        } else {
+            requestBaseRenderSurfaceSize(force = true)
+        }
     }
 
     fun setVideoAspect(aspect: Double?) {
         videoAspect = aspect ?: 0.0
-        clampTranslationToVideoContent()
-        requestOriginalRenderSurfaceSize(force = true)
-        scheduleApply()
+        if (isZoomed() || scaleDetector.isInProgress) {
+            clampTranslationToVideoContent()
+            requestOriginalRenderSurfaceSize(force = true)
+            scheduleApply()
+        }
     }
 
     fun setVideoPixelSize(size: Pair<Int, Int>?) {
         videoPixelWidth = size?.first ?: 0
         videoPixelHeight = size?.second ?: 0
-        requestOriginalRenderSurfaceSize(force = true)
+        if (isZoomed() || scaleDetector.isInProgress)
+            requestOriginalRenderSurfaceSize(force = true)
+        else
+            requestBaseRenderSurfaceSize(force = true)
     }
 
     fun isZoomed(): Boolean = scale > 1f + EPS
@@ -183,11 +191,10 @@ internal class VideoZoomGestures(
         resetPanFilters(0f, 0f, SystemClock.uptimeMillis())
         applyToView()
 
-        // Keep the same source-sized render surface at normal scale too.
-        // Returning to the full image is now only a View transform reset, not a
-        // SurfaceTexture buffer-size switch, so moving through scale=1 does not
-        // expose a one-frame stretched image.
-        requestOriginalRenderSurfaceSize(force = true)
+        // Critical for scan quality: after returning to normal size, do not keep
+        // the original-resolution texture and let Android minify it. Let mpv draw
+        // directly to the view-sized surface instead.
+        requestBaseRenderSurfaceSize(force = true)
     }
 
     /**
@@ -467,7 +474,6 @@ internal class VideoZoomGestures(
             return
 
         originalRenderSurfaceActive = false
-        player.setTransform(Matrix())
         player.resetRenderSurfaceSize()
     }
 
@@ -489,63 +495,39 @@ internal class VideoZoomGestures(
             return
         }
 
-        // Keep the render buffer tied to the media, not to the screen.
+        // Use a buffer based on the media resolution itself instead of padding it
+        // to the current screen/view aspect. The padding approach becomes very
+        // large when a landscape video is zoomed on a portrait screen (or the
+        // opposite), which can lower quality or crop on some devices.
         //
-        // The previous code scaled the whole view-sized surface until the video
-        // content area reached source resolution. On a portrait phone showing a
-        // wide image/video, that also scaled the top/bottom black bars, so a
-        // 6000x3375 image could request something like 6000x13333. That often
-        // exceeds SurfaceTexture/GPU limits, causing the actual rendered image to
-        // be silently reduced and look low-resolution at high zoom.
-        //
-        // Here the SurfaceTexture buffer contains only the aspect-correct media
-        // area. TextureView's matrix adds the visual letterbox/pillarbox on
-        // screen without spending buffer pixels on those black bars.
-        val (bufferWidth, bufferHeight) = originalDetailBufferSize()
-
-        // Apply the fit-center transform before any possible buffer-size change.
-        // If a frame is presented between these operations, it is safer for it to
-        // be letterboxed/double-letterboxed briefly than stretched to the full
-        // TextureView. In the steady state there is no transition at scale=1.
-        applyContentTextureTransform(player, c)
-        player.setRenderSurfaceSize(bufferWidth, bufferHeight)
+        // The buffer aspect must still match the displayed media aspect, not
+        // necessarily the coded pixel aspect. For anamorphic media, keep the
+        // media's real pixel detail and expand only the axis needed to match the
+        // display aspect reported by mpv.
+        val bufferSize = mediaResolutionBufferSize()
+        player.setRenderSurfaceSize(bufferSize.first, bufferSize.second, fitToView = true)
         originalRenderSurfaceActive = true
     }
 
-
-    private fun originalDetailBufferSize(): Pair<Int, Int> {
-        val sourceW = videoPixelWidth.coerceAtLeast(1)
-        val sourceH = videoPixelHeight.coerceAtLeast(1)
-        val displayAspect = (if (videoAspect > 0.001) {
+    private fun mediaResolutionBufferSize(): Pair<Int, Int> {
+        val sourceWidth = videoPixelWidth.coerceAtLeast(1)
+        val sourceHeight = videoPixelHeight.coerceAtLeast(1)
+        val displayAspect = if (videoAspect > 0.001) {
             videoAspect
         } else {
-            sourceW.toDouble() / sourceH.toDouble()
-        }).coerceAtLeast(0.001)
-        val sourceAspect = sourceW.toDouble() / sourceH.toDouble()
+            sourceWidth.toDouble() / sourceHeight.toDouble()
+        }
 
-        // Most media has square pixels, so this returns the raw source size.
-        // If the display aspect differs from the stored pixel aspect, expand the
-        // smaller display dimension so mpv still gets an aspect-correct viewport
-        // without adding screen letterbox bars to the buffer.
-        return if (abs(displayAspect - sourceAspect) <= ASPECT_EPS) {
-            sourceW to sourceH
-        } else if (displayAspect > sourceAspect) {
-            ceil(sourceH * displayAspect).toInt().coerceAtLeast(1) to sourceH
+        val sourceAspect = sourceWidth.toDouble() / sourceHeight.toDouble()
+        return if (displayAspect > sourceAspect) {
+            // Non-square/anamorphic pixels make the displayed image wider than
+            // the coded pixels. Keep the source height and expand width.
+            (sourceHeight * displayAspect).roundToInt().coerceAtLeast(1) to sourceHeight
         } else {
-            sourceW to ceil(sourceW / displayAspect).toInt().coerceAtLeast(1)
+            // The normal square-pixel path lands here unchanged. If display
+            // aspect is narrower, keep source width and expand height.
+            sourceWidth to (sourceWidth / displayAspect).roundToInt().coerceAtLeast(1)
         }
-    }
-
-    private fun applyContentTextureTransform(player: BaseMPVView, c: ContentRect) {
-        if (viewWidth <= 1f || viewHeight <= 1f || c.w <= 1f || c.h <= 1f) {
-            player.setTransform(Matrix())
-            return
-        }
-
-        val matrix = Matrix()
-        matrix.setScale(c.w / viewWidth, c.h / viewHeight)
-        matrix.postTranslate(c.ox, c.oy)
-        player.setTransform(matrix)
     }
 
     private fun filterParamsForCurrentScale(): FilterParams {
@@ -640,7 +622,6 @@ internal class VideoZoomGestures(
 
     companion object {
         private const val EPS = 0.001f
-        private const val ASPECT_EPS = 0.001
         private const val MIN_SCALE = 1f
         private const val MAX_SCALE = 20f
         private const val DOUBLE_TAP_TIMEOUT = 300L
