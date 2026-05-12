@@ -68,15 +68,10 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
     private val fadeHandler = Handler(Looper.getMainLooper())
     // for use with stopServiceRunnable
     private val stopServiceHandler = Handler(Looper.getMainLooper())
-    // Delayed single-tap toggling (we wait a bit so a faster double-tap can be recognized
-    // without flashing the control UI).
+    // Single-tap control handling. A tap now force-shows controls instead of toggling them,
+    // so one tap on the video always brings the UI back.
     private val tapToggleHandler = Handler(Looper.getMainLooper())
     private var pendingTapToggleRunnable: Runnable? = null
-
-    // We intentionally do *not* try to predict a double-tap here. Instead, we only cancel the
-    // pending single-tap toggle if TouchGestures actually confirms and handles a double-tap
-    // (PlayPause / SeekFixed / Custom). This avoids a "dead zone" where two quick taps that do
-    // not qualify as a double-tap would otherwise cancel the single-tap toggle and do nothing.
 
     /**
      * DO NOT USE THIS
@@ -1126,8 +1121,8 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
         }
 
         // Intentionally do NOT auto-hide controls.
-        // The user must explicitly toggle them off (single tap), or they will be hidden when
-        // opening any in-player menu/dialog.
+        // Tapping the video force-shows controls; controls are hidden only by explicit UI flows
+        // such as opening in-player menus/dialogs or dedicated hide actions.
     }
 
     /**
@@ -1291,9 +1286,9 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
             return super.dispatchTouchEvent(ev)
         }
 
-        // For tap-to-toggle, we delay the single-tap action slightly.
-        // We DO NOT cancel on the 2nd tap preemptively. Instead, we cancel only if TouchGestures
-        // actually confirms and handles a double-tap (see onPropertyChange for PlayPause/SeekFixed/Custom).
+        // For single-tap control handling, a confirmed tap force-shows controls.
+        // Double-tap gestures may still cancel any pending legacy tap action, but a normal
+        // one-tap press must never hide the controls or leave them hidden.
         if (ev.actionMasked == MotionEvent.ACTION_DOWN || ev.actionMasked == MotionEvent.ACTION_POINTER_DOWN) {
             // Zoom mode uses double-tap to reset zoom (handled by VideoZoomGestures), not TouchGestures.
             // Cancel any pending single-tap toggle from the previous tap so the UI won't flash/appear.
@@ -1341,8 +1336,7 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
             if (!mightWantToToggleControls)
                 return true
 
-            // Delay the single-tap toggle slightly so TouchGestures can recognize and handle
-            // a possible double-tap. If a double-tap *is* handled, onPropertyChange will cancel.
+            // Force-show controls immediately on a normal single tap.
             scheduleSingleTapToggle()
             mightWantToToggleControls = false
         }
@@ -1361,12 +1355,7 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
 
     private fun scheduleSingleTapToggle() {
         cancelPendingTapToggle()
-        val r = Runnable {
-            pendingTapToggleRunnable = null
-            toggleControls()
-        }
-        pendingTapToggleRunnable = r
-        tapToggleHandler.postDelayed(r, SINGLE_TAP_TOGGLE_DELAY_MS)
+        showControls()
     }
 
     /**
@@ -3475,10 +3464,9 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
         private const val CONTROLS_FADE_IN_DURATION = 80L
         private const val CONTROLS_FADE_OUT_DURATION = 80L
         // Tap timing (must match TouchGestures.TAP_DURATION).
-        // - Double-tap gestures: fast window (ms)
-        // - Single-tap control toggle: delayed slightly longer so double-tap can cancel it (ms)
+        // Double-tap gestures use this fast window (ms). Single tap now force-shows controls
+        // immediately instead of waiting to toggle them.
         private const val DOUBLE_TAP_TIMEOUT_MS = 225L
-        private const val SINGLE_TAP_TOGGLE_DELAY_MS = DOUBLE_TAP_TIMEOUT_MS + 20L
 
         // Reserve the very top portion of the screen for Android system gestures (notification
         // shade/status bar). We only suppress the tap-to-toggle if the finger *moves down*

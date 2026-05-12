@@ -79,12 +79,7 @@ internal class VideoZoomGestures(
     // same delayed reset path as double-tap. Calling reset() directly from
     // onScaleEnd still sees ScaleGestureDetector as in-progress on some devices,
     // which keeps the original-detail Android surface selected for that frame.
-    //
-    // Keep this as an internal reset state only. A separate per-touch-sequence
-    // flag below consumes the current pinch ending, then clears on ACTION_UP /
-    // ACTION_CANCEL so a later normal single tap can still toggle controls.
     private var pendingPinchDoubleTapReset = false
-    private var pinchResetTouchSequenceActive = false
 
     // Coalesce view property updates to vsync. We do not animate here; we only avoid
     // writing View properties multiple times in one display frame.
@@ -102,7 +97,6 @@ internal class VideoZoomGestures(
             override fun onScaleBegin(detector: ScaleGestureDetector): Boolean {
                 lastTapTime = 0L
                 pendingPinchDoubleTapReset = false
-                pinchResetTouchSequenceActive = false
                 panActive = false
                 canBeTap = false
 
@@ -129,7 +123,6 @@ internal class VideoZoomGestures(
                     tx = 0.0
                     ty = 0.0
                     pendingPinchDoubleTapReset = true
-                    pinchResetTouchSequenceActive = true
                     resetPanFilters(detector.focusX, detector.focusY, SystemClock.uptimeMillis())
                     scheduleApply()
                     return true
@@ -158,7 +151,6 @@ internal class VideoZoomGestures(
             override fun onScaleEnd(detector: ScaleGestureDetector) {
                 if (pendingPinchDoubleTapReset || scale <= PINCH_DOUBLE_TAP_RESET_SCALE) {
                     pendingPinchDoubleTapReset = true
-                    pinchResetTouchSequenceActive = true
                     resetLikeDoubleTapAfterPinch()
                 } else {
                     resetPanFilters(detector.focusX, detector.focusY, SystemClock.uptimeMillis())
@@ -200,7 +192,7 @@ internal class VideoZoomGestures(
     fun isZoomed(): Boolean = scale > 1f + EPS
 
     fun shouldBlockOtherGestures(e: MotionEvent): Boolean {
-        return isZoomed() || pinchResetTouchSequenceActive || scaleDetector.isInProgress || e.pointerCount > 1
+        return isZoomed() || pendingPinchDoubleTapReset || scaleDetector.isInProgress || e.pointerCount > 1
     }
 
     fun reset() {
@@ -217,7 +209,6 @@ internal class VideoZoomGestures(
         canBeTap = false
         lastTapTime = 0L
         pendingPinchDoubleTapReset = false
-        pinchResetTouchSequenceActive = false
         resetPanFilters(0f, 0f, SystemClock.uptimeMillis())
 
         // Critical for scan quality: after returning to normal size, do not keep
@@ -232,8 +223,7 @@ internal class VideoZoomGestures(
     private fun resetLikeDoubleTapAfterPinch() {
         target.post {
             if (scaleDetector.isInProgress) {
-                if (pendingPinchDoubleTapReset)
-                    resetLikeDoubleTapAfterPinch()
+                resetLikeDoubleTapAfterPinch()
                 return@post
             }
 
@@ -245,11 +235,6 @@ internal class VideoZoomGestures(
             // selection follows the smooth double-tap path.
             reset()
         }
-    }
-
-    private fun finishPinchResetTouchSequenceIfNeeded(e: MotionEvent) {
-        if (e.actionMasked == MotionEvent.ACTION_UP || e.actionMasked == MotionEvent.ACTION_CANCEL)
-            pinchResetTouchSequenceActive = false
     }
 
     /**
@@ -296,11 +281,8 @@ internal class VideoZoomGestures(
             return true
         }
 
-        if (!isZoomed()) {
-            val consumeThisEvent = pinchResetTouchSequenceActive
-            finishPinchResetTouchSequenceIfNeeded(e)
-            return consumeThisEvent
-        }
+        if (!isZoomed())
+            return pendingPinchDoubleTapReset
 
         when (e.actionMasked) {
             MotionEvent.ACTION_DOWN -> {
@@ -382,7 +364,6 @@ internal class VideoZoomGestures(
                 panFingerDown = false
                 panActive = false
                 canBeTap = false
-                pinchResetTouchSequenceActive = false
                 resetPanFilters(lastPointerX, lastPointerY, SystemClock.uptimeMillis())
                 return true
             }
