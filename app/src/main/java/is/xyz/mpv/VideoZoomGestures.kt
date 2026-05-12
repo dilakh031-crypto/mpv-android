@@ -75,17 +75,16 @@ internal class VideoZoomGestures(
 
     private var renderSurfaceMode = RenderSurfaceMode.BASE
 
-    // A pinch that returns to normal size needs a reset after ScaleGestureDetector
-    // has really left the in-progress state. Keep this as a single guarded
-    // deferred action; do not recursively post unbounded callbacks.
-    private var pendingPinchReset = false
-    private var pinchResetPostPending = false
-    private var pinchResetDeferCount = 0
-
-    private val deferredPinchResetRunnable = Runnable {
-        pinchResetPostPending = false
-        finishDeferredPinchReset()
-    }
+    // When a pinch returns close enough to normal size, finish it through the
+    // same delayed reset path as double-tap. Calling reset() directly from
+    // onScaleEnd still sees ScaleGestureDetector as in-progress on some devices,
+    // which keeps the original-detail Android surface selected for that frame.
+    //
+    // Keep this as an internal reset state only. A separate per-touch-sequence
+    // flag below consumes the current pinch ending, then clears on ACTION_UP /
+    // ACTION_CANCEL so a later normal single tap can still toggle controls.
+    private var pendingPinchDoubleTapReset = false
+    private var pinchResetTouchSequenceActive = false
 
     // Coalesce view property updates to vsync. We do not animate here; we only avoid
     // writing View properties multiple times in one display frame.
@@ -102,7 +101,8 @@ internal class VideoZoomGestures(
         object : ScaleGestureDetector.SimpleOnScaleGestureListener() {
             override fun onScaleBegin(detector: ScaleGestureDetector): Boolean {
                 lastTapTime = 0L
-                cancelPendingPinchReset(removePostedCallback = true)
+                pendingPinchDoubleTapReset = false
+                pinchResetTouchSequenceActive = false
                 panActive = false
                 canBeTap = false
 
@@ -124,12 +124,18 @@ internal class VideoZoomGestures(
                 val requested = oldScale * detector.scaleFactor
                 val newScale = requested.coerceIn(MIN_SCALE, MAX_SCALE)
 
-                if (newScale <= PINCH_RESET_SCALE) {
-                    armPendingPinchReset(detector.focusX, detector.focusY)
+                if (newScale <= PINCH_DOUBLE_TAP_RESET_SCALE) {
+                    scale = 1f
+                    tx = 0.0
+                    ty = 0.0
+                    pendingPinchDoubleTapReset = true
+                    pinchResetTouchSequenceActive = true
+                    resetPanFilters(detector.focusX, detector.focusY, SystemClock.uptimeMillis())
+                    scheduleApply()
                     return true
                 }
 
-                cancelPendingPinchReset(removePostedCallback = true)
+                pendingPinchDoubleTapReset = false
                 if (newScale == oldScale)
                     return true
 
@@ -150,9 +156,10 @@ internal class VideoZoomGestures(
             }
 
             override fun onScaleEnd(detector: ScaleGestureDetector) {
-                if (pendingPinchReset || scale <= PINCH_RESET_SCALE) {
-                    armPendingPinchReset(detector.focusX, detector.focusY)
-                    scheduleDeferredPinchReset()
+                if (pendingPinchDoubleTapReset || scale <= PINCH_DOUBLE_TAP_RESET_SCALE) {
+                    pendingPinchDoubleTapReset = true
+                    pinchResetTouchSequenceActive = true
+                    resetLikeDoubleTapAfterPinch()
                 } else {
                     resetPanFilters(detector.focusX, detector.focusY, SystemClock.uptimeMillis())
                     updateRenderSurfaceForCurrentState(force = true)
@@ -193,7 +200,7 @@ internal class VideoZoomGestures(
     fun isZoomed(): Boolean = scale > 1f + EPS
 
     fun shouldBlockOtherGestures(e: MotionEvent): Boolean {
-        return isZoomed() || pendingPinchReset || scaleDetector.isInProgress || e.pointerCount > 1
+        return isZoomed() || pinchResetTouchSequenceActive || scaleDetector.isInProgress || e.pointerCount > 1
     }
 
     fun reset() {
@@ -201,7 +208,6 @@ internal class VideoZoomGestures(
             choreographer.removeFrameCallback(frameCallback)
             applyScheduled = false
         }
-        cancelPendingPinchReset(removePostedCallback = true)
 
         scale = 1f
         tx = 0.0
@@ -210,6 +216,8 @@ internal class VideoZoomGestures(
         panActive = false
         canBeTap = false
         lastTapTime = 0L
+        pendingPinchDoubleTapReset = false
+        pinchResetTouchSequenceActive = false
         resetPanFilters(0f, 0f, SystemClock.uptimeMillis())
 
         // Critical for scan quality: after returning to normal size, do not keep
@@ -217,60 +225,31 @@ internal class VideoZoomGestures(
         // directly to the view-sized surface instead. The only exception is the
         // opposite-orientation case: there we keep a media-aspect surface so zoom
         // can start/stop without a surface-aspect switch or a one-frame tear.
-        updateRenderSurfaceForCurrentState(force = true, ignoreScaleDetectorInProgress = true)
+        updateRenderSurfaceForCurrentState(force = true)
         applyToView()
     }
 
-    private fun armPendingPinchReset(focusX: Float, focusY: Float) {
-        scale = 1f
-        tx = 0.0
-        ty = 0.0
-        pendingPinchReset = true
-        pinchResetDeferCount = 0
-        resetPanFilters(focusX, focusY, SystemClock.uptimeMillis())
+    private fun resetLikeDoubleTapAfterPinch() {
+        target.post {
+            if (scaleDetector.isInProgress) {
+                if (pendingPinchDoubleTapReset)
+                    resetLikeDoubleTapAfterPinch()
+                return@post
+            }
 
-        // While the detector is still active, do not let isInProgress force the
-        // original-detail surface. At 1x we want the same normal surface used by
-        // double-tap reset.
-        updateRenderSurfaceForCurrentState(force = false, ignoreScaleDetectorInProgress = true)
-        scheduleApply()
+            if (!pendingPinchDoubleTapReset && scale > PINCH_DOUBLE_TAP_RESET_SCALE)
+                return@post
+
+            // This is intentionally the same reset action used by double-tap,
+            // but deferred until the pinch detector has fully ended so surface
+            // selection follows the smooth double-tap path.
+            reset()
+        }
     }
 
-    private fun scheduleDeferredPinchReset() {
-        if (pinchResetPostPending)
-            return
-
-        pinchResetPostPending = true
-        target.postOnAnimation(deferredPinchResetRunnable)
-    }
-
-    private fun finishDeferredPinchReset() {
-        if (!pendingPinchReset)
-            return
-
-        if (scale > PINCH_RESET_SCALE) {
-            cancelPendingPinchReset()
-            updateRenderSurfaceForCurrentState(force = true)
-            scheduleApply()
-            return
-        }
-
-        if (scaleDetector.isInProgress && pinchResetDeferCount < MAX_PINCH_RESET_DEFER_FRAMES) {
-            pinchResetDeferCount++
-            scheduleDeferredPinchReset()
-            return
-        }
-
-        reset()
-    }
-
-    private fun cancelPendingPinchReset(removePostedCallback: Boolean = false) {
-        pendingPinchReset = false
-        pinchResetDeferCount = 0
-        if (removePostedCallback && pinchResetPostPending) {
-            target.removeCallbacks(deferredPinchResetRunnable)
-            pinchResetPostPending = false
-        }
+    private fun finishPinchResetTouchSequenceIfNeeded(e: MotionEvent) {
+        if (e.actionMasked == MotionEvent.ACTION_UP || e.actionMasked == MotionEvent.ACTION_CANCEL)
+            pinchResetTouchSequenceActive = false
     }
 
     /**
@@ -283,13 +262,6 @@ internal class VideoZoomGestures(
 
         // Always feed the scale detector first.
         scaleDetector.onTouchEvent(e)
-
-        if (pendingPinchReset &&
-            (e.actionMasked == MotionEvent.ACTION_UP || e.actionMasked == MotionEvent.ACTION_CANCEL)
-        ) {
-            scheduleDeferredPinchReset()
-            return true
-        }
 
         // Pointer transitions during pinch:
         // If one finger lifts and another remains down, rebase pan input so there is no jump.
@@ -324,8 +296,11 @@ internal class VideoZoomGestures(
             return true
         }
 
-        if (!isZoomed())
-            return pendingPinchReset
+        if (!isZoomed()) {
+            val consumeThisEvent = pinchResetTouchSequenceActive
+            finishPinchResetTouchSequenceIfNeeded(e)
+            return consumeThisEvent
+        }
 
         when (e.actionMasked) {
             MotionEvent.ACTION_DOWN -> {
@@ -407,6 +382,7 @@ internal class VideoZoomGestures(
                 panFingerDown = false
                 panActive = false
                 canBeTap = false
+                pinchResetTouchSequenceActive = false
                 resetPanFilters(lastPointerX, lastPointerY, SystemClock.uptimeMillis())
                 return true
             }
@@ -569,16 +545,10 @@ internal class VideoZoomGestures(
         )
     }
 
-    private fun updateRenderSurfaceForCurrentState(
-        force: Boolean,
-        ignoreScaleDetectorInProgress: Boolean = false,
-    ) {
-        val wantsOriginalDetail = isZoomed() || (
-            scaleDetector.isInProgress && !ignoreScaleDetectorInProgress && !pendingPinchReset
-        )
+    private fun updateRenderSurfaceForCurrentState(force: Boolean) {
         when {
             usesMediaAspectRenderSurface() -> requestMediaAspectRenderSurfaceSize(force)
-            wantsOriginalDetail -> requestViewAspectOriginalRenderSurfaceSize(force)
+            isZoomed() || scaleDetector.isInProgress -> requestViewAspectOriginalRenderSurfaceSize(force)
             else -> requestBaseRenderSurfaceSize(force)
         }
     }
@@ -785,8 +755,7 @@ internal class VideoZoomGestures(
         private const val EPS = 0.001f
         private const val MIN_SCALE = 1f
         private const val MAX_SCALE = 20f
-        private const val PINCH_RESET_SCALE = 1.001f
-        private const val MAX_PINCH_RESET_DEFER_FRAMES = 3
+        private const val PINCH_DOUBLE_TAP_RESET_SCALE = 1.001f
         private const val DOUBLE_TAP_TIMEOUT = 300L
         private const val MEDIA_ORIENTATION_THRESHOLD = 1.08
         private const val VIEW_ORIENTATION_THRESHOLD = 1.08f
