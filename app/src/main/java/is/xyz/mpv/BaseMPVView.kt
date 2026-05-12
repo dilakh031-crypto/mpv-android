@@ -208,30 +208,7 @@ abstract class BaseMPVView(context: Context, attrs: AttributeSet) : TextureView(
         return true
     }
 
-    private var pendingSurfaceFrames = 0
-    private var afterSurfaceFramesCallback: (() -> Unit)? = null
-
-    /**
-     * Run [callback] after this TextureView has received [count] freshly
-     * composed SurfaceTexture frames. This is used to hide short transition
-     * artifacts while the mpv surface size and TextureView matrix are changing.
-     */
-    fun afterNextSurfaceFrames(count: Int = 2, callback: () -> Unit) {
-        pendingSurfaceFrames = count.coerceAtLeast(1)
-        afterSurfaceFramesCallback = callback
-    }
-
-    override fun onSurfaceTextureUpdated(surface: SurfaceTexture) {
-        if (pendingSurfaceFrames <= 0)
-            return
-
-        pendingSurfaceFrames--
-        if (pendingSurfaceFrames == 0) {
-            val callback = afterSurfaceFramesCallback
-            afterSurfaceFramesCallback = null
-            post { callback?.invoke() }
-        }
-    }
+    override fun onSurfaceTextureUpdated(surface: SurfaceTexture) = Unit
 
     companion object {
         private const val TAG = "mpv"
