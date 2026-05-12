@@ -100,6 +100,29 @@ abstract class BaseMPVView(context: Context, attrs: AttributeSet) : TextureView(
     private var customRenderSurfaceSize = false
 
     /**
+     * Action to be executed once on the next SurfaceTexture update (i.e., when mpv delivers
+     * the first frame after a surface-size change).  Used to defer TextureView matrix changes
+     * so the old frame is never shown with a mismatched matrix, which avoids the brief visual
+     * "shrink / stretch" artefact that occurs during zoom start/end on playing video.
+     *
+     * Always accessed on the main thread — no synchronisation needed.
+     */
+    private var pendingTransformAction: (() -> Unit)? = null
+
+    /**
+     * Schedule [action] to run once, just before the next TextureView redraw that carries a
+     * freshly delivered mpv frame.  Any previously scheduled action is replaced.
+     */
+    fun scheduleTransformOnNextSurfaceUpdate(action: () -> Unit) {
+        pendingTransformAction = action
+    }
+
+    /** Cancel any transform action that was scheduled via [scheduleTransformOnNextSurfaceUpdate]. */
+    fun cancelPendingTransformSchedule() {
+        pendingTransformAction = null
+    }
+
+    /**
      * Set the real SurfaceTexture buffer size used by mpv without changing the
      * TextureView's on-screen size.
      *
@@ -179,6 +202,9 @@ abstract class BaseMPVView(context: Context, attrs: AttributeSet) : TextureView(
     private fun detachSurfaceTexture() {
         val surface = attachedSurface ?: return
 
+        // Discard any pending deferred matrix action — the surface is going away.
+        pendingTransformAction = null
+
         Log.w(TAG, "detaching texture surface")
         MPVLib.setPropertyString("vo", "null")
         MPVLib.setPropertyString("force-window", "no")
@@ -208,7 +234,17 @@ abstract class BaseMPVView(context: Context, attrs: AttributeSet) : TextureView(
         return true
     }
 
-    override fun onSurfaceTextureUpdated(surface: SurfaceTexture) = Unit
+    override fun onSurfaceTextureUpdated(surface: SurfaceTexture) {
+        // Fire any deferred matrix change exactly when mpv delivers its first frame at the new
+        // surface size.  Doing it here — rather than immediately after setRenderSurfaceSize() —
+        // prevents the old frame from being composited with the new matrix, which would produce
+        // the brief "shrink/stretch" flash visible on playing video during zoom start/end.
+        val action = pendingTransformAction
+        if (action != null) {
+            pendingTransformAction = null
+            action()
+        }
+    }
 
     companion object {
         private const val TAG = "mpv"
