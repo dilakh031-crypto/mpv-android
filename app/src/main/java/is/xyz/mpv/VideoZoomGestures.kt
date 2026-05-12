@@ -474,8 +474,11 @@ internal class VideoZoomGestures(
             return
 
         originalRenderSurfaceActive = false
-        player.setTransform(Matrix())
         player.resetRenderSurfaceSize()
+        target.postOnAnimation {
+            if (!originalRenderSurfaceActive)
+                player.setTransform(Matrix())
+        }
     }
 
     private fun requestOriginalRenderSurfaceSize(force: Boolean) {
@@ -509,9 +512,12 @@ internal class VideoZoomGestures(
         // area. TextureView's matrix adds the visual letterbox/pillarbox on
         // screen without spending buffer pixels on those black bars.
         val (bufferWidth, bufferHeight) = originalDetailBufferSize()
-        player.setTransform(Matrix())
         player.setRenderSurfaceSize(bufferWidth, bufferHeight)
         originalRenderSurfaceActive = true
+        target.postOnAnimation {
+            if (originalRenderSurfaceActive)
+                applyContentTextureTransform(player, c)
+        }
     }
 
 
