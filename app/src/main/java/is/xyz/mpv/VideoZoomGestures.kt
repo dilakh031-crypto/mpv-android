@@ -111,8 +111,8 @@ internal class VideoZoomGestures(
                 val requested = oldScale * detector.scaleFactor
 
                 // Pinch-zooming back down should behave like the double-tap reset as soon
-                // as the scale is within 0.2% of the normal full-image size. Because
-                // MIN_SCALE prevents going below 1.0, the practical threshold is 1.002.
+                // as the scale is within 1% of the normal full-image size. Because
+                // MIN_SCALE prevents going below 1.0, the practical threshold is 1.01.
                 // Require oldScale to be above the threshold so tiny pinch-out starts
                 // from the normal state are not cancelled immediately.
                 if (oldScale > RESET_SCALE_THRESHOLD && requested <= RESET_SCALE_THRESHOLD) {
@@ -709,7 +709,7 @@ internal class VideoZoomGestures(
         private const val EPS = 0.001f
         private const val MIN_SCALE = 1f
         private const val MAX_SCALE = 20f
-        private const val RESET_SCALE_THRESHOLD = 1.002f
+        private const val RESET_SCALE_THRESHOLD = 1.01f
         private const val DOUBLE_TAP_TIMEOUT = 300L
         private const val MEDIA_ORIENTATION_THRESHOLD = 1.08
         private const val VIEW_ORIENTATION_THRESHOLD = 1.08f
