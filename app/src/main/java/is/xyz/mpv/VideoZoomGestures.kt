@@ -1,8 +1,6 @@
 package `is`.xyz.mpv
 
-import android.graphics.Bitmap
 import android.graphics.Matrix
-import android.graphics.drawable.BitmapDrawable
 import android.os.SystemClock
 import android.view.Choreographer
 import android.view.MotionEvent
@@ -11,10 +9,11 @@ import android.view.View
 import android.view.ViewConfiguration
 import kotlin.math.PI
 import kotlin.math.abs
+import kotlin.math.ceil
+import kotlin.math.floor
 import kotlin.math.hypot
 import kotlin.math.max
 import kotlin.math.min
-import kotlin.math.ceil
 
 /**
  * Pinch-to-zoom + pan for mpv output.
@@ -23,9 +22,13 @@ import kotlin.math.ceil
  *  - Unzoomed view uses the normal view-sized mpv surface so mpv, not Android's
  *    TextureView compositor, performs the huge downscale. This avoids moire /
  *    false-color artifacts on high-frequency scans at 720p.
- *  - As soon as the user starts zooming, the render surface switches to the
- *    original-resolution/aspect-preserving buffer used by the previous fix, so
- *    zoom keeps full source detail and remains smooth.
+ *  - During zoom, the render surface grows with the actual zoom level, but
+ *    never ahead of it. This avoids the early-zoom case where Android would
+ *    minify an oversized source-resolution texture and reintroduce colored
+ *    moire/ghosting.
+ *  - The zoom render buffer is tied to the visible media/content area only.
+ *    Letterbox/pillarbox bars are produced by TextureView's matrix, not by
+ *    allocating extra black pixels inside the SurfaceTexture buffer.
  *
  * We do not use mpv video-pan/video-zoom for finger movement.
  */
@@ -74,11 +77,7 @@ internal class VideoZoomGestures(
     private val panFilterY = OneEuroFilter()
 
     private var originalRenderSurfaceActive = false
-
-    private var transitionCoverDrawable: BitmapDrawable? = null
-    private var transitionCoverBitmap: Bitmap? = null
-    private var transitionCoverHideRunnable: Runnable? = null
-    private var transitionCoverToken = 0
+    private var currentRenderSurfaceScale = 1f
 
     // Coalesce view property updates to vsync. We do not animate here; we only avoid
     // writing View properties multiple times in one display frame.
@@ -98,11 +97,9 @@ internal class VideoZoomGestures(
                 panActive = false
                 canBeTap = false
 
-                // Switch to the original-detail buffer before the first visible zoom step.
-                // This keeps early zoom stages sharp without forcing Android to downscale
-                // the original-size texture while the image is still unzoomed.
-                requestOriginalRenderSurfaceSize(force = true)
-
+                // Keep the base mpv-downscaled buffer until scale actually grows.
+                // Switching to an oversized source-resolution buffer at scale≈1
+                // makes Android minify it and brings back colored moire.
                 resetPanFilters(detector.focusX, detector.focusY, SystemClock.uptimeMillis())
                 return true
             }
@@ -477,14 +474,11 @@ internal class VideoZoomGestures(
 
     private fun requestBaseRenderSurfaceSize(force: Boolean) {
         val player = renderTarget ?: return
-        if (!force && !originalRenderSurfaceActive)
+        if (!force && !originalRenderSurfaceActive && currentRenderSurfaceScale == 1f)
             return
 
-        val switchingFromOriginal = originalRenderSurfaceActive
-        if (switchingFromOriginal)
-            coverRenderSurfaceTransition(player)
-
         originalRenderSurfaceActive = false
+        currentRenderSurfaceScale = 1f
         player.setTransform(Matrix())
         player.resetRenderSurfaceSize()
     }
@@ -492,9 +486,6 @@ internal class VideoZoomGestures(
     private fun requestOriginalRenderSurfaceSize(force: Boolean) {
         val player = renderTarget ?: return
         refreshMetricsFromTarget()
-
-        if (!force && originalRenderSurfaceActive)
-            return
 
         if (viewWidth <= 1f || viewHeight <= 1f || videoPixelWidth <= 1 || videoPixelHeight <= 1) {
             requestBaseRenderSurfaceSize(force = true)
@@ -507,83 +498,43 @@ internal class VideoZoomGestures(
             return
         }
 
-        val switchingToOriginal = !originalRenderSurfaceActive
-        if (switchingToOriginal)
-            coverRenderSurfaceTransition(player)
-
-        // Keep the render buffer tied to the media, not to the screen.
+        // At normal size and the first tiny zoom steps, keep the buffer close to
+        // the actual displayed scale so mpv performs the hard 5K -> 720p
+        // anti-aliased downscale. Never let the buffer become larger than the
+        // current zoom scale, because Android would minify the texture and the
+        // colored moire/ghosting returns.
         //
-        // The previous code scaled the whole view-sized surface until the video
-        // content area reached source resolution. On a portrait phone showing a
-        // wide image/video, that also scaled the top/bottom black bars, so a
-        // 6000x3375 image could request something like 6000x13333. That often
-        // exceeds SurfaceTexture/GPU limits, causing the actual rendered image to
-        // be silently reduced and look low-resolution at high zoom.
-        //
-        // Here the SurfaceTexture buffer contains only the aspect-correct media
-        // area. TextureView's matrix adds the visual letterbox/pillarbox on
-        // screen without spending buffer pixels on those black bars.
-        val (bufferWidth, bufferHeight) = originalDetailBufferSize()
-        applyContentTextureTransform(player, c)
-        player.setRenderSurfaceSize(bufferWidth, bufferHeight)
-        originalRenderSurfaceActive = true
-    }
+        // The important difference from the old code: desiredScale is applied to
+        // the media content rect only, not the whole view. Therefore portrait
+        // phone + 16:9 image grows toward 6000x3375, not toward 6000x13333.
+        val fullSize = originalDetailBufferSize()
+        val sourceScaleX = fullSize.first.toFloat() / c.w
+        val sourceScaleY = fullSize.second.toFloat() / c.h
+        val maxSourceScale = max(sourceScaleX, sourceScaleY).coerceAtLeast(1f)
 
-    private fun coverRenderSurfaceTransition(player: BaseMPVView) {
-        transitionCoverToken++
-        val token = transitionCoverToken
-        showTransitionCover(player)
-
-        player.afterNextSurfaceFrames(TRANSITION_COVER_SURFACE_FRAMES) {
-            if (token == transitionCoverToken)
-                hideTransitionCover()
-        }
-
-        transitionCoverHideRunnable?.let { target.removeCallbacks(it) }
-        val fallback = Runnable {
-            if (token == transitionCoverToken)
-                hideTransitionCover()
-        }
-        transitionCoverHideRunnable = fallback
-        target.postDelayed(fallback, TRANSITION_COVER_TIMEOUT_MS)
-    }
-
-    private fun showTransitionCover(player: BaseMPVView) {
-        removeTransitionCoverDrawable(recycleBitmap = true)
-
-        val w = target.width
-        val h = target.height
-        if (w <= 1 || h <= 1)
+        if (scale <= 1f + EPS || maxSourceScale <= 1f + EPS) {
+            requestBaseRenderSurfaceSize(force = true)
             return
+        }
 
-        val bitmap = try {
-            player.bitmap
-        } catch (_: IllegalStateException) {
-            null
-        } catch (_: RuntimeException) {
-            null
-        } ?: return
+        val desiredScale = floorToStep(scale.coerceAtMost(maxSourceScale), RENDER_BUFFER_SCALE_STEP)
+            .coerceIn(1f, maxSourceScale)
 
-        val drawable = BitmapDrawable(target.resources, bitmap)
-        drawable.setBounds(0, 0, w, h)
-        target.overlay.add(drawable)
-        transitionCoverDrawable = drawable
-        transitionCoverBitmap = bitmap
-    }
+        if (desiredScale <= 1f + EPS) {
+            requestBaseRenderSurfaceSize(force = true)
+            return
+        }
 
-    private fun hideTransitionCover() {
-        transitionCoverHideRunnable?.let { target.removeCallbacks(it) }
-        transitionCoverHideRunnable = null
-        removeTransitionCoverDrawable(recycleBitmap = true)
-    }
+        if (!force && originalRenderSurfaceActive && abs(currentRenderSurfaceScale - desiredScale) < 0.001f) {
+            applyContentTextureTransform(player, c)
+            return
+        }
 
-    private fun removeTransitionCoverDrawable(recycleBitmap: Boolean) {
-        transitionCoverDrawable?.let { target.overlay.remove(it) }
-        transitionCoverDrawable = null
-
-        if (recycleBitmap)
-            transitionCoverBitmap?.recycle()
-        transitionCoverBitmap = null
+        val (bufferWidth, bufferHeight) = detailBufferSizeForScale(c, desiredScale, fullSize)
+        player.setRenderSurfaceSize(bufferWidth, bufferHeight)
+        applyContentTextureTransform(player, c)
+        originalRenderSurfaceActive = true
+        currentRenderSurfaceScale = desiredScale
     }
 
     private fun originalDetailBufferSize(): Pair<Int, Int> {
@@ -596,10 +547,10 @@ internal class VideoZoomGestures(
         }).coerceAtLeast(0.001)
         val sourceAspect = sourceW.toDouble() / sourceH.toDouble()
 
-        // Most media has square pixels, so this returns the raw source size.
-        // If the display aspect differs from the stored pixel aspect, expand the
-        // smaller display dimension so mpv still gets an aspect-correct viewport
-        // without adding screen letterbox bars to the buffer.
+        // Most images/videos have square pixels, so this returns the raw source
+        // size. If stored-pixel aspect and display aspect differ, expand the
+        // smaller display dimension so mpv gets an aspect-correct viewport
+        // without adding screen letterbox/pillarbox bars to the buffer.
         return if (abs(displayAspect - sourceAspect) <= ASPECT_EPS) {
             sourceW to sourceH
         } else if (displayAspect > sourceAspect) {
@@ -607,6 +558,16 @@ internal class VideoZoomGestures(
         } else {
             sourceW to ceil(sourceW / displayAspect).toInt().coerceAtLeast(1)
         }
+    }
+
+    private fun detailBufferSizeForScale(
+        c: ContentRect,
+        desiredScale: Float,
+        fullSize: Pair<Int, Int>,
+    ): Pair<Int, Int> {
+        val width = ceil(c.w * desiredScale).toInt().coerceIn(1, fullSize.first)
+        val height = ceil(c.h * desiredScale).toInt().coerceIn(1, fullSize.second)
+        return width to height
     }
 
     private fun applyContentTextureTransform(player: BaseMPVView, c: ContentRect) {
@@ -619,6 +580,10 @@ internal class VideoZoomGestures(
         matrix.setScale(c.w / viewWidth, c.h / viewHeight)
         matrix.postTranslate(c.ox, c.oy)
         player.setTransform(matrix)
+    }
+
+    private fun floorToStep(value: Float, step: Float): Float {
+        return (floor((value / step).toDouble()) * step).toFloat()
     }
 
     private fun filterParamsForCurrentScale(): FilterParams {
@@ -717,6 +682,7 @@ internal class VideoZoomGestures(
         private const val MIN_SCALE = 1f
         private const val MAX_SCALE = 20f
         private const val DOUBLE_TAP_TIMEOUT = 300L
+        private const val RENDER_BUFFER_SCALE_STEP = 0.25f
 
         private const val DEFAULT_FRAME_DT = 1f / 60f
         private const val MIN_FILTER_DT = 1f / 240f
@@ -730,8 +696,5 @@ internal class VideoZoomGestures(
         private const val FILTER_BETA_AT_START = 0.020f
         private const val FILTER_BETA_AT_MAX = 0.050f
         private const val FILTER_D_CUTOFF = 1.0f
-
-        private const val TRANSITION_COVER_SURFACE_FRAMES = 2
-        private const val TRANSITION_COVER_TIMEOUT_MS = 180L
     }
 }
