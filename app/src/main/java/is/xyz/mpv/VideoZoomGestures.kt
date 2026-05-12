@@ -73,6 +73,12 @@ internal class VideoZoomGestures(
 
     private var originalRenderSurfaceActive = false
 
+    // Once pinch-out reaches the 0.2% reset margin, keep the pinch locked at
+    // the full-image state until ScaleGestureDetector finishes. This prevents
+    // following MOVE events from re-applying a tiny zoom before the fingers are
+    // lifted, then the final reset() uses the same path as double-tap.
+    private var pinchResetLocked = false
+
     // Coalesce view property updates to vsync. We do not animate here; we only avoid
     // writing View properties multiple times in one display frame.
     private val choreographer: Choreographer = Choreographer.getInstance()
@@ -90,6 +96,7 @@ internal class VideoZoomGestures(
                 lastTapTime = 0L
                 panActive = false
                 canBeTap = false
+                pinchResetLocked = false
 
                 // Switch to the original-detail buffer before the first visible zoom step.
                 // This keeps early zoom stages sharp without forcing Android to downscale
@@ -105,9 +112,22 @@ internal class VideoZoomGestures(
                 if (viewWidth <= 1f || viewHeight <= 1f)
                     return true
 
+                if (pinchResetLocked)
+                    return true
+
                 val oldScale = scale
-                val requested = oldScale * detector.scaleFactor
+                val scaleFactor = detector.scaleFactor
+                val requested = oldScale * scaleFactor
                 val newScale = requested.coerceIn(MIN_SCALE, MAX_SCALE)
+
+                // Pinch-zooming back down should behave like the double-tap reset as soon
+                // as the scale is within 0.2% of normal full-image size. MIN_SCALE is 1.0,
+                // so the practical margin is 1.002: anything at or below that snaps back.
+                if (scaleFactor < 1f && oldScale > MIN_SCALE + EPS && newScale <= PINCH_RESET_SCALE) {
+                    lockPinchAtFullImage(detector)
+                    return true
+                }
+
                 if (newScale == oldScale)
                     return true
 
@@ -128,9 +148,10 @@ internal class VideoZoomGestures(
             }
 
             override fun onScaleEnd(detector: ScaleGestureDetector) {
-                if (scale <= 1f + EPS)
+                if (pinchResetLocked || scale <= PINCH_RESET_SCALE) {
+                    pinchResetLocked = false
                     reset()
-                else {
+                } else {
                     resetPanFilters(detector.focusX, detector.focusY, SystemClock.uptimeMillis())
                     requestOriginalRenderSurfaceSize(force = true)
                 }
@@ -172,7 +193,7 @@ internal class VideoZoomGestures(
     fun isZoomed(): Boolean = scale > 1f + EPS
 
     fun shouldBlockOtherGestures(e: MotionEvent): Boolean {
-        return isZoomed() || scaleDetector.isInProgress || e.pointerCount > 1
+        return isZoomed() || pinchResetLocked || scaleDetector.isInProgress || e.pointerCount > 1
     }
 
     fun reset() {
@@ -188,6 +209,7 @@ internal class VideoZoomGestures(
         panActive = false
         canBeTap = false
         lastTapTime = 0L
+        pinchResetLocked = false
         resetPanFilters(0f, 0f, SystemClock.uptimeMillis())
         applyToView()
 
@@ -324,6 +346,7 @@ internal class VideoZoomGestures(
                 panFingerDown = false
                 panActive = false
                 canBeTap = false
+                pinchResetLocked = false
                 resetPanFilters(lastPointerX, lastPointerY, SystemClock.uptimeMillis())
                 return true
             }
@@ -468,14 +491,31 @@ internal class VideoZoomGestures(
         target.translationY = ty.toFloat()
     }
 
+    private fun lockPinchAtFullImage(detector: ScaleGestureDetector) {
+        pinchResetLocked = true
+        scale = 1f
+        tx = 0.0
+        ty = 0.0
+        panFingerDown = false
+        panActive = false
+        canBeTap = false
+        lastTapTime = 0L
+        resetPanFilters(detector.focusX, detector.focusY, SystemClock.uptimeMillis())
+        applyToView()
+        requestBaseRenderSurfaceSize(force = true)
+    }
+
     private fun requestBaseRenderSurfaceSize(force: Boolean) {
         val player = renderTarget ?: return
         if (!force && !originalRenderSurfaceActive)
             return
 
         originalRenderSurfaceActive = false
-        player.setTransform(Matrix())
         player.resetRenderSurfaceSize()
+        target.postOnAnimation {
+            if (!originalRenderSurfaceActive)
+                player.setTransform(Matrix())
+        }
     }
 
     private fun requestOriginalRenderSurfaceSize(force: Boolean) {
@@ -509,9 +549,12 @@ internal class VideoZoomGestures(
         // area. TextureView's matrix adds the visual letterbox/pillarbox on
         // screen without spending buffer pixels on those black bars.
         val (bufferWidth, bufferHeight) = originalDetailBufferSize()
-        player.setTransform(Matrix())
         player.setRenderSurfaceSize(bufferWidth, bufferHeight)
         originalRenderSurfaceActive = true
+        target.postOnAnimation {
+            if (originalRenderSurfaceActive)
+                applyContentTextureTransform(player, c)
+        }
     }
 
 
@@ -645,6 +688,7 @@ internal class VideoZoomGestures(
         private const val ASPECT_EPS = 0.001
         private const val MIN_SCALE = 1f
         private const val MAX_SCALE = 20f
+        private const val PINCH_RESET_SCALE = 1.002f
         private const val DOUBLE_TAP_TIMEOUT = 300L
 
         private const val DEFAULT_FRAME_DT = 1f / 60f
