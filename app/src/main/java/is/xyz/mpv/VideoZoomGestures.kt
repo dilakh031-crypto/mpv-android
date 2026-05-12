@@ -119,13 +119,10 @@ internal class VideoZoomGestures(
                 val newScale = requested.coerceIn(MIN_SCALE, MAX_SCALE)
 
                 if (newScale <= PINCH_DOUBLE_TAP_RESET_SCALE) {
-                    // Only request a reset animation if we were genuinely zoomed.
-                    // A spurious scale event at scale=1 must not set this flag.
-                    if (oldScale > PINCH_DOUBLE_TAP_RESET_SCALE)
-                        pendingPinchDoubleTapReset = true
                     scale = 1f
                     tx = 0.0
                     ty = 0.0
+                    pendingPinchDoubleTapReset = true
                     resetPanFilters(detector.focusX, detector.focusY, SystemClock.uptimeMillis())
                     scheduleApply()
                     return true
@@ -152,11 +149,8 @@ internal class VideoZoomGestures(
             }
 
             override fun onScaleEnd(detector: ScaleGestureDetector) {
-                // Do not re-derive pendingPinchDoubleTapReset from the scale value here.
-                // onScale already sets it correctly (only when the user was zoomed).
-                // Setting it again based on scale<=threshold would wrongly fire on any
-                // accidental gesture that never changed scale from 1.
-                if (pendingPinchDoubleTapReset) {
+                if (pendingPinchDoubleTapReset || scale <= PINCH_DOUBLE_TAP_RESET_SCALE) {
+                    pendingPinchDoubleTapReset = true
                     resetLikeDoubleTapAfterPinch()
                 } else {
                     resetPanFilters(detector.focusX, detector.focusY, SystemClock.uptimeMillis())
@@ -164,7 +158,9 @@ internal class VideoZoomGestures(
                 }
             }
         }
-    )
+    ).apply {
+        isQuickScaleEnabled = false
+    }
 
     fun setMetrics(width: Float, height: Float) {
         viewWidth = width
@@ -217,6 +213,10 @@ internal class VideoZoomGestures(
         pendingPinchDoubleTapReset = false
         resetPanFilters(0f, 0f, SystemClock.uptimeMillis())
 
+        val cancelEvent = MotionEvent.obtain(0L, 0L, MotionEvent.ACTION_CANCEL, 0f, 0f, 0)
+        scaleDetector.onTouchEvent(cancelEvent)
+        cancelEvent.recycle()
+
         // Critical for scan quality: after returning to normal size, do not keep
         // the original-resolution texture and let Android minify it. Let mpv draw
         // directly to the view-sized surface instead. The only exception is the
@@ -226,17 +226,10 @@ internal class VideoZoomGestures(
         applyToView()
     }
 
-    private fun resetLikeDoubleTapAfterPinch(attempt: Int = 0) {
+    private fun resetLikeDoubleTapAfterPinch() {
         target.post {
             if (scaleDetector.isInProgress) {
-                // Cap retries: if the scale detector is stuck in-progress (can happen
-                // with quick-scale on some devices), force a reset anyway so
-                // pendingPinchDoubleTapReset is never left true indefinitely.
-                if (attempt < 10) {
-                    resetLikeDoubleTapAfterPinch(attempt + 1)
-                } else {
-                    reset()
-                }
+                resetLikeDoubleTapAfterPinch()
                 return@post
             }
 
@@ -285,8 +278,8 @@ internal class VideoZoomGestures(
             return true
         }
 
-        // Multi-touch is always handled by ScaleGestureDetector.
-        if (e.pointerCount > 1) {
+        // Multi-touch, or an active pinch, is handled only by ScaleGestureDetector.
+        if (e.pointerCount > 1 || scaleDetector.isInProgress) {
             lastTapTime = 0L
             panFingerDown = false
             panActive = false
@@ -294,23 +287,8 @@ internal class VideoZoomGestures(
             return true
         }
 
-        // When not zoomed, always let the Activity see single-finger events so it
-        // can toggle controls. Checking scaleDetector.isInProgress here is wrong:
-        // Android's built-in quick-scale feature can set isInProgress=true on a
-        // single-finger touch even at scale=1, which would permanently consume all
-        // taps and hide the controls until the video is closed and reopened.
         if (!isZoomed())
             return pendingPinchDoubleTapReset
-
-        // We are zoomed. While a pinch gesture is still active, block pan/tap
-        // handling — the scale detector owns the pointer until it finishes.
-        if (scaleDetector.isInProgress) {
-            lastTapTime = 0L
-            panFingerDown = false
-            panActive = false
-            canBeTap = false
-            return true
-        }
 
         when (e.actionMasked) {
             MotionEvent.ACTION_DOWN -> {
