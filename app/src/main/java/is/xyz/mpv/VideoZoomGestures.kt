@@ -158,9 +158,7 @@ internal class VideoZoomGestures(
                 }
             }
         }
-    ).apply {
-        isQuickScaleEnabled = false
-    }
+    )
 
     fun setMetrics(width: Float, height: Float) {
         viewWidth = width
@@ -212,10 +210,6 @@ internal class VideoZoomGestures(
         lastTapTime = 0L
         pendingPinchDoubleTapReset = false
         resetPanFilters(0f, 0f, SystemClock.uptimeMillis())
-
-        val cancelEvent = MotionEvent.obtain(0L, 0L, MotionEvent.ACTION_CANCEL, 0f, 0f, 0)
-        scaleDetector.onTouchEvent(cancelEvent)
-        cancelEvent.recycle()
 
         // Critical for scan quality: after returning to normal size, do not keep
         // the original-resolution texture and let Android minify it. Let mpv draw

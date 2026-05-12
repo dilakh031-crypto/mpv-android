@@ -183,6 +183,8 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
             }
 
             val posText = Utils.prettyTime(targetSec.toInt())
+            if (binding.gestureTextView.visibility != View.VISIBLE)
+                refreshPlayerOverlay()
             fadeHandler.removeCallbacks(fadeRunnable3)
             binding.gestureTextView.visibility = View.VISIBLE
             binding.gestureTextView.text = posText
@@ -193,6 +195,7 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
         }
 
         override fun onStartTrackingTouch(seekBar: SeekBar) {
+            refreshPlayerOverlay()
             userIsOperatingSeekbar = true
             seekbarScrubActive = true
             pendingSeekbarSeekPos = null
@@ -489,6 +492,7 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
 
         setContentView(binding.root)
         uiInitialized = true
+        refreshPlayerOverlay()
 
         // Init controls to be hidden and view fullscreen
         hideControls()
@@ -596,6 +600,7 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
         // Insert above the player view but below gesture/controls layers.
         // Layout order in player.xml: player(0), gestureLayer(1), outside(2).
         (binding.root as? ViewGroup)?.addView(overlay, 1)
+        refreshPlayerOverlay()
 
         startupPreviewOverlay = overlay
 
@@ -644,6 +649,7 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
         val overlay = startupPreviewOverlay ?: return
         (overlay.parent as? ViewGroup)?.removeView(overlay)
         startupPreviewOverlay = null
+        refreshPlayerOverlay()
 
         startupPreviewBitmap?.let {
             try { it.recycle() } catch (_: Throwable) {}
@@ -906,6 +912,7 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
         // If we weren't actually in the background (e.g. multi window mode), don't reinitialize stuff
         if (activityIsForeground) {
             super.onResume()
+            refreshPlayerOverlay()
             return
         }
 
@@ -924,8 +931,15 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
         stopServiceHandler.postDelayed(stopServiceRunnable, 1000L)
 
         refreshUi()
+        refreshPlayerOverlay()
 
         super.onResume()
+    }
+
+    override fun onWindowFocusChanged(hasFocus: Boolean) {
+        super.onWindowFocusChanged(hasFocus)
+        if (hasFocus)
+            refreshPlayerOverlay()
     }
 
     private fun savePosition() {
@@ -1072,6 +1086,38 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
         binding.statsTextView.text = getString(R.string.ui_fps, player.estimatedVfFps)
     }
 
+    /**
+     * Keeps the Android UI overlay above the video layer and forces a redraw.
+     *
+     * On some devices the TextureView can momentarily win composition/z-order during player
+     * startup. Touch still reaches gestureLayer, so seeking works, but controls/gestureTextView
+     * do not become visible until the window is redrawn by something external (for example
+     * pulling the notification shade). Poking the overlay here makes that redraw deterministic.
+     */
+    private fun refreshPlayerOverlay() {
+        if (!::binding.isInitialized)
+            return
+
+        // Keep the touch layer above the video and the actual UI above the touch layer.
+        ViewCompat.setElevation(binding.gestureLayer, 1f)
+        ViewCompat.setElevation(binding.outside, 2f)
+        binding.gestureLayer.bringToFront()
+        binding.outside.bringToFront()
+
+        binding.outside.invalidate()
+        binding.root.invalidate()
+
+        binding.root.post {
+            if (!::binding.isInitialized)
+                return@post
+            binding.gestureLayer.bringToFront()
+            binding.outside.bringToFront()
+            binding.outside.requestLayout()
+            binding.outside.invalidate()
+            binding.root.invalidate()
+        }
+    }
+
     private fun controlsShouldBeVisible(): Boolean {
         if (lockedUI)
             return false
@@ -1084,6 +1130,8 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
             Log.w(TAG, "cannot show UI in locked mode")
             return
         }
+
+        refreshPlayerOverlay()
 
         // Cancel any pending fade-out.
         fadeHandler.removeCallbacks(fadeRunnable)
@@ -3301,6 +3349,7 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
     private var gestureSeekDeltaOffsetSec = 0
 
     private fun fadeGestureText() {
+        refreshPlayerOverlay()
         fadeHandler.removeCallbacks(fadeRunnable3)
         binding.gestureTextView.visibility = View.VISIBLE
 
@@ -3314,6 +3363,7 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
             PropertyChange.Init -> {
                 mightWantToToggleControls = false
                 cancelPendingTapToggle()
+                refreshPlayerOverlay()
 
                 initialSeek = (psc.position / 1000f)
                 initialBright = Utils.getScreenBrightness(this) ?: 0.5f
