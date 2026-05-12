@@ -21,9 +21,12 @@ import kotlin.math.ceil
  *  - Unzoomed view uses the normal view-sized mpv surface so mpv, not Android's
  *    TextureView compositor, performs the huge downscale. This avoids moire /
  *    false-color artifacts on high-frequency scans at 720p.
- *  - As soon as the user starts zooming, the render surface switches to the
- *    original-resolution/aspect-preserving buffer used by the previous fix, so
- *    zoom keeps full source detail and remains smooth.
+ *  - As soon as the user starts zooming, the render surface switches to a
+ *    higher-detail buffer that keeps the same aspect as the TextureView. Keeping
+ *    the TextureView matrix unchanged is important: changing both the buffer
+ *    geometry and the matrix while video frames are arriving can briefly show an
+ *    old frame through the new matrix (or the opposite), which looks like a
+ *    one-frame shrink/grow tear at the zoom boundary.
  *
  * We do not use mpv video-pan/video-zoom for finger movement.
  */
@@ -474,20 +477,8 @@ internal class VideoZoomGestures(
             return
 
         originalRenderSurfaceActive = false
-        // Cancel any previously deferred transform (e.g. a pending content-matrix application
-        // that was never fired because the user cancelled the zoom gesture).
-        player.cancelPendingTransformSchedule()
-
-        // Tell mpv to render at view size immediately so the new frames start arriving at the
-        // right resolution.
+        player.setTransform(Matrix())
         player.resetRenderSurfaceSize()
-
-        // Defer the matrix reset until mpv delivers the first view-sized frame via
-        // onSurfaceTextureUpdated.  Until then the old video-sized frame is still in the
-        // SurfaceTexture and looks correct with the existing content-mapping matrix, so there is
-        // no visible artefact.  Resetting the matrix immediately (old behaviour) would show the
-        // video-sized frame through an identity matrix — making it appear briefly stretched.
-        player.scheduleTransformOnNextSurfaceUpdate { player.setTransform(Matrix()) }
     }
 
     private fun requestOriginalRenderSurfaceSize(force: Boolean) {
@@ -508,43 +499,24 @@ internal class VideoZoomGestures(
             return
         }
 
-        // Keep the render buffer tied to the media, not to the screen.
+        // Keep TextureView's transform matrix stable while switching render
+        // detail. A playing video can deliver a frame between setDefaultBufferSize()
+        // and setTransform(); if the matrix also changes, that single frame is
+        // displayed with mismatched geometry and appears as a quick shrink/grow
+        // tear when entering or leaving zoom.
         //
-        // The previous code scaled the whole view-sized surface until the video
-        // content area reached source resolution. On a portrait phone showing a
-        // wide image/video, that also scaled the top/bottom black bars, so a
-        // 6000x3375 image could request something like 6000x13333. That often
-        // exceeds SurfaceTexture/GPU limits, causing the actual rendered image to
-        // be silently reduced and look low-resolution at high zoom.
-        //
-        // Here the SurfaceTexture buffer contains only the aspect-correct media
-        // area. TextureView's matrix adds the visual letterbox/pillarbox on
-        // screen without spending buffer pixels on those black bars.
-        val (bufferWidth, bufferHeight) = originalDetailBufferSize()
+        // Instead, request a higher-detail buffer with the same aspect as the
+        // on-screen view and let mpv draw its normal letterbox/pillarbox inside
+        // that buffer. Both the old and new buffers then use the identity matrix,
+        // so in-flight frames keep the same visual geometry.
+        val (bufferWidth, bufferHeight) = originalDetailBufferSize(c)
+        player.setTransform(Matrix())
         player.setRenderSurfaceSize(bufferWidth, bufferHeight)
-
-        // Cancel any previously deferred transform (e.g. a pending identity-reset that hasn't
-        // fired yet) and schedule the content-mapping matrix to be applied once mpv delivers
-        // the first frame at the new buffer size via onSurfaceTextureUpdated.
-        //
-        // Applying the matrix immediately (old behaviour) would show the old view-sized frame
-        // (which includes letterbox bars) through the content-mapping matrix, making the video
-        // appear briefly shrunken.  Deferring keeps the current identity matrix active until the
-        // video-sized frame arrives, so the old frame continues to look correct in the interim.
-        player.cancelPendingTransformSchedule()
-        player.scheduleTransformOnNextSurfaceUpdate {
-            // Re-evaluate the content rect at the time of application: the view or video may
-            // have been resized while we were waiting for the frame.
-            refreshMetricsFromTarget()
-            val latestC = contentRect()
-            if (latestC.w > 1f && latestC.h > 1f)
-                applyContentTextureTransform(player, latestC)
-        }
         originalRenderSurfaceActive = true
     }
 
 
-    private fun originalDetailBufferSize(): Pair<Int, Int> {
+    private fun originalDetailBufferSize(c: ContentRect): Pair<Int, Int> {
         val sourceW = videoPixelWidth.coerceAtLeast(1)
         val sourceH = videoPixelHeight.coerceAtLeast(1)
         val displayAspect = (if (videoAspect > 0.001) {
@@ -554,29 +526,41 @@ internal class VideoZoomGestures(
         }).coerceAtLeast(0.001)
         val sourceAspect = sourceW.toDouble() / sourceH.toDouble()
 
-        // Most media has square pixels, so this returns the raw source size.
-        // If the display aspect differs from the stored pixel aspect, expand the
-        // smaller display dimension so mpv still gets an aspect-correct viewport
-        // without adding screen letterbox bars to the buffer.
-        return if (abs(displayAspect - sourceAspect) <= ASPECT_EPS) {
-            sourceW to sourceH
+        val mediaW: Int
+        val mediaH: Int
+        if (abs(displayAspect - sourceAspect) <= ASPECT_EPS) {
+            mediaW = sourceW
+            mediaH = sourceH
         } else if (displayAspect > sourceAspect) {
-            ceil(sourceH * displayAspect).toInt().coerceAtLeast(1) to sourceH
+            mediaW = ceil(sourceH * displayAspect).toInt().coerceAtLeast(1)
+            mediaH = sourceH
         } else {
-            sourceW to ceil(sourceW / displayAspect).toInt().coerceAtLeast(1)
-        }
-    }
-
-    private fun applyContentTextureTransform(player: BaseMPVView, c: ContentRect) {
-        if (viewWidth <= 1f || viewHeight <= 1f || c.w <= 1f || c.h <= 1f) {
-            player.setTransform(Matrix())
-            return
+            mediaW = sourceW
+            mediaH = ceil(sourceW / displayAspect).toInt().coerceAtLeast(1)
         }
 
-        val matrix = Matrix()
-        matrix.setScale(c.w / viewWidth, c.h / viewHeight)
-        matrix.postTranslate(c.ox, c.oy)
-        player.setTransform(matrix)
+        val viewW = viewWidth.coerceAtLeast(1f)
+        val viewH = viewHeight.coerceAtLeast(1f)
+        val contentW = c.w.coerceAtLeast(1f)
+        val contentH = c.h.coerceAtLeast(1f)
+
+        val detailScale = max(
+            1f,
+            max(
+                mediaW.toFloat() / contentW,
+                mediaH.toFloat() / contentH,
+            ),
+        )
+
+        // Preserve the TextureView/view aspect to avoid any matrix change at the
+        // zoom boundary. Cap the largest side so portrait screens showing very
+        // wide media do not request enormous buffers just to represent black bars.
+        val maxScaleByDimension = MAX_RENDER_SURFACE_DIMENSION / max(viewW, viewH)
+        val bufferScale = min(detailScale, max(1f, maxScaleByDimension))
+
+        val bufferW = ceil(viewW * bufferScale).toInt().coerceAtLeast(1)
+        val bufferH = ceil(viewH * bufferScale).toInt().coerceAtLeast(1)
+        return bufferW to bufferH
     }
 
     private fun filterParamsForCurrentScale(): FilterParams {
@@ -674,6 +658,7 @@ internal class VideoZoomGestures(
         private const val ASPECT_EPS = 0.001
         private const val MIN_SCALE = 1f
         private const val MAX_SCALE = 20f
+        private const val MAX_RENDER_SURFACE_DIMENSION = 4096f
         private const val DOUBLE_TAP_TIMEOUT = 300L
 
         private const val DEFAULT_FRAME_DT = 1f / 60f
