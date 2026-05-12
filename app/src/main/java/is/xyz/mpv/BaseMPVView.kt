@@ -208,23 +208,29 @@ abstract class BaseMPVView(context: Context, attrs: AttributeSet) : TextureView(
         return true
     }
 
-    private var nextSurfaceTextureUpdateAction: (() -> Unit)? = null
+    private var pendingSurfaceFrames = 0
+    private var afterSurfaceFramesCallback: (() -> Unit)? = null
 
     /**
-     * Runs [action] on the UI thread when TextureView receives the next frame.
-     *
-     * VideoZoomGestures uses this to hide the one unavoidable SurfaceTexture
-     * buffer-aspect handoff in opposite-orientation zoom: the view is restored
-     * only after mpv has produced a frame for the new buffer size.
+     * Run [callback] after this TextureView has received [count] freshly
+     * composed SurfaceTexture frames. This is used to hide short transition
+     * artifacts while the mpv surface size and TextureView matrix are changing.
      */
-    fun runOnNextSurfaceTextureUpdate(action: () -> Unit) {
-        nextSurfaceTextureUpdateAction = action
+    fun afterNextSurfaceFrames(count: Int = 2, callback: () -> Unit) {
+        pendingSurfaceFrames = count.coerceAtLeast(1)
+        afterSurfaceFramesCallback = callback
     }
 
     override fun onSurfaceTextureUpdated(surface: SurfaceTexture) {
-        val action = nextSurfaceTextureUpdateAction ?: return
-        nextSurfaceTextureUpdateAction = null
-        post(action)
+        if (pendingSurfaceFrames <= 0)
+            return
+
+        pendingSurfaceFrames--
+        if (pendingSurfaceFrames == 0) {
+            val callback = afterSurfaceFramesCallback
+            afterSurfaceFramesCallback = null
+            post { callback?.invoke() }
+        }
     }
 
     companion object {
