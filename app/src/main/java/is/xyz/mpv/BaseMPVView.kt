@@ -1,7 +1,6 @@
 package `is`.xyz.mpv
 
 import android.content.Context
-import android.graphics.Color
 import android.graphics.SurfaceTexture
 import android.util.AttributeSet
 import android.util.Log
@@ -16,13 +15,7 @@ abstract class BaseMPVView(context: Context, attrs: AttributeSet) : TextureView(
         // scale/translation much smoother than transforming a SurfaceView layer,
         // especially on older Android devices where SurfaceView composition is
         // quantized by SurfaceFlinger/HWC.
-        //
-        // VideoZoomGestures may shrink the texture with TextureView.setTransform()
-        // so letterbox/pillarbox bars are produced visually instead of being
-        // allocated inside the high-resolution render buffer. Keep the view itself
-        // black so those exposed areas are stable on every device/theme.
         isOpaque = true
-        setBackgroundColor(Color.BLACK)
     }
 
     /**
@@ -153,17 +146,7 @@ abstract class BaseMPVView(context: Context, attrs: AttributeSet) : TextureView(
         if (renderSurfaceWidth <= 0 || renderSurfaceHeight <= 0)
             return
 
-        try {
-            texture.setDefaultBufferSize(renderSurfaceWidth, renderSurfaceHeight)
-        } catch (e: RuntimeException) {
-            Log.e(TAG, "failed to set mpv texture buffer ${renderSurfaceWidth}x${renderSurfaceHeight}; falling back to view size", e)
-
-            customRenderSurfaceSize = false
-            renderSurfaceWidth = width.coerceAtLeast(1)
-            renderSurfaceHeight = height.coerceAtLeast(1)
-            texture.setDefaultBufferSize(renderSurfaceWidth, renderSurfaceHeight)
-        }
-
+        texture.setDefaultBufferSize(renderSurfaceWidth, renderSurfaceHeight)
         MPVLib.setPropertyString("android-surface-size", "${renderSurfaceWidth}x${renderSurfaceHeight}")
     }
 
@@ -225,7 +208,24 @@ abstract class BaseMPVView(context: Context, attrs: AttributeSet) : TextureView(
         return true
     }
 
-    override fun onSurfaceTextureUpdated(surface: SurfaceTexture) = Unit
+    private var nextSurfaceTextureUpdateAction: (() -> Unit)? = null
+
+    /**
+     * Runs [action] on the UI thread when TextureView receives the next frame.
+     *
+     * VideoZoomGestures uses this to hide the one unavoidable SurfaceTexture
+     * buffer-aspect handoff in opposite-orientation zoom: the view is restored
+     * only after mpv has produced a frame for the new buffer size.
+     */
+    fun runOnNextSurfaceTextureUpdate(action: () -> Unit) {
+        nextSurfaceTextureUpdateAction = action
+    }
+
+    override fun onSurfaceTextureUpdated(surface: SurfaceTexture) {
+        val action = nextSurfaceTextureUpdateAction ?: return
+        nextSurfaceTextureUpdateAction = null
+        post(action)
+    }
 
     companion object {
         private const val TAG = "mpv"
