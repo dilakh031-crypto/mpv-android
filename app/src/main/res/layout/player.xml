@@ -23,13 +23,15 @@
         android:id="@+id/gestureLayer"
         android:layout_width="match_parent"
         android:layout_height="match_parent"
-        android:background="@android:color/transparent" />
+        android:background="@android:color/transparent"
+        android:elevation="1dp" />
 
     <!-- so that insets can be applied as margins -->
     <RelativeLayout
         android:id="@+id/outside"
         android:layout_width="match_parent"
-        android:layout_height="match_parent">
+        android:layout_height="match_parent"
+        android:elevation="2dp">
 
         <LinearLayout
             android:id="@+id/controls"
