@@ -22,10 +22,10 @@ import kotlin.math.roundToInt
  *    false-color artifacts on high-frequency scans at 720p.
  *  - As soon as the user starts zooming, the render surface switches to an
  *    original-detail buffer so zoom keeps full source detail.
- *  - If the phone orientation is opposite to the media orientation during zoom,
- *    we use a media-aspect render surface and compensate with the normal View
- *    transform. At normal scale we intentionally stay on the plain view-sized
- *    surface so Android overlay controls keep a stable z-order while a file opens.
+ *  - If the phone orientation is opposite to the media orientation, we keep a
+ *    media-aspect render surface and compensate with the normal View transform.
+ *    This avoids the oversized black-bar buffer that loses zoom quality without
+ *    using TextureView#setTransform, so playback does not tear at zoom/reset.
  *
  * We do not use mpv video-pan/video-zoom for finger movement.
  */
@@ -119,10 +119,16 @@ internal class VideoZoomGestures(
                 val newScale = requested.coerceIn(MIN_SCALE, MAX_SCALE)
 
                 if (newScale <= PINCH_DOUBLE_TAP_RESET_SCALE) {
+                    // Only flag a double-tap reset if the user was actually zoomed in
+                    // before this scale event. A spurious scale gesture at scale=1
+                    // (e.g. quick-scale misfire on first touch) must not set this flag,
+                    // because that leaves pendingPinchDoubleTapReset=true permanently
+                    // and every subsequent tap gets consumed, hiding the controls.
+                    if (oldScale > PINCH_DOUBLE_TAP_RESET_SCALE)
+                        pendingPinchDoubleTapReset = true
                     scale = 1f
                     tx = 0.0
                     ty = 0.0
-                    pendingPinchDoubleTapReset = true
                     resetPanFilters(detector.focusX, detector.focusY, SystemClock.uptimeMillis())
                     scheduleApply()
                     return true
@@ -149,8 +155,12 @@ internal class VideoZoomGestures(
             }
 
             override fun onScaleEnd(detector: ScaleGestureDetector) {
-                if (pendingPinchDoubleTapReset || scale <= PINCH_DOUBLE_TAP_RESET_SCALE) {
-                    pendingPinchDoubleTapReset = true
+                // pendingPinchDoubleTapReset is only set in onScale when the user
+                // was genuinely zoomed and pinched back to ~1x. Do not re-derive it
+                // from scale here: scale can be 1f after a spurious gesture that
+                // never actually zoomed the view, and setting the flag then would
+                // block all subsequent taps from reaching the Activity.
+                if (pendingPinchDoubleTapReset) {
                     resetLikeDoubleTapAfterPinch()
                 } else {
                     resetPanFilters(detector.focusX, detector.focusY, SystemClock.uptimeMillis())
@@ -220,10 +230,17 @@ internal class VideoZoomGestures(
         applyToView()
     }
 
-    private fun resetLikeDoubleTapAfterPinch() {
+    private fun resetLikeDoubleTapAfterPinch(attempt: Int = 0) {
         target.post {
             if (scaleDetector.isInProgress) {
-                resetLikeDoubleTapAfterPinch()
+                // ScaleGestureDetector can stay in-progress longer than expected on
+                // some devices (particularly with quick-scale enabled). Cap retries so
+                // pendingPinchDoubleTapReset is never stuck true indefinitely.
+                if (attempt < 10) {
+                    resetLikeDoubleTapAfterPinch(attempt + 1)
+                } else {
+                    reset()
+                }
                 return@post
             }
 
@@ -527,23 +544,9 @@ internal class VideoZoomGestures(
     }
 
     private fun updateRenderSurfaceForCurrentState(force: Boolean) {
-        val zoomSurfaceNeeded = isZoomed() || scaleDetector.isInProgress
-
         when {
-            // Keep the normal, non-zoomed player as a plain view-sized TextureView.
-            // The previous code also used the media-aspect/original-detail surface at
-            // normal scale for opposite-orientation videos. That means opening a video
-            // can immediately change both the TextureView buffer size and its View
-            // transform while Android is still settling the first frames. On some
-            // devices this can leave the video layer visually above the Android overlay,
-            // so taps still seek/toggle internally but the controls and seek text are
-            // not drawn until the file is reopened.
-            //
-            // Limit custom/original-detail surfaces to active zoom gestures only. At
-            // normal scale mpv renders directly to the view-sized surface, which keeps
-            // the overlay stack stable when entering a video.
-            zoomSurfaceNeeded && usesMediaAspectRenderSurface() -> requestMediaAspectRenderSurfaceSize(force)
-            zoomSurfaceNeeded -> requestViewAspectOriginalRenderSurfaceSize(force)
+            usesMediaAspectRenderSurface() -> requestMediaAspectRenderSurfaceSize(force)
+            isZoomed() || scaleDetector.isInProgress -> requestViewAspectOriginalRenderSurfaceSize(force)
             else -> requestBaseRenderSurfaceSize(force)
         }
     }
