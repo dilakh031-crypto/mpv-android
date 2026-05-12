@@ -98,7 +98,6 @@ abstract class BaseMPVView(context: Context, attrs: AttributeSet) : TextureView(
     private var renderSurfaceWidth = 0
     private var renderSurfaceHeight = 0
     private var customRenderSurfaceSize = false
-    private val nextSurfaceTextureUpdateActions = mutableListOf<() -> Unit>()
 
     /**
      * Set the real SurfaceTexture buffer size used by mpv without changing the
@@ -108,36 +107,30 @@ abstract class BaseMPVView(context: Context, attrs: AttributeSet) : TextureView(
      * size, so high-resolution media can be rendered at its original resolution
      * instead of being reduced to the display resolution before Android zooms it.
      */
-    fun setRenderSurfaceSize(width: Int, height: Int): Boolean {
+    fun setRenderSurfaceSize(width: Int, height: Int) {
         val safeWidth = width.coerceAtLeast(1)
         val safeHeight = height.coerceAtLeast(1)
         customRenderSurfaceSize = true
 
         if (safeWidth == renderSurfaceWidth && safeHeight == renderSurfaceHeight)
-            return false
+            return
 
         renderSurfaceWidth = safeWidth
         renderSurfaceHeight = safeHeight
         applyRenderSurfaceSize()
-        return true
     }
 
-    fun resetRenderSurfaceSize(): Boolean {
+    fun resetRenderSurfaceSize() {
         customRenderSurfaceSize = false
         val safeWidth = width.coerceAtLeast(1)
         val safeHeight = height.coerceAtLeast(1)
 
         if (safeWidth == renderSurfaceWidth && safeHeight == renderSurfaceHeight)
-            return false
+            return
 
         renderSurfaceWidth = safeWidth
         renderSurfaceHeight = safeHeight
         applyRenderSurfaceSize()
-        return true
-    }
-
-    fun doOnNextSurfaceTextureUpdate(action: () -> Unit) {
-        nextSurfaceTextureUpdateActions.add(action)
     }
 
     private fun ensureRenderSurfaceSize(width: Int, height: Int) {
@@ -215,15 +208,7 @@ abstract class BaseMPVView(context: Context, attrs: AttributeSet) : TextureView(
         return true
     }
 
-    override fun onSurfaceTextureUpdated(surface: SurfaceTexture) {
-        if (nextSurfaceTextureUpdateActions.isEmpty())
-            return
-
-        val actions = nextSurfaceTextureUpdateActions.toList()
-        nextSurfaceTextureUpdateActions.clear()
-        for (action in actions)
-            post(action)
-    }
+    override fun onSurfaceTextureUpdated(surface: SurfaceTexture) = Unit
 
     companion object {
         private const val TAG = "mpv"

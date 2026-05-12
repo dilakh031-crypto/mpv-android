@@ -22,14 +22,10 @@ import kotlin.math.roundToInt
  *    false-color artifacts on high-frequency scans at 720p.
  *  - As soon as the user starts zooming, the render surface switches to an
  *    original-detail buffer so zoom keeps full source detail.
- *  - In the normal unzoomed state we always keep mpv rendering directly to the
- *    view-sized surface, even when the phone orientation and media orientation
- *    do not match. The Android-sized/original-detail surface is used only while
- *    the user is zooming.
- *  - During zoom in the opposite-orientation case, we keep a media-aspect render
- *    surface and compensate with the normal View transform. This avoids the
- *    oversized black-bar buffer that loses zoom quality without using
- *    TextureView#setTransform.
+ *  - If the phone orientation is opposite to the media orientation, we keep a
+ *    media-aspect render surface and compensate with the normal View transform.
+ *    This avoids the oversized black-bar buffer that loses zoom quality without
+ *    using TextureView#setTransform, so playback does not tear at zoom/reset.
  *
  * We do not use mpv video-pan/video-zoom for finger movement.
  */
@@ -79,12 +75,6 @@ internal class VideoZoomGestures(
 
     private var renderSurfaceMode = RenderSurfaceMode.BASE
 
-    // When a pinch returns close enough to normal size, finish it through the
-    // same delayed reset path as double-tap. Calling reset() directly from
-    // onScaleEnd still sees ScaleGestureDetector as in-progress on some devices,
-    // which keeps the original-detail Android surface selected for that frame.
-    private var pendingPinchDoubleTapReset = false
-
     // Coalesce view property updates to vsync. We do not animate here; we only avoid
     // writing View properties multiple times in one display frame.
     private val choreographer: Choreographer = Choreographer.getInstance()
@@ -100,7 +90,6 @@ internal class VideoZoomGestures(
         object : ScaleGestureDetector.SimpleOnScaleGestureListener() {
             override fun onScaleBegin(detector: ScaleGestureDetector): Boolean {
                 lastTapTime = 0L
-                pendingPinchDoubleTapReset = false
                 panActive = false
                 canBeTap = false
 
@@ -120,19 +109,18 @@ internal class VideoZoomGestures(
 
                 val oldScale = scale
                 val requested = oldScale * detector.scaleFactor
-                val newScale = requested.coerceIn(MIN_SCALE, MAX_SCALE)
 
-                if (newScale <= PINCH_DOUBLE_TAP_RESET_SCALE) {
-                    scale = 1f
-                    tx = 0.0
-                    ty = 0.0
-                    pendingPinchDoubleTapReset = true
-                    resetPanFilters(detector.focusX, detector.focusY, SystemClock.uptimeMillis())
-                    scheduleApply()
+                // Pinch-zooming back down should behave like the double-tap reset as soon
+                // as the scale is within 0.2% of the normal full-image size. Because
+                // MIN_SCALE prevents going below 1.0, the practical threshold is 1.002.
+                // Require oldScale to be above the threshold so tiny pinch-out starts
+                // from the normal state are not cancelled immediately.
+                if (oldScale > RESET_SCALE_THRESHOLD && requested <= RESET_SCALE_THRESHOLD) {
+                    reset()
                     return true
                 }
 
-                pendingPinchDoubleTapReset = false
+                val newScale = requested.coerceIn(MIN_SCALE, MAX_SCALE)
                 if (newScale == oldScale)
                     return true
 
@@ -153,10 +141,9 @@ internal class VideoZoomGestures(
             }
 
             override fun onScaleEnd(detector: ScaleGestureDetector) {
-                if (pendingPinchDoubleTapReset || scale <= PINCH_DOUBLE_TAP_RESET_SCALE) {
-                    pendingPinchDoubleTapReset = true
-                    resetLikeDoubleTapAfterPinch()
-                } else {
+                if (scale <= 1f + EPS)
+                    reset()
+                else {
                     resetPanFilters(detector.focusX, detector.focusY, SystemClock.uptimeMillis())
                     updateRenderSurfaceForCurrentState(force = true)
                 }
@@ -196,7 +183,7 @@ internal class VideoZoomGestures(
     fun isZoomed(): Boolean = scale > 1f + EPS
 
     fun shouldBlockOtherGestures(e: MotionEvent): Boolean {
-        return isZoomed() || pendingPinchDoubleTapReset || scaleDetector.isInProgress || e.pointerCount > 1
+        return isZoomed() || scaleDetector.isInProgress || e.pointerCount > 1
     }
 
     fun reset() {
@@ -212,32 +199,15 @@ internal class VideoZoomGestures(
         panActive = false
         canBeTap = false
         lastTapTime = 0L
-        pendingPinchDoubleTapReset = false
         resetPanFilters(0f, 0f, SystemClock.uptimeMillis())
 
         // Critical for scan quality: after returning to normal size, do not keep
         // the original-resolution texture and let Android minify it. Let mpv draw
-        // directly to the view-sized surface instead, including the case where
-        // the phone orientation and media orientation do not match.
+        // directly to the view-sized surface instead. The only exception is the
+        // opposite-orientation case: there we keep a media-aspect surface so zoom
+        // can start/stop without a surface-aspect switch or a one-frame tear.
         updateRenderSurfaceForCurrentState(force = true)
         applyToView()
-    }
-
-    private fun resetLikeDoubleTapAfterPinch() {
-        target.post {
-            if (scaleDetector.isInProgress) {
-                resetLikeDoubleTapAfterPinch()
-                return@post
-            }
-
-            if (!pendingPinchDoubleTapReset && scale > PINCH_DOUBLE_TAP_RESET_SCALE)
-                return@post
-
-            // This is intentionally the same reset action used by double-tap,
-            // but deferred until the pinch detector has fully ended so surface
-            // selection follows the smooth double-tap path.
-            reset()
-        }
     }
 
     /**
@@ -285,7 +255,7 @@ internal class VideoZoomGestures(
         }
 
         if (!isZoomed())
-            return pendingPinchDoubleTapReset
+            return false
 
         when (e.actionMasked) {
             MotionEvent.ACTION_DOWN -> {
@@ -530,11 +500,10 @@ internal class VideoZoomGestures(
     }
 
     private fun updateRenderSurfaceForCurrentState(force: Boolean) {
-        val needsZoomRenderSurface = isZoomed() || scaleDetector.isInProgress
         when {
-            !needsZoomRenderSurface -> requestBaseRenderSurfaceSize(force)
             usesMediaAspectRenderSurface() -> requestMediaAspectRenderSurfaceSize(force)
-            else -> requestViewAspectOriginalRenderSurfaceSize(force)
+            isZoomed() || scaleDetector.isInProgress -> requestViewAspectOriginalRenderSurfaceSize(force)
+            else -> requestBaseRenderSurfaceSize(force)
         }
     }
 
@@ -740,7 +709,7 @@ internal class VideoZoomGestures(
         private const val EPS = 0.001f
         private const val MIN_SCALE = 1f
         private const val MAX_SCALE = 20f
-        private const val PINCH_DOUBLE_TAP_RESET_SCALE = 1.01f
+        private const val RESET_SCALE_THRESHOLD = 1.002f
         private const val DOUBLE_TAP_TIMEOUT = 300L
         private const val MEDIA_ORIENTATION_THRESHOLD = 1.08
         private const val VIEW_ORIENTATION_THRESHOLD = 1.08f
