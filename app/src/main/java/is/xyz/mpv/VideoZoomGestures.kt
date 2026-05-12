@@ -119,11 +119,8 @@ internal class VideoZoomGestures(
                 val newScale = requested.coerceIn(MIN_SCALE, MAX_SCALE)
 
                 if (newScale <= PINCH_DOUBLE_TAP_RESET_SCALE) {
-                    // Only flag a double-tap reset if the user was actually zoomed in
-                    // before this scale event. A spurious scale gesture at scale=1
-                    // (e.g. quick-scale misfire on first touch) must not set this flag,
-                    // because that leaves pendingPinchDoubleTapReset=true permanently
-                    // and every subsequent tap gets consumed, hiding the controls.
+                    // Only request a reset animation if we were genuinely zoomed.
+                    // A spurious scale event at scale=1 must not set this flag.
                     if (oldScale > PINCH_DOUBLE_TAP_RESET_SCALE)
                         pendingPinchDoubleTapReset = true
                     scale = 1f
@@ -155,11 +152,10 @@ internal class VideoZoomGestures(
             }
 
             override fun onScaleEnd(detector: ScaleGestureDetector) {
-                // pendingPinchDoubleTapReset is only set in onScale when the user
-                // was genuinely zoomed and pinched back to ~1x. Do not re-derive it
-                // from scale here: scale can be 1f after a spurious gesture that
-                // never actually zoomed the view, and setting the flag then would
-                // block all subsequent taps from reaching the Activity.
+                // Do not re-derive pendingPinchDoubleTapReset from the scale value here.
+                // onScale already sets it correctly (only when the user was zoomed).
+                // Setting it again based on scale<=threshold would wrongly fire on any
+                // accidental gesture that never changed scale from 1.
                 if (pendingPinchDoubleTapReset) {
                     resetLikeDoubleTapAfterPinch()
                 } else {
@@ -233,9 +229,9 @@ internal class VideoZoomGestures(
     private fun resetLikeDoubleTapAfterPinch(attempt: Int = 0) {
         target.post {
             if (scaleDetector.isInProgress) {
-                // ScaleGestureDetector can stay in-progress longer than expected on
-                // some devices (particularly with quick-scale enabled). Cap retries so
-                // pendingPinchDoubleTapReset is never stuck true indefinitely.
+                // Cap retries: if the scale detector is stuck in-progress (can happen
+                // with quick-scale on some devices), force a reset anyway so
+                // pendingPinchDoubleTapReset is never left true indefinitely.
                 if (attempt < 10) {
                     resetLikeDoubleTapAfterPinch(attempt + 1)
                 } else {
@@ -289,8 +285,8 @@ internal class VideoZoomGestures(
             return true
         }
 
-        // Multi-touch, or an active pinch, is handled only by ScaleGestureDetector.
-        if (e.pointerCount > 1 || scaleDetector.isInProgress) {
+        // Multi-touch is always handled by ScaleGestureDetector.
+        if (e.pointerCount > 1) {
             lastTapTime = 0L
             panFingerDown = false
             panActive = false
@@ -298,8 +294,23 @@ internal class VideoZoomGestures(
             return true
         }
 
+        // When not zoomed, always let the Activity see single-finger events so it
+        // can toggle controls. Checking scaleDetector.isInProgress here is wrong:
+        // Android's built-in quick-scale feature can set isInProgress=true on a
+        // single-finger touch even at scale=1, which would permanently consume all
+        // taps and hide the controls until the video is closed and reopened.
         if (!isZoomed())
             return pendingPinchDoubleTapReset
+
+        // We are zoomed. While a pinch gesture is still active, block pan/tap
+        // handling — the scale detector owns the pointer until it finishes.
+        if (scaleDetector.isInProgress) {
+            lastTapTime = 0L
+            panFingerDown = false
+            panActive = false
+            canBeTap = false
+            return true
+        }
 
         when (e.actionMasked) {
             MotionEvent.ACTION_DOWN -> {
