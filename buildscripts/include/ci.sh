@@ -9,6 +9,9 @@ msg() {
 	printf '==> %s\n' "$1"
 }
 
+ci_arch="${CI_ANDROID_ARCH:-armv7l}"
+ci_cache_id="${ci_tarball%.tgz}-${ci_arch}.tgz"
+
 fetch_prefix() {
 	if [[ "$CACHE_MODE" == folder ]]; then
 		local text=
@@ -17,8 +20,8 @@ fetch_prefix() {
 		else
 			echo "Cache seems to be empty"
 		fi
-		printf 'Expecting "%s",\nfound     "%s".\n' "$ci_tarball" "$text"
-		if [[ "$text" == "$ci_tarball" ]]; then
+		printf 'Expecting "%s",\nfound     "%s".\n' "$ci_cache_id" "$text"
+		if [[ "$text" == "$ci_cache_id" ]]; then
 			tar -xzf "$CACHE_FOLDER/data.tgz" -C prefix && return 0
 		fi
 	fi
@@ -26,18 +29,18 @@ fetch_prefix() {
 }
 
 build_prefix() {
-	msg "Building the prefix ($ci_tarball)..."
+	msg "Building the prefix ($ci_cache_id)..."
 
 	msg "Fetching deps"
 	IN_CI=1 ./include/download-deps.sh
 
 	msg "Compiling"
-	./buildall.sh --arch arm64 --only-deps mpv
+	./buildall.sh --arch "$ci_arch" --only-deps mpv
 
 	if [[ "$CACHE_MODE" == folder && -w "$CACHE_FOLDER" ]]; then
 		msg "Compressing the prefix"
 		tar -cvzf "$CACHE_FOLDER/data.tgz" -C prefix .
-		echo "$ci_tarball" >"$CACHE_FOLDER/id.txt"
+		echo "$ci_cache_id" >"$CACHE_FOLDER/id.txt"
 	fi
 }
 
@@ -45,7 +48,7 @@ export WGET="wget --progress=bar:force"
 
 if [ "$1" = "export" ]; then
 	# export variable with unique cache identifier
-	echo "CACHE_IDENTIFIER=$ci_tarball"
+	echo "CACHE_IDENTIFIER=$ci_cache_id"
 	exit 0
 elif [ "$1" = "install" ]; then
 	# install deps
@@ -76,13 +79,13 @@ else
 fi
 
 msg "Building mpv"
-./buildall.sh --arch arm64 -n mpv || {
+./buildall.sh --arch "$ci_arch" -n mpv || {
 	# show logfile if configure failed
 	[ ! -f deps/mpv/_build/config.h ] && cat deps/mpv/_build/meson-logs/meson-log.txt
 	exit 1
 }
 
 msg "Building mpv-android"
-./buildall.sh --arch arm64 -n
+./buildall.sh --arch "$ci_arch" -n
 
 exit 0
