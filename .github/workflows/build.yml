@@ -4,6 +4,11 @@ on:
   - push
   - pull_request
 
+env:
+  CI_ANDROID_ARCH: arm64
+  CI_ANDROID_ABI: arm64-v8a
+  MPV_ANDROID_GHA_DEFAULT_ARM64_RELEASE: "1"
+
 jobs:
   linux:
     runs-on: ubuntu-24.04
@@ -37,21 +42,29 @@ jobs:
           CACHE_MODE: "folder"
           CACHE_FOLDER: "${{ github.workspace }}/gh-cache"
 
-      - name: Build
+      - name: Prepare release signing key
         run: |
-          buildscripts/include/ci.sh build
-
-      - name: Verify APK
-        run: |
-          apk=app/build/outputs/apk/default/release/app-default-arm64-v8a-release.apk
-          if [ ! -f "$apk" ]; then
-            echo "Error: expected APK not found"
-            ls -la app/build/outputs/apk/default/release/ || true
+          if [ -z "${ANDROID_SIGNING_KEY_BASE64}" ]; then
+            echo "ANDROID_SIGNING_KEY_BASE64 secret is required to sign the default arm64-v8a release APK." >&2
             exit 1
           fi
+          printf '%s' "${ANDROID_SIGNING_KEY_BASE64}" | base64 -d > "${ANDROID_SIGNING_KEY}"
+          chmod 600 "${ANDROID_SIGNING_KEY}"
+        env:
+          ANDROID_SIGNING_KEY_BASE64: "${{ secrets.ANDROID_SIGNING_KEY_BASE64 }}"
+          ANDROID_SIGNING_KEY: "${{ runner.temp }}/mpv-android-release.jks"
+
+      - name: Build default arm64-v8a release
+        run: |
+          buildscripts/include/ci.sh build
+        env:
+          ANDROID_SIGNING_KEY: "${{ runner.temp }}/mpv-android-release.jks"
+          ANDROID_SIGNING_ALIAS: "${{ secrets.ANDROID_SIGNING_ALIAS }}"
+          ANDROID_SIGNING_STORE_PASSWORD: "${{ secrets.ANDROID_SIGNING_STORE_PASSWORD }}"
+          ANDROID_SIGNING_KEY_PASSWORD: "${{ secrets.ANDROID_SIGNING_KEY_PASSWORD }}"
 
       - uses: actions/upload-artifact@v7
         with:
-          name: mpv-android
-          path: app/build/outputs/apk/default/release/app-default-arm64-v8a-release.apk
+          name: mpv-android-default-arm64-v8a-release
+          path: app/build/outputs/apk/default/release/app-default-arm64-v8a-release-signed.apk
           if-no-files-found: error
