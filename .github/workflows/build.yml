@@ -70,11 +70,13 @@ jobs:
           set -euo pipefail
           cd buildscripts
           ./buildall.sh --arch arm64 -n mpv || {
-            [ ! -f deps/mpv/_build/config.h ] && cat deps/mpv/_build/meson-logs/meson-log.txt
+            [ ! -f deps/mpv/_build-arm64/config.h ] && cat deps/mpv/_build-arm64/meson-logs/meson-log.txt
             exit 1
           }
           cd ..
+          set +u
           . buildscripts/include/path.sh
+          set -u
           PREFIX64="${{ github.workspace }}/buildscripts/prefix/arm64" ndk-build -C app/src/main -j"$cores"
           ./gradlew :app:assembleDefaultRelease -Pandroid.injected.build.abi=arm64-v8a
           find app/build/outputs -type f \( -name "*.apk" -o -name "*.aab" \) ! -name "app-default-arm64-v8a-release-unsigned.apk" -delete
@@ -87,7 +89,9 @@ jobs:
           ANDROID_SIGNING_KEY_PASSWORD: ${{ secrets.ANDROID_SIGNING_KEY_PASSWORD }}
         run: |
           set -euo pipefail
+          set +u
           . buildscripts/include/path.sh
+          set -u
 
           mkdir -p signing
           if [[ -n "${ANDROID_SIGNING_KEY:-}" && -n "${ANDROID_SIGNING_STORE_PASSWORD:-}" ]]; then
