@@ -15,10 +15,7 @@ jobs:
           distribution: temurin
 
       - name: Export env vars
-        run: |
-          buildscripts/include/ci.sh export >>$GITHUB_ENV
-          echo "APK_UNSIGNED=app/build/outputs/apk/default/release/app-default-arm64-v8a-release-unsigned.apk" >>$GITHUB_ENV
-          echo "APK_SIGNED=app/build/outputs/apk/default/release/app-default-arm64-v8a-release-signed.apk" >>$GITHUB_ENV
+        run: buildscripts/include/ci.sh export >>$GITHUB_ENV
 
       - uses: actions/cache@v5
         with:
@@ -34,66 +31,78 @@ jobs:
 
       - name: Download deps
         run: |
-          cd buildscripts
-          . ./include/depinfo.sh
           export WGET="wget --progress=bar:force"
-          cache_id="${ci_tarball}-arm64"
+          export IN_CI=1
+          export CACHE_FOLDER="${{ github.workspace }}/gh-cache"
+
+          mkdir -p "$CACHE_FOLDER"
+          cd buildscripts
 
           if [[ -n "$ANDROID_HOME" && -d "$ANDROID_HOME" ]]; then
             mkdir -p sdk
             ln -sv "$ANDROID_HOME" sdk/android-sdk-linux
           fi
 
-          IN_CI=1 ./include/download-sdk.sh
+          ./include/download-sdk.sh
 
           mkdir -p deps/mpv
           $WGET https://github.com/mpv-player/mpv/archive/master.tar.gz -O master.tgz
           tar -xzf master.tgz -C deps/mpv --strip-components=1
           rm master.tgz
 
-          mkdir -p prefix "$CACHE_FOLDER"
-          if [[ -f "$CACHE_FOLDER/id.txt" ]] && [[ "$(cat "$CACHE_FOLDER/id.txt")" == "$cache_id" ]]; then
+          mkdir -p prefix
+          cache_id="${CACHE_IDENTIFIER}-arm64"
+          if [[ -f "$CACHE_FOLDER/id.txt" && "$(cat "$CACHE_FOLDER/id.txt")" == "$cache_id" ]]; then
             tar -xzf "$CACHE_FOLDER/data.tgz" -C prefix
           else
-            IN_CI=1 ./include/download-deps.sh
-            ./buildall.sh --arch arm64 --only-deps mpv
-            tar -cvzf "$CACHE_FOLDER/data.tgz" -C prefix .
+            ./buildall.sh --only-deps --arch arm64 mpv
+            tar -czf "$CACHE_FOLDER/data.tgz" -C prefix .
             echo "$cache_id" >"$CACHE_FOLDER/id.txt"
           fi
+
+      - name: Build
+        run: |
+          ./buildscripts/buildall.sh --arch arm64 -n mpv
+
+          source buildscripts/include/path.sh
+          PREFIX64="${{ github.workspace }}/buildscripts/prefix/arm64" \
+            ndk-build -C app/src/main -j$(nproc)
+
+          sed -i 's/universalApk true/universalApk false/' app/build.gradle
+          ./gradlew :app:assembleDefaultRelease -Pandroid.injected.build.abi=arm64-v8a
+
+      - name: Sign
+        run: |
+          : "${ANDROID_SIGNING_KEY:?Missing secret ANDROID_SIGNING_KEY}"
+          : "${ANDROID_SIGNING_ALIAS:?Missing secret ANDROID_SIGNING_ALIAS}"
+          : "${ANDROID_SIGNING_STORE_PASSWORD:?Missing secret ANDROID_SIGNING_STORE_PASSWORD}"
+
+          source buildscripts/include/depinfo.sh
+
+          key_pass="${ANDROID_SIGNING_KEY_PASSWORD:-$ANDROID_SIGNING_STORE_PASSWORD}"
+          keystore="${{ runner.temp }}/release.keystore"
+          unsigned="app/build/outputs/apk/default/release/app-default-arm64-v8a-release-unsigned.apk"
+          signed="app/build/outputs/apk/default/release/app-default-arm64-v8a-release-signed.apk"
+          apksigner="buildscripts/sdk/android-sdk-linux/build-tools/${v_sdk_build_tools}/apksigner"
+
+          printf '%s' "$ANDROID_SIGNING_KEY" | base64 --decode > "$keystore"
+
+          "$apksigner" sign \
+            --ks "$keystore" \
+            --ks-key-alias "$ANDROID_SIGNING_ALIAS" \
+            --ks-pass "pass:$ANDROID_SIGNING_STORE_PASSWORD" \
+            --key-pass "pass:$key_pass" \
+            --out "$signed" \
+            "$unsigned"
+
+          "$apksigner" verify "$signed"
         env:
-          CACHE_MODE: "folder"
-          CACHE_FOLDER: "${{ github.workspace }}/gh-cache"
-
-      - name: Build default arm64-v8a release
-        run: |
-          buildscripts/buildall.sh --arch arm64 -n mpv || {
-            [ ! -f buildscripts/deps/mpv/_build-arm64/config.h ] && cat buildscripts/deps/mpv/_build-arm64/meson-logs/meson-log.txt
-            exit 1
-          }
-
-          . buildscripts/include/path.sh
-          perl -0pi -e 's/universalApk\s+true/universalApk false/' app/build.gradle
-          PREFIX64="$PWD/buildscripts/prefix/arm64" ndk-build -C app/src/main -j$cores
-          ./gradlew assembleDefaultRelease
-          test -f "$APK_UNSIGNED"
-
-      - name: Sign default arm64-v8a release
-        if: env.ANDROID_SIGNING_KEY != ''
-        run: |
-          . buildscripts/include/path.sh
-          apksigner="${ANDROID_HOME}/build-tools/${v_sdk_build_tools}/apksigner"
-          "$apksigner" sign --ks "${ANDROID_SIGNING_KEY}" \
-            --in "$APK_UNSIGNED" --out "$APK_SIGNED"
-
-      - name: Select default arm64-v8a release APK
-        run: |
-          if [ -f "$APK_SIGNED" ]; then
-            echo "APK_TO_UPLOAD=$APK_SIGNED" >>$GITHUB_ENV
-          else
-            echo "APK_TO_UPLOAD=$APK_UNSIGNED" >>$GITHUB_ENV
-          fi
+          ANDROID_SIGNING_KEY: ${{ secrets.ANDROID_SIGNING_KEY }}
+          ANDROID_SIGNING_ALIAS: ${{ secrets.ANDROID_SIGNING_ALIAS }}
+          ANDROID_SIGNING_STORE_PASSWORD: ${{ secrets.ANDROID_SIGNING_STORE_PASSWORD }}
+          ANDROID_SIGNING_KEY_PASSWORD: ${{ secrets.ANDROID_SIGNING_KEY_PASSWORD }}
 
       - uses: actions/upload-artifact@v7
         with:
-          name: default arm64-v8a release
-          path: "${{ env.APK_TO_UPLOAD }}"
+          name: mpv-android-arm64-v8a-release
+          path: app/build/outputs/apk/default/release/app-default-arm64-v8a-release-signed.apk
