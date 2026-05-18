@@ -7,6 +7,9 @@ on:
 jobs:
   linux:
     runs-on: ubuntu-24.04
+    env:
+      CI_ARCH: arm64
+      MPV_ANDROID_GITHUB_ACTIONS_ARM64_RELEASE_ONLY: "1"
     steps:
       - uses: actions/checkout@v6
       - uses: actions/setup-java@v5
@@ -15,9 +18,7 @@ jobs:
           distribution: temurin
 
       - name: Export env vars
-        run: |
-          cache_identifier="$(buildscripts/include/ci.sh export | sed 's/^CACHE_IDENTIFIER=//')"
-          echo "CACHE_IDENTIFIER=${cache_identifier}-arm64-v8a" >>$GITHUB_ENV
+        run: buildscripts/include/ci.sh export >> "$GITHUB_ENV"
 
       - uses: actions/cache@v5
         with:
@@ -33,90 +34,60 @@ jobs:
 
       - name: Download deps
         run: |
-          set -euo pipefail
-          export WGET="wget --progress=bar:force"
-          export CACHE_FOLDER="${{ github.workspace }}/gh-cache"
-          export CACHE_MODE="folder"
           mkdir -p "$CACHE_FOLDER"
-
-          cd buildscripts
-          . ./include/depinfo.sh
-
-          if [[ -n "${ANDROID_HOME:-}" && -d "$ANDROID_HOME" ]]; then
-            mkdir -p sdk
-            ln -sfn "$ANDROID_HOME" sdk/android-sdk-linux
-          fi
-
-          IN_CI=1 ./include/download-sdk.sh
-
-          mkdir -p deps/mpv
-          $WGET https://github.com/mpv-player/mpv/archive/master.tar.gz -O master.tgz
-          tar -xzf master.tgz -C deps/mpv --strip-components=1
-          rm master.tgz
-
-          mkdir -p prefix
-          cache_id="${ci_tarball}-arm64-v8a"
-          if [[ -f "$CACHE_FOLDER/id.txt" && -f "$CACHE_FOLDER/data.tgz" && "$(cat "$CACHE_FOLDER/id.txt")" == "$cache_id" ]]; then
-            tar -xzf "$CACHE_FOLDER/data.tgz" -C prefix
-          else
-            IN_CI=1 ./include/download-deps.sh
-            ./buildall.sh --arch arm64 --only-deps mpv
-            tar -czf "$CACHE_FOLDER/data.tgz" -C prefix .
-            echo "$cache_id" >"$CACHE_FOLDER/id.txt"
-          fi
-
-      - name: Build
-        run: |
-          set -euo pipefail
-          cd buildscripts
-          ./buildall.sh --arch arm64 -n mpv || {
-            [ ! -f deps/mpv/_build-arm64/config.h ] && cat deps/mpv/_build-arm64/meson-logs/meson-log.txt
-            exit 1
-          }
-          cd ..
-          set +u
-          . buildscripts/include/path.sh
-          set -u
-          PREFIX64="${{ github.workspace }}/buildscripts/prefix/arm64" ndk-build -C app/src/main -j"$cores"
-          ./gradlew :app:assembleDefaultRelease -Pandroid.injected.build.abi=arm64-v8a
-          find app/build/outputs -type f \( -name "*.apk" -o -name "*.aab" \) ! -name "app-default-arm64-v8a-release-unsigned.apk" -delete
-
-      - name: Sign
+          buildscripts/include/ci.sh install
         env:
-          ANDROID_SIGNING_KEY: ${{ secrets.ANDROID_SIGNING_KEY }}
-          ANDROID_SIGNING_ALIAS: ${{ secrets.ANDROID_SIGNING_ALIAS }}
-          ANDROID_SIGNING_STORE_PASSWORD: ${{ secrets.ANDROID_SIGNING_STORE_PASSWORD }}
+          CACHE_MODE: "folder"
+          CACHE_FOLDER: "${{ github.workspace }}/gh-cache"
+
+      - name: Configure release signing
+        shell: bash
+        env:
+          ANDROID_SIGNING_KEY_B64: ${{ secrets.ANDROID_SIGNING_KEY_B64 }}
+          ANDROID_SIGNING_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_SIGNING_KEYSTORE_PASSWORD }}
           ANDROID_SIGNING_KEY_PASSWORD: ${{ secrets.ANDROID_SIGNING_KEY_PASSWORD }}
+          ANDROID_SIGNING_ALIAS: ${{ secrets.ANDROID_SIGNING_ALIAS }}
         run: |
           set -euo pipefail
-          set +u
-          . buildscripts/include/path.sh
-          set -u
 
-          mkdir -p signing
-          if [[ -n "${ANDROID_SIGNING_KEY:-}" && -n "${ANDROID_SIGNING_STORE_PASSWORD:-}" ]]; then
-            printf '%s' "$ANDROID_SIGNING_KEY" | base64 --decode > signing/release.jks
-            keystore="signing/release.jks"
-            alias="${ANDROID_SIGNING_ALIAS:-release}"
-            storepass="$ANDROID_SIGNING_STORE_PASSWORD"
-            keypass="${ANDROID_SIGNING_KEY_PASSWORD:-$ANDROID_SIGNING_STORE_PASSWORD}"
+          key_path="$RUNNER_TEMP/mpv-android-release.jks"
+
+          if [ -n "${ANDROID_SIGNING_KEY_B64:-}" ]; then
+            printf '%s' "$ANDROID_SIGNING_KEY_B64" | base64 --decode > "$key_path"
+
+            : "${ANDROID_SIGNING_KEYSTORE_PASSWORD:?ANDROID_SIGNING_KEYSTORE_PASSWORD secret is required when ANDROID_SIGNING_KEY_B64 is set}"
+            : "${ANDROID_SIGNING_ALIAS:?ANDROID_SIGNING_ALIAS secret is required when ANDROID_SIGNING_KEY_B64 is set}"
+
+            store_password="$ANDROID_SIGNING_KEYSTORE_PASSWORD"
+            key_password="${ANDROID_SIGNING_KEY_PASSWORD:-$ANDROID_SIGNING_KEYSTORE_PASSWORD}"
+            key_alias="$ANDROID_SIGNING_ALIAS"
           else
-            keystore="signing/private.jks"
-            alias="private"
-            storepass="android"
-            keypass="android"
-            keytool -genkeypair -v -keystore "$keystore" -storepass "$storepass" -keypass "$keypass" -alias "$alias" -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=mpv-android,O=GitHub Actions,C=US"
+            store_password="$(openssl rand -base64 24)"
+            key_password="$store_password"
+            key_alias="mpv-android-github-actions"
+
+            keytool -genkeypair \
+              -keystore "$key_path" \
+              -storetype JKS \
+              -storepass "$store_password" \
+              -keypass "$key_password" \
+              -alias "$key_alias" \
+              -keyalg RSA \
+              -keysize 4096 \
+              -validity 10000 \
+              -dname "CN=GitHub Actions, O=mpv-android"
           fi
 
-          unsigned="app/build/outputs/apk/default/release/app-default-arm64-v8a-release-unsigned.apk"
-          signed="app/build/outputs/apk/default/release/app-default-arm64-v8a-release-signed.apk"
-          test -f "$unsigned"
+          {
+            echo "ANDROID_SIGNING_KEY=$key_path"
+            echo "ANDROID_SIGNING_STORE_PASSWORD=$store_password"
+            echo "ANDROID_SIGNING_KEY_PASSWORD=$key_password"
+            echo "ANDROID_SIGNING_ALIAS=$key_alias"
+          } >> "$GITHUB_ENV"
 
-          apksigner="${ANDROID_HOME}/build-tools/${v_sdk_build_tools}/apksigner"
-          "$apksigner" sign --ks "$keystore" --ks-key-alias "$alias" --ks-pass "pass:$storepass" --key-pass "pass:$keypass" --out "$signed" "$unsigned"
-          "$apksigner" verify --print-certs "$signed"
-          rm -f "$unsigned"
-          find app/build/outputs -type f \( -name "*.apk" -o -name "*.aab" \) ! -name "$(basename "$signed")" -delete
+      - name: Build default arm64-v8a release only
+        run: |
+          buildscripts/include/ci.sh build
 
       - uses: actions/upload-artifact@v7
         with:
