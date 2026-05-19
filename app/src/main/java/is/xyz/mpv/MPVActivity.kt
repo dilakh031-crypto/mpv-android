@@ -3235,12 +3235,13 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
     }
 
     override fun event(eventId: Int) {
-        if (eventId == MpvEvent.MPV_EVENT_SHUTDOWN)
-            finishWithResult(if (playbackHasStarted) RESULT_OK else RESULT_CANCELED)
         if (eventId == MpvEvent.MPV_EVENT_END_FILE) {
             psc.eof()
             updateMediaSession()
         }
+
+        if (eventId == MpvEvent.MPV_EVENT_SHUTDOWN)
+            finishWithResult(if (playbackHasStarted) RESULT_OK else RESULT_CANCELED)
 
         if (eventId == MpvEvent.MPV_EVENT_PLAYBACK_RESTART) {
             // A seek completed. If the user has released the finger, resume playback now.
@@ -3257,9 +3258,6 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
         }
 
         if (eventId == MpvEvent.MPV_EVENT_START_FILE) {
-            val cmds = onloadCommands.toTypedArray()
-            onloadCommands.clear()
-            for (c in cmds)
             // Reset any view-level zoom/pan when a new file starts.
 
             // Apply orientation as early as possible for playlist items, so we don't show the wrong orientation first.
@@ -3279,7 +3277,9 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
                 // ignore
             }
 
-            for (c in onloadCommands)
+            val cmds = onloadCommands.toTypedArray()
+            onloadCommands.clear()
+            for (c in cmds)
                 MPVLib.command(c)
 
             // Restore the user's previously chosen subtitle and audio track for this video.
