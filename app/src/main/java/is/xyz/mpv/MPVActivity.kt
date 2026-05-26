@@ -1041,6 +1041,8 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
     private var btnSelected = -1
 
     private var mightWantToToggleControls = false
+    private var tapDownX = 0f
+    private var tapDownY = 0f
 
     // Prevent accidental single-tap UI toggle while user swipes from the very top to open
     // Android's notification shade / status bar.
@@ -1342,27 +1344,50 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
         // For tap-to-toggle, we delay the single-tap action slightly.
         // We DO NOT cancel on the 2nd tap preemptively. Instead, we cancel only if TouchGestures
         // actually confirms and handles a double-tap (see onPropertyChange for PlayPause/SeekFixed/Custom).
-        if (ev.actionMasked == MotionEvent.ACTION_DOWN || ev.actionMasked == MotionEvent.ACTION_POINTER_DOWN) {
-            // Zoom mode uses double-tap to reset zoom (handled by VideoZoomGestures), not TouchGestures.
-            // Cancel any pending single-tap toggle from the previous tap so the UI won't flash/appear.
-            if (::zoomGestures.isInitialized && zoomGestures.shouldBlockOtherGestures(ev)) {
-                cancelPendingTapToggle()
-            }
-            mightWantToToggleControls = true
+        when (ev.actionMasked) {
+            MotionEvent.ACTION_DOWN -> {
+                // Zoom mode uses double-tap to reset zoom (handled by VideoZoomGestures), not TouchGestures.
+                // Cancel any pending single-tap toggle from the previous tap so the UI won't flash/appear.
+                if (::zoomGestures.isInitialized && zoomGestures.shouldBlockOtherGestures(ev)) {
+                    cancelPendingTapToggle()
+                }
+                mightWantToToggleControls = true
+                tapDownX = ev.x
+                tapDownY = ev.y
 
-            // If the gesture starts from the very top, treat it as a possible status-bar swipe.
-            // We'll only cancel the tap-to-toggle if the finger moves down noticeably.
-            statusBarSwipeCandidate = isInTopSystemGestureDeadzone(ev.y)
-            statusBarSwipeStartY = ev.y
-            statusBarSwipeCanceledToggle = false
+                // If the gesture starts from the very top, treat it as a possible status-bar swipe.
+                // We'll only cancel the tap-to-toggle if the finger moves down noticeably.
+                statusBarSwipeCandidate = isInTopSystemGestureDeadzone(ev.y)
+                statusBarSwipeStartY = ev.y
+                statusBarSwipeCanceledToggle = false
+            }
+            MotionEvent.ACTION_POINTER_DOWN -> {
+                // Multi-touch/pinch gestures are not taps; never toggle controls for them.
+                cancelPendingTapToggle()
+                mightWantToToggleControls = false
+            }
         }
 
-        if (ev.actionMasked == MotionEvent.ACTION_MOVE && statusBarSwipeCandidate && !statusBarSwipeCanceledToggle) {
-            // User is likely pulling down the notification shade; don't show player controls.
-            if (ev.y - statusBarSwipeStartY > statusBarSwipeCancelPx()) {
-                statusBarSwipeCanceledToggle = true
-                mightWantToToggleControls = false
-                cancelPendingTapToggle()
+        if (ev.actionMasked == MotionEvent.ACTION_MOVE) {
+            // Any meaningful movement turns the interaction into a drag/swipe, so controls should
+            // only toggle for a real tap and never for horizontal or vertical swipes.
+            if (mightWantToToggleControls) {
+                val dx = ev.x - tapDownX
+                val dy = ev.y - tapDownY
+                val touchSlop = ViewConfiguration.get(this).scaledTouchSlop.toFloat()
+                if (dx * dx + dy * dy > touchSlop * touchSlop) {
+                    mightWantToToggleControls = false
+                    cancelPendingTapToggle()
+                }
+            }
+
+            if (statusBarSwipeCandidate && !statusBarSwipeCanceledToggle) {
+                // User is likely pulling down the notification shade; don't show player controls.
+                if (ev.y - statusBarSwipeStartY > statusBarSwipeCancelPx()) {
+                    statusBarSwipeCanceledToggle = true
+                    mightWantToToggleControls = false
+                    cancelPendingTapToggle()
+                }
             }
         }
 
