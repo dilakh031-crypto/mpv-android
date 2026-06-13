@@ -190,6 +190,8 @@ internal class MPVView(context: Context, attrs: AttributeSet) : BaseMPVView(cont
             Property("track-list"),
             Property("video-params/aspect", MPV_FORMAT_DOUBLE),
             Property("video-params/rotate", MPV_FORMAT_DOUBLE),
+            Property("video-params/w", MPV_FORMAT_INT64),
+            Property("video-params/h", MPV_FORMAT_INT64),
             Property("playlist-pos", MPV_FORMAT_INT64),
             Property("playlist-count", MPV_FORMAT_INT64),
             Property("current-tracks/video/image"),
@@ -324,6 +326,15 @@ internal class MPVView(context: Context, attrs: AttributeSet) : BaseMPVView(cont
             else
                 it
         }
+    }
+
+    fun getVideoPixelSize(): Pair<Int, Int>? {
+        val w = MPVLib.getPropertyInt("video-params/w") ?: return null
+        val h = MPVLib.getPropertyInt("video-params/h") ?: return null
+        if (w <= 0 || h <= 0)
+            return null
+        val rot = MPVLib.getPropertyInt("video-params/rotate") ?: 0
+        return if (rot % 180 == 90) h to w else w to h
     }
 
     fun setAudioSessionId(id: Int) {
