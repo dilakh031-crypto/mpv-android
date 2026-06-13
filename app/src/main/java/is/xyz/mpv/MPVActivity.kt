@@ -345,9 +345,8 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
         }
 
         // NOTE: touch events must come from an untransformed overlay view (gestureLayer).
-        // The high-resolution zoom layer is transformed for zoom/pan, so attaching
-        // gestures directly to a transformed video view would inverse-transform
-        // MotionEvents and create feedback/jitter.
+        // The player view is transformed for zoom/pan, so attaching gestures directly to it
+        // would inverse-transform MotionEvents and create feedback/jitter.
         binding.gestureLayer.setOnTouchListener { _, e ->
             if (lockedUI)
                 return@setOnTouchListener false
@@ -406,7 +405,7 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
             // Prepare binding/gestures early so onConfigurationChanged is safe even if we change orientation immediately.
             binding = PlayerBinding.inflate(layoutInflater)
             gestures = TouchGestures(this)
-            zoomGestures = VideoZoomGestures(binding.player, binding.zoomPlayer, binding.zoomSnapshot)
+            zoomGestures = VideoZoomGestures(binding.player)
 
             // Do these here and not in MainActivity because mpv can be launched from a file browser.
             Utils.copyAssets(this)
@@ -598,9 +597,8 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
             setBackgroundColor(Color.BLACK)
         }
 
-        // Insert above the normal player view but below the gesture/controls layers.
-        // The zoom layer is transparent until pinch zoom starts, so this still
-        // covers the startup player frame without blocking touch/UI overlays.
+        // Insert above the player view but below gesture/controls layers.
+        // Layout order in player.xml: player(0), gestureLayer(1), outside(2).
         (binding.root as? ViewGroup)?.addView(overlay, 1)
         refreshPlayerOverlay()
 

@@ -44,10 +44,7 @@ abstract class BaseMPVView(context: Context, attrs: AttributeSet) : TextureView(
 
         surfaceTextureListener = this
         if (isAvailable) {
-            surfaceTexture?.let {
-                primaryTexture = it
-                usePrimaryRenderSurface()
-            }
+            surfaceTexture?.let { attachSurfaceTexture(it, width, height) }
         }
         observeProperties()
     }
@@ -60,8 +57,7 @@ abstract class BaseMPVView(context: Context, attrs: AttributeSet) : TextureView(
     fun destroy() {
         // Disable texture callbacks to avoid using uninitialized mpv state.
         surfaceTextureListener = null
-        detachCurrentRenderSurface()
-        primaryTexture = null
+        detachSurfaceTexture()
 
         MPVLib.destroy()
     }
@@ -77,7 +73,7 @@ abstract class BaseMPVView(context: Context, attrs: AttributeSet) : TextureView(
      * Set the first file to be played once the player is ready.
      */
     fun playFile(filePath: String) {
-        if (currentSurface != null) {
+        if (attachedSurface != null) {
             MPVLib.command(arrayOf("loadfile", filePath))
             this.filePath = null
         } else {
@@ -96,25 +92,12 @@ abstract class BaseMPVView(context: Context, attrs: AttributeSet) : TextureView(
         MPVLib.setOptionString("vo", vo)
     }
 
-    private enum class SurfaceOwner {
-        NONE,
-        PRIMARY,
-        EXTERNAL,
-    }
-
-    private var currentSurface: Surface? = null
-    private var currentTexture: SurfaceTexture? = null
-    private var currentSurfaceOwner = SurfaceOwner.NONE
-    private var primaryTexture: SurfaceTexture? = null
+    private var attachedSurface: Surface? = null
+    private var attachedTexture: SurfaceTexture? = null
 
     private var renderSurfaceWidth = 0
     private var renderSurfaceHeight = 0
     private var customRenderSurfaceSize = false
-    private var onPrimaryFrameRendered: (() -> Unit)? = null
-
-    fun setOnPrimaryFrameRenderedListener(listener: (() -> Unit)?) {
-        onPrimaryFrameRendered = listener
-    }
 
     /**
      * Set the real SurfaceTexture buffer size used by mpv without changing the
@@ -150,42 +133,16 @@ abstract class BaseMPVView(context: Context, attrs: AttributeSet) : TextureView(
         applyRenderSurfaceSize()
     }
 
-    /**
-     * Move mpv back to the normal player TextureView. This is the path used at
-     * base scale so mpv remains responsible for the final screen-sized downscale
-     * and its configured scalers/filters keep working before zoom starts.
-     */
-    fun usePrimaryRenderSurface(): Boolean {
-        val texture = primaryTexture ?: return false
-        customRenderSurfaceSize = false
-        val safeWidth = width.coerceAtLeast(1)
-        val safeHeight = height.coerceAtLeast(1)
-        return attachRenderSurface(texture, safeWidth, safeHeight, SurfaceOwner.PRIMARY)
-    }
+    private fun ensureRenderSurfaceSize(width: Int, height: Int) {
+        if (customRenderSurfaceSize)
+            return
 
-    /**
-     * Move mpv to an external TextureView owned by the zoom layer. The caller
-     * supplies a media-aspect, original-detail buffer size. The primary TextureView
-     * remains in the hierarchy with its last frame, so the user never sees a blank
-     * frame while mpv renders the first zoom-layer frame.
-     */
-    fun useExternalRenderSurface(texture: SurfaceTexture, width: Int, height: Int): Boolean {
-        customRenderSurfaceSize = true
-        return attachRenderSurface(
-            texture,
-            width.coerceAtLeast(1),
-            height.coerceAtLeast(1),
-            SurfaceOwner.EXTERNAL,
-        )
-    }
-
-    fun detachExternalRenderSurface(texture: SurfaceTexture) {
-        if (currentSurfaceOwner == SurfaceOwner.EXTERNAL && currentTexture === texture)
-            detachCurrentRenderSurface()
+        renderSurfaceWidth = width.coerceAtLeast(1)
+        renderSurfaceHeight = height.coerceAtLeast(1)
     }
 
     private fun applyRenderSurfaceSize() {
-        val texture = currentTexture ?: return
+        val texture = attachedTexture ?: return
         if (renderSurfaceWidth <= 0 || renderSurfaceHeight <= 0)
             return
 
@@ -193,37 +150,19 @@ abstract class BaseMPVView(context: Context, attrs: AttributeSet) : TextureView(
         MPVLib.setPropertyString("android-surface-size", "${renderSurfaceWidth}x${renderSurfaceHeight}")
     }
 
-    private fun attachRenderSurface(
-        texture: SurfaceTexture,
-        surfaceWidth: Int,
-        surfaceHeight: Int,
-        owner: SurfaceOwner,
-    ): Boolean {
-        val safeWidth = surfaceWidth.coerceAtLeast(1)
-        val safeHeight = surfaceHeight.coerceAtLeast(1)
+    private fun attachSurfaceTexture(texture: SurfaceTexture, width: Int, height: Int) {
+        if (attachedSurface != null)
+            return
 
-        if (currentTexture === texture && currentSurfaceOwner == owner) {
-            renderSurfaceWidth = safeWidth
-            renderSurfaceHeight = safeHeight
-            applyRenderSurfaceSize()
-            return true
-        }
+        attachedTexture = texture
+        ensureRenderSurfaceSize(width, height)
+        texture.setDefaultBufferSize(renderSurfaceWidth, renderSurfaceHeight)
 
-        texture.setDefaultBufferSize(safeWidth, safeHeight)
-        val newSurface = Surface(texture)
-        val oldSurface = currentSurface
-        val hadSurface = oldSurface != null
+        Log.w(TAG, "attaching texture surface ${renderSurfaceWidth}x${renderSurfaceHeight}")
+        val surface = Surface(texture)
+        attachedSurface = surface
 
-        currentTexture = texture
-        currentSurface = newSurface
-        currentSurfaceOwner = owner
-        renderSurfaceWidth = safeWidth
-        renderSurfaceHeight = safeHeight
-
-        Log.w(TAG, "attaching ${owner.name.lowercase()} texture surface ${renderSurfaceWidth}x${renderSurfaceHeight}")
-        MPVLib.attachSurface(newSurface)
-        oldSurface?.release()
-
+        MPVLib.attachSurface(surface)
         MPVLib.setPropertyString("android-surface-size", "${renderSurfaceWidth}x${renderSurfaceHeight}")
         // This forces mpv to render subs/osd/whatever into our surface even if it would ordinarily not
         MPVLib.setOptionString("force-window", "yes")
@@ -231,18 +170,14 @@ abstract class BaseMPVView(context: Context, attrs: AttributeSet) : TextureView(
         if (filePath != null) {
             MPVLib.command(arrayOf("loadfile", filePath as String))
             filePath = null
-        } else if (!hadSurface) {
-            // We disable video output when the context disappears, enable it back.
-            // During zoom we only switch mpv's wid between two already-live
-            // TextureViews, so avoid forcing a VO reinit on every zoom transition.
+        } else {
+            // We disable video output when the context disappears, enable it back
             MPVLib.setPropertyString("vo", voInUse)
         }
-
-        return true
     }
 
-    private fun detachCurrentRenderSurface() {
-        val surface = currentSurface ?: return
+    private fun detachSurfaceTexture() {
+        val surface = attachedSurface ?: return
 
         Log.w(TAG, "detaching texture surface")
         MPVLib.setPropertyString("vo", "null")
@@ -253,42 +188,27 @@ abstract class BaseMPVView(context: Context, attrs: AttributeSet) : TextureView(
         // setting a property will wait for VO deinit.
         MPVLib.detachSurface()
         surface.release()
-        currentSurface = null
-        currentTexture = null
-        currentSurfaceOwner = SurfaceOwner.NONE
+        attachedSurface = null
+        attachedTexture = null
     }
 
     // Texture callbacks
 
     override fun onSurfaceTextureAvailable(surface: SurfaceTexture, width: Int, height: Int) {
-        primaryTexture = surface
-        usePrimaryRenderSurface()
+        attachSurfaceTexture(surface, width, height)
     }
 
     override fun onSurfaceTextureSizeChanged(surface: SurfaceTexture, width: Int, height: Int) {
-        if (primaryTexture !== surface)
-            primaryTexture = surface
-
-        if (currentSurfaceOwner == SurfaceOwner.PRIMARY && currentTexture === surface) {
-            customRenderSurfaceSize = false
-            renderSurfaceWidth = width.coerceAtLeast(1)
-            renderSurfaceHeight = height.coerceAtLeast(1)
-            applyRenderSurfaceSize()
-        }
+        ensureRenderSurfaceSize(width, height)
+        applyRenderSurfaceSize()
     }
 
     override fun onSurfaceTextureDestroyed(surface: SurfaceTexture): Boolean {
-        if (currentSurfaceOwner == SurfaceOwner.PRIMARY && currentTexture === surface)
-            detachCurrentRenderSurface()
-        if (primaryTexture === surface)
-            primaryTexture = null
+        detachSurfaceTexture()
         return true
     }
 
-    override fun onSurfaceTextureUpdated(surface: SurfaceTexture) {
-        if (currentSurfaceOwner == SurfaceOwner.PRIMARY && currentTexture === surface)
-            onPrimaryFrameRendered?.invoke()
-    }
+    override fun onSurfaceTextureUpdated(surface: SurfaceTexture) = Unit
 
     companion object {
         private const val TAG = "mpv"
