@@ -1,7 +1,6 @@
 package `is`.xyz.mpv
 
 import android.content.Context
-import android.graphics.Color
 import android.graphics.SurfaceTexture
 import android.util.AttributeSet
 import android.util.Log
@@ -132,55 +131,6 @@ abstract class BaseMPVView(context: Context, attrs: AttributeSet) : TextureView(
         renderSurfaceWidth = safeWidth
         renderSurfaceHeight = safeHeight
         applyRenderSurfaceSize()
-    }
-
-    /**
-     * Drop any custom zoom buffer state left by the previous file.
-     *
-     * TextureView/SurfaceTexture and mpv's GPU VO can otherwise keep the last
-     * buffer size/contents alive across file boundaries. Reopening the same
-     * still image may then show one stale frame with the previous media-aspect
-     * geometry before mpv uploads the new frame. Reset the buffer size first and,
-     * when requested, detach/reattach the VO surface so the old GPU-backed
-     * buffers are not reused by the next file.
-     */
-    fun discardRenderSurfaceState(recreateVoSurface: Boolean) {
-        customRenderSurfaceSize = false
-        renderSurfaceWidth = width.coerceAtLeast(1)
-        renderSurfaceHeight = height.coerceAtLeast(1)
-
-        val texture = attachedTexture
-        if (texture != null) {
-            texture.setDefaultBufferSize(renderSurfaceWidth, renderSurfaceHeight)
-            MPVLib.setPropertyString("android-surface-size", "${renderSurfaceWidth}x${renderSurfaceHeight}")
-        }
-
-        if (!recreateVoSurface || texture == null || attachedSurface == null)
-            return
-
-        // Keep TextureView itself alive, but force mpv to drop the Surface/VO-side
-        // resources tied to the old file. attachSurfaceTexture() will create a new
-        // Surface wrapper for the same TextureView texture.
-        detachSurfaceTexture()
-        clearSurfaceTextureBuffer(texture)
-        if (isAvailable)
-            attachSurfaceTexture(texture, width, height)
-    }
-
-    private fun clearSurfaceTextureBuffer(texture: SurfaceTexture) {
-        val surface = Surface(texture)
-        try {
-            val canvas = surface.lockCanvas(null)
-            try {
-                canvas.drawColor(Color.BLACK)
-            } finally {
-                surface.unlockCanvasAndPost(canvas)
-            }
-        } catch (e: Throwable) {
-            Log.w(TAG, "failed to clear texture buffer", e)
-        } finally {
-            surface.release()
-        }
     }
 
     private fun ensureRenderSurfaceSize(width: Int, height: Int) {

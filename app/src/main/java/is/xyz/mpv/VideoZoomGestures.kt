@@ -20,10 +20,13 @@ import kotlin.math.min
  *  - Unzoomed view uses a display-sized mpv-rendered compact surface, so mpv,
  *    not Android's TextureView compositor, performs the huge downscale. This
  *    avoids moire / false-color artifacts on high-frequency scans at 720p.
- *  - The visual geometry is always the same media-aspect fit both before zoom
- *    and while zoomed. At normal size it uses only a display-sized compact
- *    buffer; when the user starts zooming it upgrades the same geometry to an
- *    original-detail buffer.
+ *  - After the first mpv frame is ready, the unzoomed view is prepared with the
+ *    same media-aspect fit that will be used while zoomed. At normal size it
+ *    uses only a display-sized compact buffer; when the user starts zooming it
+ *    upgrades the same geometry to an original-detail buffer.
+ *  - New-file and window-exit transitions are forced back to the plain mpv/base
+ *    surface so Android never animates a transformed TextureView while entering
+ *    or leaving the player.
  *  - Because the geometry does not switch at zoom start/end, Android never shows
  *    the one-frame shrink/stretch tear. Because the zoom buffer has no oversized
  *    black bars, it keeps full source detail in both matching and opposite
@@ -77,6 +80,11 @@ internal class VideoZoomGestures(
 
     private var renderSurfaceMode = RenderSurfaceMode.BASE
 
+    // Keep the startup/exit window transitions on the plain mpv surface. Once
+    // MPVActivity has a stable first frame hidden behind the startup preview, it
+    // enables the compact normal surface so zoom can start/stop without a tear.
+    private var normalCompactSurfacePrepared = false
+
     // When a pinch returns close enough to normal size, finish it through the
     // same delayed reset path as double-tap. Calling reset() directly from
     // onScaleEnd still sees ScaleGestureDetector as in-progress on some devices,
@@ -103,9 +111,11 @@ internal class VideoZoomGestures(
                 canBeTap = false
 
                 // Switch to the original-detail buffer before the first visible zoom step.
-                // This keeps early zoom stages sharp without forcing Android to downscale
-                // the original-size texture while the image is still unzoomed.
+                // If the first-frame preparation was skipped (for example, a remote file
+                // without startup preview), arm the compact normal geometry now as a fallback.
+                normalCompactSurfacePrepared = true
                 updateRenderSurfaceForCurrentState(force = true)
+                applyToView()
 
                 resetPanFilters(detector.focusX, detector.focusY, SystemClock.uptimeMillis())
                 return true
@@ -198,27 +208,44 @@ internal class VideoZoomGestures(
     }
 
     fun reset() {
-        resetGestureState()
+        resetTransformState()
 
-        // Keep v4's no-tear behavior: normal size uses the same media-aspect
-        // geometry as the zoom surface, but with only display-sized backing
-        // buffers. This avoids a geometry switch when zoom starts.
+        // Critical for scan quality: after returning to normal size, do not keep
+        // the original-resolution texture and let Android minify it. Return to
+        // the prepared compact normal surface so the next zoom starts from the
+        // same geometry, without a start/end tear.
         updateRenderSurfaceForCurrentState(force = true)
         applyToView()
     }
 
-    fun discardStateAfterFileExit(recreateVoSurface: Boolean) {
-        resetGestureState()
+    fun resetForNewFile() {
+        resetTransformState()
         videoAspect = 0.0
         videoPixelWidth = 0
         videoPixelHeight = 0
-        renderSurfaceMode = RenderSurfaceMode.BASE
-
-        renderTarget?.discardRenderSurfaceState(recreateVoSurface)
+        normalCompactSurfacePrepared = false
+        requestBaseRenderSurfaceSize(force = true)
         applyToView()
     }
 
-    private fun resetGestureState() {
+    fun prepareForVisibleMedia() {
+        if (normalCompactSurfacePrepared)
+            return
+
+        normalCompactSurfacePrepared = true
+        updateRenderSurfaceForCurrentState(force = true)
+        applyToView()
+    }
+
+    fun prepareForWindowExit() {
+        resetTransformState()
+        normalCompactSurfacePrepared = false
+        target.alpha = 0f
+        requestBaseRenderSurfaceSize(force = true)
+        applyToView()
+    }
+
+    private fun resetTransformState() {
         if (applyScheduled) {
             choreographer.removeFrameCallback(frameCallback)
             applyScheduled = false
@@ -233,6 +260,7 @@ internal class VideoZoomGestures(
         lastTapTime = 0L
         pendingPinchDoubleTapReset = false
         resetPanFilters(0f, 0f, SystemClock.uptimeMillis())
+        target.alpha = 1f
     }
 
     private fun resetLikeDoubleTapAfterPinch() {
@@ -549,8 +577,10 @@ internal class VideoZoomGestures(
         // the on-screen rectangle, so there is no transient aspect jump.
         if (zooming)
             requestMediaAspectOriginalRenderSurfaceSize(force)
-        else
+        else if (normalCompactSurfacePrepared)
             requestMediaAspectBaseRenderSurfaceSize(force)
+        else
+            requestBaseRenderSurfaceSize(force)
     }
 
     private fun requestBaseRenderSurfaceSize(force: Boolean) {

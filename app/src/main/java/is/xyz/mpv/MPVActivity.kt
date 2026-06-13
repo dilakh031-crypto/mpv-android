@@ -657,6 +657,40 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
         startupPreviewBitmap = null
     }
 
+    private fun prepareZoomSurfaceAndHideStartupPreview() {
+        if (::zoomGestures.isInitialized) {
+            // Property observers can arrive after FILE_LOADED/VIDEO_RECONFIG on some
+            // devices. Pull the current mpv dimensions here so the compact surface is
+            // prepared while the startup preview is still covering the player.
+            try { zoomGestures.setVideoAspect(player.getVideoAspect()) } catch (_: Throwable) {}
+            try { zoomGestures.setVideoPixelSize(player.getVideoPixelSize()) } catch (_: Throwable) {}
+            zoomGestures.prepareForVisibleMedia()
+        }
+
+        if (startupPreviewOverlay == null)
+            return
+
+        // Keep the preview above the player until the compact no-tear surface
+        // has had a couple of vsyncs to take effect. Otherwise Android can show
+        // the old TextureView buffer with the new transform for one frame while entering.
+        ViewCompat.postOnAnimation(binding.player) {
+            ViewCompat.postOnAnimation(binding.player) {
+                hideStartupPreview()
+            }
+        }
+    }
+
+    private fun prepareZoomSurfaceForWindowExit() {
+        if (!::zoomGestures.isInitialized || !::binding.isInitialized)
+            return
+
+        try {
+            zoomGestures.prepareForWindowExit()
+        } catch (_: Throwable) {
+            // ignore; finish must continue
+        }
+    }
+
     private fun finishWithResult(code: Int, includeTimePos: Boolean = false) {
         // Refer to http://mpv-android.github.io/mpv-android/intent.html
         // FIXME: should track end-file events to accurately report OK vs CANCELED
@@ -671,6 +705,11 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
             result.putExtra("duration", psc.duration.toInt())
         }
         setResult(code, result)
+
+        // Avoid letting Android's activity/window transition animate a transformed
+        // TextureView. The player is about to close, so return it to the plain
+        // mpv surface before finish/rotation starts.
+        prepareZoomSurfaceForWindowExit()
 
         // Restore the orientation we entered with. This also bypasses the system auto-rotate lock,
         // so the next activity does not briefly appear in the wrong orientation.
@@ -754,13 +793,6 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
         }
     }
 
-    private fun discardZoomSurfaceStateAfterFileExit(recreateVoSurface: Boolean = true) {
-        if (!::zoomGestures.isInitialized)
-            return
-
-        zoomGestures.discardStateAfterFileExit(recreateVoSurface)
-    }
-
     private fun updateAudioPresence() {
         val haveAudio = MPVLib.getPropertyBoolean("current-tracks/audio/selected")
         if (haveAudio == null) {
@@ -829,7 +861,6 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
         cancelPendingTapToggle()
         if (isFinishing) {
             savePosition()
-            discardZoomSurfaceStateAfterFileExit(recreateVoSurface = true)
             // tell mpv to shut down so that any other property changes or such are ignored,
             // preventing useless busywork
             MPVLib.command(arrayOf("stop"))
@@ -3271,7 +3302,6 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
         if (eventId == MpvEvent.MPV_EVENT_END_FILE) {
             psc.eof()
             updateMediaSession()
-            eventUiHandler.post { discardZoomSurfaceStateAfterFileExit(recreateVoSurface = true) }
         }
 
         if (eventId == MpvEvent.MPV_EVENT_SHUTDOWN)
@@ -3288,13 +3318,11 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
         }
 
         if (eventId == MpvEvent.MPV_EVENT_VIDEO_RECONFIG || eventId == MpvEvent.MPV_EVENT_FILE_LOADED) {
-            eventUiHandler.post { hideStartupPreview() }
+            eventUiHandler.post { prepareZoomSurfaceAndHideStartupPreview() }
         }
 
         if (eventId == MpvEvent.MPV_EVENT_START_FILE) {
-            // Reset any view-level zoom/pan and stale render-surface state when a new file starts.
-            // END_FILE normally does this already, but START_FILE is a second guard for replace/playlist paths.
-            eventUiHandler.post { discardZoomSurfaceStateAfterFileExit(recreateVoSurface = false) }
+            // Reset any view-level zoom/pan when a new file starts.
 
             // Apply orientation as early as possible for playlist items, so we don't show the wrong orientation first.
             // Must run on the UI thread.
@@ -3303,6 +3331,7 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
                 if (p != null) eventUiHandler.post { try { applyOrientationFromMetadata(p) } catch (_: Throwable) {} }
             }
 
+            zoomGestures.resetForNewFile()
             try {
                 MPVLib.setPropertyDouble("video-zoom", 0.0)
                 MPVLib.setPropertyDouble("video-pan-x", 0.0)
