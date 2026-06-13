@@ -157,7 +157,6 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
     // Optional startup preview to avoid a brief black frame while mpv starts
     private var startupPreviewOverlay: ImageView? = null
     private var startupPreviewBitmap: Bitmap? = null
-    private var startupPreviewHideSerial = 0
 
     private val psc = Utils.PlaybackStateCache()
     private var mediaSession: MediaSessionCompat? = null
@@ -346,8 +345,9 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
         }
 
         // NOTE: touch events must come from an untransformed overlay view (gestureLayer).
-        // The player view is transformed for zoom/pan, so attaching gestures directly to it
-        // would inverse-transform MotionEvents and create feedback/jitter.
+        // The high-resolution zoom layer is transformed for zoom/pan, so attaching
+        // gestures directly to a transformed video view would inverse-transform
+        // MotionEvents and create feedback/jitter.
         binding.gestureLayer.setOnTouchListener { _, e ->
             if (lockedUI)
                 return@setOnTouchListener false
@@ -406,7 +406,7 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
             // Prepare binding/gestures early so onConfigurationChanged is safe even if we change orientation immediately.
             binding = PlayerBinding.inflate(layoutInflater)
             gestures = TouchGestures(this)
-            zoomGestures = VideoZoomGestures(binding.player)
+            zoomGestures = VideoZoomGestures(binding.player, binding.zoomPlayer)
 
             // Do these here and not in MainActivity because mpv can be launched from a file browser.
             Utils.copyAssets(this)
@@ -598,12 +598,12 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
             setBackgroundColor(Color.BLACK)
         }
 
-        // Insert above the player view but below gesture/controls layers.
-        // Layout order in player.xml: player(0), gestureLayer(1), outside(2).
+        // Insert above the normal player view but below the gesture/controls layers.
+        // The zoom layer is transparent until pinch zoom starts, so this still
+        // covers the startup player frame without blocking touch/UI overlays.
         (binding.root as? ViewGroup)?.addView(overlay, 1)
         refreshPlayerOverlay()
 
-        startupPreviewHideSerial += 1
         startupPreviewOverlay = overlay
 
         Thread {
@@ -647,54 +647,8 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
         }.start()
     }
 
-    private fun hideStartupPreviewWhenStable() {
-        if (startupPreviewOverlay == null)
-            return
-
-        val serial = ++startupPreviewHideSerial
-        var sawTextureFrame = false
-        var minDelayPassed = false
-
-        fun hideIfReady(force: Boolean = false) {
-            if (serial != startupPreviewHideSerial)
-                return
-            if (isFinishing || isDestroyed)
-                return
-            if (!force && !(sawTextureFrame && minDelayPassed))
-                return
-            hideStartupPreviewNow(serial)
-        }
-
-        // FILE_LOADED / VIDEO_RECONFIG can arrive before TextureView has
-        // presented the final correctly-sized frame. Keep the preview covering
-        // the player until at least one surface update has happened and a small
-        // minimum delay has elapsed. This hides the one-frame startup aspect/size
-        // tear without changing the zoom handoff design.
-        if (::binding.isInitialized) {
-            binding.player.runOnNextSurfaceTextureUpdate {
-                eventUiHandler.post {
-                    sawTextureFrame = true
-                    hideIfReady()
-                }
-            }
-        }
-
-        eventUiHandler.postDelayed({
-            minDelayPassed = true
-            hideIfReady()
-        }, STARTUP_PREVIEW_MIN_STABLE_MS)
-
-        // Static images may not always produce another TextureView update after
-        // the event was delivered. Never let the preview get stuck forever.
-        eventUiHandler.postDelayed({ hideIfReady(force = true) }, STARTUP_PREVIEW_MAX_HOLD_MS)
-    }
-
-    private fun hideStartupPreviewNow(serial: Int? = null) {
-        if (serial != null && serial != startupPreviewHideSerial)
-            return
-
+    private fun hideStartupPreview() {
         val overlay = startupPreviewOverlay ?: return
-        startupPreviewHideSerial += 1
         (overlay.parent as? ViewGroup)?.removeView(overlay)
         startupPreviewOverlay = null
         refreshPlayerOverlay()
@@ -3210,6 +3164,7 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
         when (property) {
             "time-pos" -> updatePlaybackPos(psc.positionSec)
             "playlist-pos", "playlist-count" -> updatePlaylistButtons()
+            "video-params/w", "video-params/h" -> zoomGestures.setVideoPixelSize(player.getVideoPixelSize())
         }
     }
 
@@ -3221,6 +3176,7 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
                 updateOrientation()
                 updatePiPParams()
                 zoomGestures.setVideoAspect(player.getVideoAspect())
+                zoomGestures.setVideoPixelSize(player.getVideoPixelSize())
             }
         }
     }
@@ -3325,7 +3281,7 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
         }
 
         if (eventId == MpvEvent.MPV_EVENT_VIDEO_RECONFIG || eventId == MpvEvent.MPV_EVENT_FILE_LOADED) {
-            eventUiHandler.post { hideStartupPreviewWhenStable() }
+            eventUiHandler.post { hideStartupPreview() }
         }
 
         if (eventId == MpvEvent.MPV_EVENT_START_FILE) {
@@ -3590,8 +3546,6 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
 
     companion object {
         private const val TAG = "mpv"
-        private const val STARTUP_PREVIEW_MIN_STABLE_MS = 90L
-        private const val STARTUP_PREVIEW_MAX_HOLD_MS = 420L
         // how long should controls be displayed on screen (ms)
         private const val CONTROLS_DISPLAY_TIMEOUT = 1500L
         // Controls fade-in/out durations (ms). Keep them very fast but non-zero to avoid a harsh pop.
