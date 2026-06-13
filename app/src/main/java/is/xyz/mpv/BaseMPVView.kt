@@ -97,46 +97,13 @@ abstract class BaseMPVView(context: Context, attrs: AttributeSet) : TextureView(
 
     private var renderSurfaceWidth = 0
     private var renderSurfaceHeight = 0
-    private var customRenderSurfaceSize = false
+    private val pendingFrameUpdateCallbacks = mutableListOf<() -> Unit>()
 
-    /**
-     * Set the real SurfaceTexture buffer size used by mpv without changing the
-     * TextureView's on-screen size.
-     *
-     * This intentionally accepts the requested size as-is. The caller decides the
-     * size, so high-resolution media can be rendered at its original resolution
-     * instead of being reduced to the display resolution before Android zooms it.
-     */
-    fun setRenderSurfaceSize(width: Int, height: Int) {
-        val safeWidth = width.coerceAtLeast(1)
-        val safeHeight = height.coerceAtLeast(1)
-        customRenderSurfaceSize = true
-
-        if (safeWidth == renderSurfaceWidth && safeHeight == renderSurfaceHeight)
-            return
-
-        renderSurfaceWidth = safeWidth
-        renderSurfaceHeight = safeHeight
-        applyRenderSurfaceSize()
-    }
-
-    fun resetRenderSurfaceSize() {
-        customRenderSurfaceSize = false
-        val safeWidth = width.coerceAtLeast(1)
-        val safeHeight = height.coerceAtLeast(1)
-
-        if (safeWidth == renderSurfaceWidth && safeHeight == renderSurfaceHeight)
-            return
-
-        renderSurfaceWidth = safeWidth
-        renderSurfaceHeight = safeHeight
-        applyRenderSurfaceSize()
+    fun runOnNextSurfaceTextureUpdate(callback: () -> Unit) {
+        pendingFrameUpdateCallbacks.add(callback)
     }
 
     private fun ensureRenderSurfaceSize(width: Int, height: Int) {
-        if (customRenderSurfaceSize)
-            return
-
         renderSurfaceWidth = width.coerceAtLeast(1)
         renderSurfaceHeight = height.coerceAtLeast(1)
     }
@@ -190,6 +157,7 @@ abstract class BaseMPVView(context: Context, attrs: AttributeSet) : TextureView(
         surface.release()
         attachedSurface = null
         attachedTexture = null
+        pendingFrameUpdateCallbacks.clear()
     }
 
     // Texture callbacks
@@ -208,7 +176,15 @@ abstract class BaseMPVView(context: Context, attrs: AttributeSet) : TextureView(
         return true
     }
 
-    override fun onSurfaceTextureUpdated(surface: SurfaceTexture) = Unit
+    override fun onSurfaceTextureUpdated(surface: SurfaceTexture) {
+        if (pendingFrameUpdateCallbacks.isEmpty())
+            return
+
+        val callbacks = pendingFrameUpdateCallbacks.toTypedArray()
+        pendingFrameUpdateCallbacks.clear()
+        for (callback in callbacks)
+            callback()
+    }
 
     companion object {
         private const val TAG = "mpv"
