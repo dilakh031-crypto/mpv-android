@@ -11,6 +11,20 @@
         android:layout_height="match_parent" />
 
     <!--
+        High-resolution zoom layer.
+
+        It stays transparent until pinch zoom starts. mpv normally renders to
+        @id/player so mpv scalers/filters remain responsible at base scale.
+        During zoom, mpv is temporarily moved to this TextureView with a
+        media-aspect, source-detail buffer; Android then scales/pans this layer.
+    -->
+    <TextureView
+        android:id="@+id/zoomPlayer"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:alpha="0" />
+
+    <!--
         Gesture layer.
 
         IMPORTANT: This view must not be transformed.
