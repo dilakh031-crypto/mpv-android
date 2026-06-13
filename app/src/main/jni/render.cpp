@@ -16,11 +16,6 @@ static jobject surface;
 jni_func(void, attachSurface, jobject surface_) {
     CHECK_MPV_INIT();
 
-    if (surface) {
-        env->DeleteGlobalRef(surface);
-        surface = NULL;
-    }
-
     surface = env->NewGlobalRef(surface_);
     if (!surface)
         die("invalid surface provided");
@@ -38,8 +33,6 @@ jni_func(void, detachSurface) {
     if (result < 0)
          ALOGE("mpv_set_option(wid) returned error %s", mpv_error_string(result));
 
-    if (surface) {
-        env->DeleteGlobalRef(surface);
-        surface = NULL;
-    }
+    env->DeleteGlobalRef(surface);
+    surface = NULL;
 }
