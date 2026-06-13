@@ -9,9 +9,9 @@ import android.view.ViewConfiguration
 import kotlin.math.PI
 import kotlin.math.abs
 import kotlin.math.hypot
+import kotlin.math.ceil
 import kotlin.math.max
 import kotlin.math.min
-import kotlin.math.roundToInt
 
 /**
  * Pinch-to-zoom + pan for mpv output.
@@ -22,10 +22,13 @@ import kotlin.math.roundToInt
  *    false-color artifacts on high-frequency scans at 720p.
  *  - As soon as the user starts zooming, the render surface switches to an
  *    original-detail buffer so zoom keeps full source detail.
- *  - If the phone orientation is opposite to the media orientation, we keep a
- *    media-aspect render surface and compensate with the normal View transform.
- *    This avoids the oversized black-bar buffer that loses zoom quality without
- *    using TextureView#setTransform, so playback does not tear at zoom/reset.
+ *  - During zoom we keep a media-aspect render surface and compensate with the
+ *    normal View transform. This avoids allocating a huge view-aspect buffer
+ *    full of black bars for very wide/tall images, which could silently lose
+ *    detail on some Android/GPU paths.
+ *  - If the phone orientation is opposite to the media orientation, that same
+ *    media-aspect surface is kept even at normal size to preserve the existing
+ *    no-tear orientation workaround.
  *
  * We do not use mpv video-pan/video-zoom for finger movement.
  */
@@ -104,6 +107,7 @@ internal class VideoZoomGestures(
                 // This keeps early zoom stages sharp without forcing Android to downscale
                 // the original-size texture while the image is still unzoomed.
                 updateRenderSurfaceForCurrentState(force = true)
+                applyToView()
 
                 resetPanFilters(detector.focusX, detector.focusY, SystemClock.uptimeMillis())
                 return true
@@ -527,9 +531,11 @@ internal class VideoZoomGestures(
     }
 
     private fun updateRenderSurfaceForCurrentState(force: Boolean) {
+        val zoomNeedsOriginalDetail = isZoomed() || scaleDetector.isInProgress
         when {
-            usesMediaAspectRenderSurface() -> requestMediaAspectRenderSurfaceSize(force)
-            isZoomed() || scaleDetector.isInProgress -> requestViewAspectOriginalRenderSurfaceSize(force)
+            usesPersistentMediaAspectRenderSurface() || zoomNeedsOriginalDetail -> {
+                requestMediaAspectRenderSurfaceSize(force)
+            }
             else -> requestBaseRenderSurfaceSize(force)
         }
     }
@@ -564,12 +570,12 @@ internal class VideoZoomGestures(
         // Same-orientation path: keep the buffer aspect identical to the on-screen
         // view, but choose its scale so the video content rect inside it is
         // rendered at the original source resolution.
-        val scaleX = videoPixelWidth.toFloat() / c.w
-        val scaleY = videoPixelHeight.toFloat() / c.h
-        val bufferScale = max(scaleX, scaleY).coerceAtLeast(1f)
+        val scaleX = videoPixelWidth.toDouble() / c.w.toDouble()
+        val scaleY = videoPixelHeight.toDouble() / c.h.toDouble()
+        val bufferScale = max(scaleX, scaleY).coerceAtLeast(1.0)
 
-        val bufferWidth = (viewWidth * bufferScale).roundToInt().coerceAtLeast(1)
-        val bufferHeight = (viewHeight * bufferScale).roundToInt().coerceAtLeast(1)
+        val bufferWidth = ceilToIntAtLeastOne(viewWidth.toDouble() * bufferScale)
+        val bufferHeight = ceilToIntAtLeastOne(viewHeight.toDouble() * bufferScale)
         player.setRenderSurfaceSize(bufferWidth, bufferHeight)
         renderSurfaceMode = RenderSurfaceMode.VIEW_ASPECT_ORIGINAL
     }
@@ -597,17 +603,17 @@ internal class VideoZoomGestures(
         // 1920x3413 for a 16:9 video on a portrait screen, which can lose detail
         // or hit GPU limits. Use a media-aspect buffer instead; applyToView()
         // places it into the normal content rect with View scale/translation.
-        val scaleX = videoPixelWidth.toFloat() / c.w
-        val scaleY = videoPixelHeight.toFloat() / c.h
-        val bufferScale = max(scaleX, scaleY).coerceAtLeast(1f)
+        val scaleX = videoPixelWidth.toDouble() / c.w.toDouble()
+        val scaleY = videoPixelHeight.toDouble() / c.h.toDouble()
+        val bufferScale = max(scaleX, scaleY).coerceAtLeast(1.0)
 
-        val bufferWidth = (c.w * bufferScale).roundToInt().coerceAtLeast(1)
-        val bufferHeight = (c.h * bufferScale).roundToInt().coerceAtLeast(1)
+        val bufferWidth = ceilToIntAtLeastOne(c.w.toDouble() * bufferScale)
+        val bufferHeight = ceilToIntAtLeastOne(c.h.toDouble() * bufferScale)
         player.setRenderSurfaceSize(bufferWidth, bufferHeight)
         renderSurfaceMode = RenderSurfaceMode.MEDIA_ASPECT_ORIGINAL
     }
 
-    private fun usesMediaAspectRenderSurface(): Boolean {
+    private fun usesPersistentMediaAspectRenderSurface(): Boolean {
         if (viewWidth <= 1f || viewHeight <= 1f || videoAspect <= 0.001)
             return false
 
@@ -623,6 +629,13 @@ internal class VideoZoomGestures(
             return false
 
         return (mediaIsLandscape && viewIsPortrait) || (mediaIsPortrait && viewIsLandscape)
+    }
+
+    private fun ceilToIntAtLeastOne(value: Double): Int {
+        return ceil(value)
+            .coerceAtLeast(1.0)
+            .coerceAtMost(Int.MAX_VALUE.toDouble())
+            .toInt()
     }
 
     private fun filterParamsForCurrentScale(): FilterParams {
