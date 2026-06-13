@@ -198,6 +198,27 @@ internal class VideoZoomGestures(
     }
 
     fun reset() {
+        resetGestureState()
+
+        // Keep v4's no-tear behavior: normal size uses the same media-aspect
+        // geometry as the zoom surface, but with only display-sized backing
+        // buffers. This avoids a geometry switch when zoom starts.
+        updateRenderSurfaceForCurrentState(force = true)
+        applyToView()
+    }
+
+    fun discardStateAfterFileExit(recreateVoSurface: Boolean) {
+        resetGestureState()
+        videoAspect = 0.0
+        videoPixelWidth = 0
+        videoPixelHeight = 0
+        renderSurfaceMode = RenderSurfaceMode.BASE
+
+        renderTarget?.discardRenderSurfaceState(recreateVoSurface)
+        applyToView()
+    }
+
+    private fun resetGestureState() {
         if (applyScheduled) {
             choreographer.removeFrameCallback(frameCallback)
             applyScheduled = false
@@ -212,14 +233,6 @@ internal class VideoZoomGestures(
         lastTapTime = 0L
         pendingPinchDoubleTapReset = false
         resetPanFilters(0f, 0f, SystemClock.uptimeMillis())
-
-        // Critical for scan quality: after returning to normal size, do not keep
-        // the original-resolution texture and let Android minify it. Let mpv draw
-        // directly to the view-sized surface instead. The only exception is the
-        // opposite-orientation case: there we keep a media-aspect surface so zoom
-        // can start/stop without a surface-aspect switch or a one-frame tear.
-        updateRenderSurfaceForCurrentState(force = true)
-        applyToView()
     }
 
     private fun resetLikeDoubleTapAfterPinch() {

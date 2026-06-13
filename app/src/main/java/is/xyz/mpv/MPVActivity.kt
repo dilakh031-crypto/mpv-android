@@ -754,6 +754,13 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
         }
     }
 
+    private fun discardZoomSurfaceStateAfterFileExit(recreateVoSurface: Boolean = true) {
+        if (!::zoomGestures.isInitialized)
+            return
+
+        zoomGestures.discardStateAfterFileExit(recreateVoSurface)
+    }
+
     private fun updateAudioPresence() {
         val haveAudio = MPVLib.getPropertyBoolean("current-tracks/audio/selected")
         if (haveAudio == null) {
@@ -822,6 +829,7 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
         cancelPendingTapToggle()
         if (isFinishing) {
             savePosition()
+            discardZoomSurfaceStateAfterFileExit(recreateVoSurface = true)
             // tell mpv to shut down so that any other property changes or such are ignored,
             // preventing useless busywork
             MPVLib.command(arrayOf("stop"))
@@ -3263,6 +3271,7 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
         if (eventId == MpvEvent.MPV_EVENT_END_FILE) {
             psc.eof()
             updateMediaSession()
+            eventUiHandler.post { discardZoomSurfaceStateAfterFileExit(recreateVoSurface = true) }
         }
 
         if (eventId == MpvEvent.MPV_EVENT_SHUTDOWN)
@@ -3283,7 +3292,9 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
         }
 
         if (eventId == MpvEvent.MPV_EVENT_START_FILE) {
-            // Reset any view-level zoom/pan when a new file starts.
+            // Reset any view-level zoom/pan and stale render-surface state when a new file starts.
+            // END_FILE normally does this already, but START_FILE is a second guard for replace/playlist paths.
+            eventUiHandler.post { discardZoomSurfaceStateAfterFileExit(recreateVoSurface = false) }
 
             // Apply orientation as early as possible for playlist items, so we don't show the wrong orientation first.
             // Must run on the UI thread.
@@ -3292,7 +3303,6 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
                 if (p != null) eventUiHandler.post { try { applyOrientationFromMetadata(p) } catch (_: Throwable) {} }
             }
 
-            zoomGestures.reset()
             try {
                 MPVLib.setPropertyDouble("video-zoom", 0.0)
                 MPVLib.setPropertyDouble("video-pan-x", 0.0)
