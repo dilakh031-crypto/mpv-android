@@ -8,6 +8,7 @@ import android.view.ScaleGestureDetector
 import android.view.TextureView
 import android.view.View
 import android.view.ViewConfiguration
+import android.widget.ImageView
 import kotlin.math.PI
 import kotlin.math.abs
 import kotlin.math.hypot
@@ -23,15 +24,16 @@ import kotlin.math.ceil
  *    responsible for final screen-sized downscaling and its configured scalers /
  *    filters still apply before zoom.
  *  - During pinch zoom mpv is moved to a second TextureView that uses a
- *    media-aspect, original-detail buffer. The normal player layer stays visible
- *    with its last frame until the zoom layer receives its first frame, so the
- *    user does not see a blank or wrong-aspect transition frame.
+ *    media-aspect, original-detail buffer. A temporary bitmap snapshot covers
+ *    the switch until the destination layer receives its first frame, so the user
+ *    does not see a blank or wrong-aspect transition frame.
  *
  * We do not use mpv video-pan/video-zoom for finger movement.
  */
 internal class VideoZoomGestures(
     private val target: BaseMPVView,
     private val zoomTarget: TextureView? = null,
+    private val transitionSnapshot: ImageView? = null,
 ) {
 
     private var viewWidth = 0f
@@ -83,7 +85,15 @@ internal class VideoZoomGestures(
             if (pendingHideZoomLayerAfterPrimaryFrame) {
                 pendingHideZoomLayerAfterPrimaryFrame = false
                 hideZoomLayer()
+                hideTransitionSnapshot()
             }
+        }
+
+        transitionSnapshot?.apply {
+            scaleType = ImageView.ScaleType.FIT_XY
+            alpha = 0f
+            pivotX = 0f
+            pivotY = 0f
         }
 
         zoomTarget?.apply {
@@ -611,6 +621,9 @@ internal class VideoZoomGestures(
             return
 
         val shouldWaitForPrimaryFrame = zoomTarget != null && (zoomTarget.alpha > 0f || pendingShowZoomLayer)
+        if (shouldWaitForPrimaryFrame)
+            showTransitionSnapshotFrom(zoomTarget ?: target)
+
         pendingShowZoomLayer = false
         renderSurfaceMode = RenderSurfaceMode.PRIMARY
         target.usePrimaryRenderSurface()
@@ -620,16 +633,18 @@ internal class VideoZoomGestures(
             pendingHideZoomLayerAfterPrimaryFrame = true
             // Safety fallback for paused/static outputs that may not report a callback on
             // every device. The primary layer is already reattached; this only prevents
-            // the transparent zoom layer from staying visible forever.
+            // the transition snapshot/zoom layer from staying visible forever.
             target.postDelayed({
                 if (pendingHideZoomLayerAfterPrimaryFrame) {
                     pendingHideZoomLayerAfterPrimaryFrame = false
                     hideZoomLayer()
+                    hideTransitionSnapshot()
                 }
             }, RETURN_TO_PRIMARY_FALLBACK_MS)
         } else {
             pendingHideZoomLayerAfterPrimaryFrame = false
             hideZoomLayer()
+            hideTransitionSnapshot()
         }
     }
 
@@ -657,8 +672,10 @@ internal class VideoZoomGestures(
         val bufferHeight = ceilToIntAtLeastOne(c.h.toDouble() * bufferScale)
 
         pendingHideZoomLayerAfterPrimaryFrame = false
-        if (zoom.alpha <= 0f)
+        if (zoom.alpha <= 0f) {
+            showTransitionSnapshotFrom(target)
             pendingShowZoomLayer = true
+        }
         renderSurfaceMode = RenderSurfaceMode.ZOOM_EXTERNAL
         applyToView()
         target.useExternalRenderSurface(texture, bufferWidth, bufferHeight)
@@ -670,6 +687,7 @@ internal class VideoZoomGestures(
             return
         applyToView()
         zoom.alpha = 1f
+        hideTransitionSnapshot()
     }
 
     private fun hideZoomLayer() {
@@ -682,6 +700,39 @@ internal class VideoZoomGestures(
         zoom.scaleY = 1f
         zoom.translationX = 0f
         zoom.translationY = 0f
+    }
+
+    private fun showTransitionSnapshotFrom(source: TextureView) {
+        val snapshot = transitionSnapshot ?: return
+        if (!source.isAvailable || source.width <= 0 || source.height <= 0)
+            return
+
+        val bitmap = try {
+            source.getBitmap(source.width, source.height)
+        } catch (_: Throwable) {
+            null
+        } ?: return
+
+        snapshot.setImageBitmap(bitmap)
+        snapshot.pivotX = source.pivotX
+        snapshot.pivotY = source.pivotY
+        snapshot.scaleX = source.scaleX
+        snapshot.scaleY = source.scaleY
+        snapshot.translationX = source.translationX
+        snapshot.translationY = source.translationY
+        snapshot.alpha = 1f
+    }
+
+    private fun hideTransitionSnapshot() {
+        val snapshot = transitionSnapshot ?: return
+        snapshot.alpha = 0f
+        snapshot.pivotX = 0f
+        snapshot.pivotY = 0f
+        snapshot.scaleX = 1f
+        snapshot.scaleY = 1f
+        snapshot.translationX = 0f
+        snapshot.translationY = 0f
+        snapshot.setImageDrawable(null)
     }
 
     private fun originalDetailBufferScale(c: ContentRect): Double {
