@@ -189,78 +189,26 @@ internal class VideoZoomGestures(
     }
 
     fun setVideoAspect(aspect: Double?) {
-        setVideoGeometry(
-            aspect = aspect,
-            pixelSize = videoPixelSizeOrNull(),
-            panscanValue = panscan,
-            prepareNormalSurface = false,
-            immediate = false,
-        )
+        videoAspect = aspect ?: 0.0
+        if (isZoomed() || scaleDetector.isInProgress)
+            clampTranslationToVideoContent()
+        updateRenderSurfaceForCurrentState(force = true)
+        scheduleApply()
     }
 
     fun setVideoPixelSize(size: Pair<Int, Int>?) {
-        setVideoGeometry(
-            aspect = videoAspect.takeIf { it > 0.001 },
-            pixelSize = size,
-            panscanValue = panscan,
-            prepareNormalSurface = false,
-            immediate = false,
-        )
+        videoPixelWidth = size?.first ?: 0
+        videoPixelHeight = size?.second ?: 0
+        updateRenderSurfaceForCurrentState(force = true)
+        scheduleApply()
     }
 
     fun setPanscan(value: Double?) {
-        setVideoGeometry(
-            aspect = videoAspect.takeIf { it > 0.001 },
-            pixelSize = videoPixelSizeOrNull(),
-            panscanValue = value,
-            prepareNormalSurface = false,
-            immediate = false,
-        )
-    }
-
-    fun setVideoGeometry(
-        aspect: Double?,
-        pixelSize: Pair<Int, Int>?,
-        panscanValue: Double?,
-        prepareNormalSurface: Boolean = false,
-        immediate: Boolean = false,
-    ) {
-        videoAspect = aspect ?: 0.0
-        videoPixelWidth = pixelSize?.first ?: 0
-        videoPixelHeight = pixelSize?.second ?: 0
-        panscan = panscanValue ?: 0.0
-
-        if (prepareNormalSurface)
-            normalCompactSurfacePrepared = true
-
+        panscan = value ?: 0.0
         if (isZoomed() || scaleDetector.isInProgress)
             clampTranslationToVideoContent()
-
         updateRenderSurfaceForCurrentState(force = true)
-        if (immediate)
-            applyToView()
-        else
-            scheduleApply()
-    }
-
-    fun applyPredictedAspectMenuGeometry(
-        aspect: Double?,
-        pixelSize: Pair<Int, Int>?,
-        panscanValue: Double?,
-    ) {
-        setVideoGeometry(
-            aspect = aspect,
-            pixelSize = pixelSize,
-            panscanValue = panscanValue,
-            prepareNormalSurface = true,
-            immediate = true,
-        )
-    }
-
-    private fun videoPixelSizeOrNull(): Pair<Int, Int>? {
-        if (videoPixelWidth <= 0 || videoPixelHeight <= 0)
-            return null
-        return videoPixelWidth to videoPixelHeight
+        scheduleApply()
     }
 
     fun isZoomed(): Boolean = scale > 1f + EPS
