@@ -56,6 +56,7 @@ import androidx.media.AudioFocusRequestCompat
 import androidx.media.AudioManagerCompat
 import java.io.File
 import java.lang.IllegalArgumentException
+import kotlin.math.abs
 import kotlin.math.roundToInt
 
 typealias ActivityResultCallback = (Int, Intent?) -> Unit
@@ -2607,15 +2608,44 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
         val ratios = resources.getStringArray(R.array.aspect_ratios)
         val names = resources.getStringArray(R.array.aspect_ratio_names)
 
+        fun parseAspectRatio(value: String): Double? {
+            val trimmed = value.trim()
+            if (trimmed.isEmpty() || trimmed == "panscan" || trimmed == "-1" || trimmed.equals("no", true))
+                return null
+
+            val parts = trimmed.split(':', limit = 2)
+            return if (parts.size == 2) {
+                val width = parts[0].toDoubleOrNull()
+                val height = parts[1].toDoubleOrNull()
+                if (width != null && height != null && height != 0.0)
+                    width / height
+                else
+                    null
+            } else {
+                trimmed.toDoubleOrNull()
+            }
+        }
+
+        fun aspectRatioMatches(current: String, ratio: String): Boolean {
+            if (current == ratio)
+                return true
+            val currentValue = parseAspectRatio(current) ?: return false
+            val ratioValue = parseAspectRatio(ratio) ?: return false
+            return abs(currentValue - ratioValue) < 0.001
+        }
+
         val currentPanscan = MPVLib.getPropertyDouble("panscan") ?: 0.0
-        val currentOverride = MPVLib.getPropertyString("video-aspect-override") ?: ""
+        val currentOverride = MPVLib.getPropertyString("video-aspect-override")?.trim() ?: ""
         val panscanIndex = ratios.indexOf("panscan")
+        val originalIndex = ratios.indexOf("-1").takeIf { it >= 0 } ?: 0
         var selectedIndex = if (currentPanscan > 0.0 && panscanIndex >= 0) {
             panscanIndex
         } else {
-            ratios.indexOf(currentOverride)
+            ratios.indexOfFirst { ratio ->
+                ratio != "panscan" && aspectRatioMatches(currentOverride, ratio)
+            }
         }
-        if (selectedIndex < 0) selectedIndex = 0
+        if (selectedIndex < 0) selectedIndex = originalIndex
 
         var handled = false
         val dialog = with(AlertDialog.Builder(this)) {
