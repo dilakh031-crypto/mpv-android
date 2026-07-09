@@ -21,6 +21,7 @@ import android.graphics.drawable.Icon
 import android.graphics.Bitmap
 import android.graphics.Color
 import android.widget.ImageView
+import android.widget.FrameLayout
 import android.util.Log
 import android.media.AudioManager
 import android.media.MediaMetadataRetriever
@@ -158,6 +159,13 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
     // Optional startup preview to avoid a brief black frame while mpv starts
     private var startupPreviewOverlay: ImageView? = null
     private var startupPreviewBitmap: Bitmap? = null
+
+    // Holds the last correct frame while mpv / SurfaceTexture / TextureView geometry
+    // catches up to an aspect or playlist change. This avoids exposing the one-frame
+    // full-screen/wrong-aspect intermediate state on slow, high-resolution media.
+    private var geometryTransitionOverlay: FrameLayout? = null
+    private var geometryTransitionBitmap: Bitmap? = null
+    private var geometryTransitionGeneration = 0
 
     private val psc = Utils.PlaybackStateCache()
     private var mediaSession: MediaSessionCompat? = null
@@ -525,6 +533,8 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
 
         // Best-effort: show a preview frame while mpv starts to avoid a brief black flash.
         try { showStartupPreview(filepath) } catch (_: Throwable) {}
+        // Cover the player until the first correctly-sized TextureView surface has rendered.
+        beginGeometryTransition(snapshot = false)
 
         startPlayback(filepath)
     }
@@ -594,7 +604,7 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.MATCH_PARENT
             )
-            scaleType = ImageView.ScaleType.CENTER_CROP
+            scaleType = ImageView.ScaleType.FIT_CENTER
             setBackgroundColor(Color.BLACK)
         }
 
@@ -658,13 +668,137 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
         startupPreviewBitmap = null
     }
 
-    private fun syncZoomVideoGeometry() {
+    private fun beginGeometryTransition(snapshot: Boolean): Int {
+        if (!::binding.isInitialized)
+            return geometryTransitionGeneration
+
+        val root = binding.root as? ViewGroup ?: return geometryTransitionGeneration
+        geometryTransitionGeneration += 1
+        val generation = geometryTransitionGeneration
+
+        if (geometryTransitionOverlay == null) {
+            val overlay = FrameLayout(this).apply {
+                layoutParams = ViewGroup.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT,
+                    ViewGroup.LayoutParams.MATCH_PARENT,
+                )
+                setBackgroundColor(Color.BLACK)
+            }
+
+            val bmp = if (snapshot) capturePlayerFrame() else null
+            if (bmp != null) {
+                geometryTransitionBitmap = bmp
+                overlay.addView(ImageView(this).apply {
+                    layoutParams = FrameLayout.LayoutParams(
+                        FrameLayout.LayoutParams.MATCH_PARENT,
+                        FrameLayout.LayoutParams.MATCH_PARENT,
+                    )
+                    scaleType = ImageView.ScaleType.FIT_XY
+                    setImageBitmap(bmp)
+
+                    // TextureView.getBitmap() captures the raw texture content before the
+                    // parent View transform used by VideoZoomGestures. Re-apply the same
+                    // transform to freeze exactly what was visible on screen.
+                    pivotX = binding.player.pivotX
+                    pivotY = binding.player.pivotY
+                    scaleX = binding.player.scaleX
+                    scaleY = binding.player.scaleY
+                    translationX = binding.player.translationX
+                    translationY = binding.player.translationY
+                })
+            }
+
+            // Insert directly above the player and below gesture/controls layers.
+            root.addView(overlay, 1)
+            geometryTransitionOverlay = overlay
+            refreshPlayerOverlay()
+        }
+
+        return generation
+    }
+
+    private fun capturePlayerFrame(): Bitmap? {
+        return try {
+            val w = binding.player.width
+            val h = binding.player.height
+            if (!binding.player.isAvailable || w <= 1 || h <= 1)
+                null
+            else
+                binding.player.getBitmap(w, h)
+        } catch (_: Throwable) {
+            null
+        }
+    }
+
+    private fun releaseGeometryTransitionWhenReady(generation: Int = geometryTransitionGeneration) {
+        if (geometryTransitionOverlay == null || generation != geometryTransitionGeneration)
+            return
+
+        waitForSurfaceUpdatesBeforeRelease(generation, GEOMETRY_TRANSITION_SURFACE_UPDATES)
+        eventUiHandler.postDelayed({
+            hideGeometryTransitionOverlay(generation)
+        }, GEOMETRY_TRANSITION_FALLBACK_MS)
+    }
+
+    private fun waitForSurfaceUpdatesBeforeRelease(generation: Int, remaining: Int) {
+        if (geometryTransitionOverlay == null || generation != geometryTransitionGeneration)
+            return
+
+        if (remaining <= 0) {
+            ViewCompat.postOnAnimation(binding.player) {
+                ViewCompat.postOnAnimation(binding.player) {
+                    hideGeometryTransitionOverlay(generation)
+                }
+            }
+            return
+        }
+
+        try {
+            binding.player.runOnNextSurfaceTextureUpdate {
+                eventUiHandler.post {
+                    waitForSurfaceUpdatesBeforeRelease(generation, remaining - 1)
+                }
+            }
+        } catch (_: Throwable) {
+            ViewCompat.postOnAnimation(binding.player) {
+                hideGeometryTransitionOverlay(generation)
+            }
+        }
+    }
+
+    private fun hideGeometryTransitionOverlay(generation: Int = geometryTransitionGeneration) {
+        if (generation != geometryTransitionGeneration)
+            return
+
+        val overlay = geometryTransitionOverlay ?: return
+        (overlay.parent as? ViewGroup)?.removeView(overlay)
+        geometryTransitionOverlay = null
+        refreshPlayerOverlay()
+
+        geometryTransitionBitmap?.let {
+            try { it.recycle() } catch (_: Throwable) {}
+        }
+        geometryTransitionBitmap = null
+    }
+
+    private fun syncZoomVideoGeometry(applyImmediately: Boolean = true) {
         if (!::zoomGestures.isInitialized)
             return
 
-        try { zoomGestures.setVideoAspect(player.getEffectiveVideoAspect()) } catch (_: Throwable) {}
-        try { zoomGestures.setVideoPixelSize(player.getVideoPixelSize()) } catch (_: Throwable) {}
-        try { zoomGestures.setPanscan(player.getPanscan()) } catch (_: Throwable) {}
+        try {
+            zoomGestures.setVideoGeometry(
+                aspect = player.getEffectiveVideoAspect(),
+                size = player.getVideoPixelSize(),
+                panscanValue = player.getPanscan(),
+                applyImmediately = applyImmediately,
+            )
+        } catch (_: Throwable) {}
+    }
+
+    private fun syncZoomVideoGeometryWithTransition(snapshot: Boolean = true) {
+        val transition = beginGeometryTransition(snapshot = snapshot)
+        syncZoomVideoGeometry(applyImmediately = true)
+        releaseGeometryTransitionWhenReady(transition)
     }
 
     private fun prepareZoomSurfaceAndHideStartupPreview() {
@@ -675,6 +809,8 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
             syncZoomVideoGeometry()
             zoomGestures.prepareForVisibleMedia()
         }
+
+        releaseGeometryTransitionWhenReady()
 
         if (startupPreviewOverlay == null)
             return
@@ -2658,14 +2794,40 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
         var handled = false
         val dialog = with(AlertDialog.Builder(this)) {
             setSingleChoiceItems(names, selectedIndex) { _, item ->
-                if (ratios[item] == "panscan") {
-                    MPVLib.setPropertyString("video-aspect-override", "-1")
-                    MPVLib.setPropertyDouble("panscan", 1.0)
-                } else {
-                    MPVLib.setPropertyString("video-aspect-override", ratios[item])
-                    MPVLib.setPropertyDouble("panscan", 0.0)
+                val ratio = ratios[item]
+                val transition = beginGeometryTransition(snapshot = true)
+
+                try {
+                    if (ratio == "panscan") {
+                        zoomGestures.setVideoGeometry(
+                            aspect = player.getVideoAspect(),
+                            size = player.getVideoPixelSize(),
+                            panscanValue = 1.0,
+                            applyImmediately = true,
+                        )
+                        MPVLib.setPropertyString("video-aspect-override", "-1")
+                        MPVLib.setPropertyDouble("panscan", 1.0)
+                    } else {
+                        zoomGestures.setVideoGeometry(
+                            aspect = parseAspectRatio(ratio) ?: player.getVideoAspect(),
+                            size = player.getVideoPixelSize(),
+                            panscanValue = 0.0,
+                            applyImmediately = true,
+                        )
+                        MPVLib.setPropertyString("video-aspect-override", ratio)
+                        MPVLib.setPropertyDouble("panscan", 0.0)
+                    }
+                } catch (_: Throwable) {
+                    if (ratio == "panscan") {
+                        MPVLib.setPropertyString("video-aspect-override", "-1")
+                        MPVLib.setPropertyDouble("panscan", 1.0)
+                    } else {
+                        MPVLib.setPropertyString("video-aspect-override", ratio)
+                        MPVLib.setPropertyDouble("panscan", 0.0)
+                    }
                 }
-                syncZoomVideoGeometry()
+
+                releaseGeometryTransitionWhenReady(transition)
                 // Keep dialog open (apply-in-place).
             }
             // "Cancel" behaves like Back (up to the advanced menu).
@@ -3240,7 +3402,7 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
         when (property) {
             "time-pos" -> updatePlaybackPos(psc.positionSec)
             "playlist-pos", "playlist-count" -> updatePlaylistButtons()
-            "video-params/w", "video-params/h" -> syncZoomVideoGeometry()
+            "video-params/w", "video-params/h" -> syncZoomVideoGeometryWithTransition()
         }
     }
 
@@ -3251,9 +3413,9 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
             "video-params/aspect", "video-params/rotate" -> {
                 updateOrientation()
                 updatePiPParams()
-                syncZoomVideoGeometry()
+                syncZoomVideoGeometryWithTransition()
             }
-            "panscan" -> syncZoomVideoGeometry()
+            "panscan" -> syncZoomVideoGeometryWithTransition()
         }
     }
 
@@ -3261,7 +3423,7 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
         if (!activityIsForeground) return
         when (property) {
             "speed" -> updateSpeedButton()
-            "video-aspect-override" -> syncZoomVideoGeometry()
+            "video-aspect-override" -> syncZoomVideoGeometryWithTransition()
         }
         if (metaUpdated)
             updateMetadataDisplay()
@@ -3371,7 +3533,10 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
                 if (p != null) eventUiHandler.post { try { applyOrientationFromMetadata(p) } catch (_: Throwable) {} }
             }
 
-            zoomGestures.resetForNewFile()
+            eventUiHandler.post {
+                beginGeometryTransition(snapshot = true)
+                try { zoomGestures.resetForNewFile() } catch (_: Throwable) {}
+            }
             try {
                 MPVLib.setPropertyDouble("video-zoom", 0.0)
                 MPVLib.setPropertyDouble("video-pan-x", 0.0)
@@ -3658,6 +3823,12 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
 
         // When scrubbing, wait briefly for the finger to stop moving before doing an exact seek.
         private const val SCRUB_IDLE_SEEK_DELAY_MS = 140L
+
+        // Aspect/playlist transitions can produce one or two stale TextureView frames
+        // before mpv and Android agree on the final surface geometry. Keep the last
+        // correct frame over the player until fresh frames have arrived.
+        private const val GEOMETRY_TRANSITION_SURFACE_UPDATES = 2
+        private const val GEOMETRY_TRANSITION_FALLBACK_MS = 1200L
 
         // Per-file subtitle persistence keys
         private const val PREF_SUB_KIND = "sub_kind"

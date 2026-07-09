@@ -6,6 +6,7 @@ import android.util.AttributeSet
 import android.util.Log
 import android.view.Surface
 import android.view.TextureView
+import java.util.ArrayDeque
 
 // Contains only the essential code needed to get a picture on the screen
 
@@ -98,6 +99,7 @@ abstract class BaseMPVView(context: Context, attrs: AttributeSet) : TextureView(
     private var renderSurfaceWidth = 0
     private var renderSurfaceHeight = 0
     private var customRenderSurfaceSize = false
+    private val surfaceUpdateCallbacks = ArrayDeque<() -> Unit>()
 
     /**
      * Set the real SurfaceTexture buffer size used by mpv without changing the
@@ -118,6 +120,10 @@ abstract class BaseMPVView(context: Context, attrs: AttributeSet) : TextureView(
         renderSurfaceWidth = safeWidth
         renderSurfaceHeight = safeHeight
         applyRenderSurfaceSize()
+    }
+
+    fun runOnNextSurfaceTextureUpdate(callback: () -> Unit) {
+        surfaceUpdateCallbacks.add(callback)
     }
 
     fun resetRenderSurfaceSize() {
@@ -190,6 +196,7 @@ abstract class BaseMPVView(context: Context, attrs: AttributeSet) : TextureView(
         surface.release()
         attachedSurface = null
         attachedTexture = null
+        surfaceUpdateCallbacks.clear()
     }
 
     // Texture callbacks
@@ -208,7 +215,14 @@ abstract class BaseMPVView(context: Context, attrs: AttributeSet) : TextureView(
         return true
     }
 
-    override fun onSurfaceTextureUpdated(surface: SurfaceTexture) = Unit
+    override fun onSurfaceTextureUpdated(surface: SurfaceTexture) {
+        if (surfaceUpdateCallbacks.isEmpty())
+            return
+
+        val callbacks = ArrayList(surfaceUpdateCallbacks)
+        surfaceUpdateCallbacks.clear()
+        callbacks.forEach { it.invoke() }
+    }
 
     companion object {
         private const val TAG = "mpv"

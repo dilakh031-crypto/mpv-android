@@ -189,26 +189,57 @@ internal class VideoZoomGestures(
     }
 
     fun setVideoAspect(aspect: Double?) {
-        videoAspect = aspect ?: 0.0
-        if (isZoomed() || scaleDetector.isInProgress)
-            clampTranslationToVideoContent()
-        updateRenderSurfaceForCurrentState(force = true)
-        scheduleApply()
+        setVideoGeometry(
+            aspect = aspect,
+            size = videoPixelSizeOrNull(),
+            panscanValue = panscan,
+            applyImmediately = false,
+        )
     }
 
     fun setVideoPixelSize(size: Pair<Int, Int>?) {
-        videoPixelWidth = size?.first ?: 0
-        videoPixelHeight = size?.second ?: 0
-        updateRenderSurfaceForCurrentState(force = true)
-        scheduleApply()
+        setVideoGeometry(
+            aspect = videoAspect.takeIf { it > 0.001 },
+            size = size,
+            panscanValue = panscan,
+            applyImmediately = false,
+        )
     }
 
     fun setPanscan(value: Double?) {
-        panscan = value ?: 0.0
+        setVideoGeometry(
+            aspect = videoAspect.takeIf { it > 0.001 },
+            size = videoPixelSizeOrNull(),
+            panscanValue = value,
+            applyImmediately = false,
+        )
+    }
+
+    fun setVideoGeometry(
+        aspect: Double?,
+        size: Pair<Int, Int>?,
+        panscanValue: Double?,
+        applyImmediately: Boolean,
+    ) {
+        videoAspect = aspect ?: 0.0
+        videoPixelWidth = size?.first ?: 0
+        videoPixelHeight = size?.second ?: 0
+        panscan = panscanValue ?: 0.0
+
         if (isZoomed() || scaleDetector.isInProgress)
             clampTranslationToVideoContent()
+
         updateRenderSurfaceForCurrentState(force = true)
-        scheduleApply()
+        if (applyImmediately)
+            applyToView()
+        else
+            scheduleApply()
+    }
+
+    private fun videoPixelSizeOrNull(): Pair<Int, Int>? {
+        if (videoPixelWidth <= 0 || videoPixelHeight <= 0)
+            return null
+        return videoPixelWidth to videoPixelHeight
     }
 
     fun isZoomed(): Boolean = scale > 1f + EPS
