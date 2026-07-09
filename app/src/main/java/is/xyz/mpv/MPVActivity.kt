@@ -103,6 +103,23 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
     private var pendingSeekbarSeekPos: Double? = null
     private var lastIssuedSeekbarSeekPos: Double? = null
 
+    // Live/dynamic stream edge guard.
+    // Some live inputs expose only the currently available window. If the user seeks to the
+    // current end of that window, mpv can report EOF and advance to the next playlist entry even
+    // though new media will arrive a few seconds later. We detect inputs whose duration grows (or
+    // known live playlist/protocol inputs) and temporarily keep mpv open at the live edge so it can
+    // continue from the user's selected point once more data is available.
+    private var streamDurationMaxSec = 0.0
+    private var streamDurationIsGrowing = false
+    private var streamEdgeSeekPending = false
+    private var streamEdgeSeekTargetSec: Double? = null
+    private var streamKeepOpenActive = false
+    private var streamKeepOpenBefore: String? = null
+    private var streamKeepOpenPauseBefore: String? = null
+    private var streamLastNudgedDurationSec = 0.0
+    private var currentInputPath: String? = null
+    private var currentInputFormat: String? = null
+
     /** 0 = initial, 1 = paused, 2 = was already paused */
     private var pausedForSeekbar = 0
 
@@ -1714,8 +1731,14 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
         }
     }
 
-    private fun playlistPrev() = MPVLib.command(arrayOf("playlist-prev"))
-    private fun playlistNext() = MPVLib.command(arrayOf("playlist-next"))
+    private fun playlistPrev() {
+        restoreLiveStreamEndGuard()
+        MPVLib.command(arrayOf("playlist-prev"))
+    }
+    private fun playlistNext() {
+        restoreLiveStreamEndGuard()
+        MPVLib.command(arrayOf("playlist-next"))
+    }
 
     private fun showToast(msg: String, cancel: Boolean = false) {
         if (cancel)
@@ -3192,6 +3215,150 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
 
     // Media Session handling
 
+    // Live/dynamic stream helpers
+
+    private fun resetLiveStreamEndGuardForNewFile() {
+        restoreLiveStreamEndGuard()
+        streamDurationMaxSec = 0.0
+        streamDurationIsGrowing = false
+        streamEdgeSeekPending = false
+        streamEdgeSeekTargetSec = null
+        streamLastNudgedDurationSec = 0.0
+        currentInputPath = null
+        currentInputFormat = null
+    }
+
+    private fun restoreLiveStreamEndGuard() {
+        if (!streamKeepOpenActive)
+            return
+
+        try {
+            MPVLib.setPropertyString("keep-open", streamKeepOpenBefore ?: "no")
+            MPVLib.setPropertyString("keep-open-pause", streamKeepOpenPauseBefore ?: "yes")
+        } catch (e: Throwable) {
+            Log.w(TAG, "failed to restore live stream EOF guard", e)
+        }
+
+        streamKeepOpenActive = false
+        streamKeepOpenBefore = null
+        streamKeepOpenPauseBefore = null
+        streamLastNudgedDurationSec = 0.0
+    }
+
+    private fun enableLiveStreamEndGuard() {
+        if (streamKeepOpenActive)
+            return
+
+        try {
+            streamKeepOpenBefore = MPVLib.getPropertyString("keep-open")
+            streamKeepOpenPauseBefore = MPVLib.getPropertyString("keep-open-pause")
+            // `always` is important for playlists: it keeps the current live entry open instead
+            // of letting EOF advance to the next item while the live window is still growing.
+            MPVLib.setPropertyString("keep-open", "always")
+            // Do not convert the live-edge wait into a real pause. If mpv reaches the current end,
+            // it should be able to continue as soon as more packets become available.
+            MPVLib.setPropertyBoolean("keep-open-pause", false)
+            streamKeepOpenActive = true
+            Log.v(TAG, "enabled live stream EOF guard")
+        } catch (e: Throwable) {
+            Log.w(TAG, "failed to enable live stream EOF guard", e)
+            streamKeepOpenBefore = null
+            streamKeepOpenPauseBefore = null
+            streamKeepOpenActive = false
+        }
+    }
+
+    private fun normalizedPathWithoutQuery(path: String): String {
+        return path.substringBefore('#').substringBefore('?').lowercase()
+    }
+
+    private fun isKnownLiveLikeInput(): Boolean {
+        if (streamDurationIsGrowing)
+            return true
+
+        val format = (currentInputFormat ?: MPVLib.getPropertyString("file-format"))?.lowercase()
+        if (format != null && ("hls" in format || "dash" in format))
+            return true
+
+        val path = currentInputPath ?: MPVLib.getPropertyString("path")
+        if (path != null) {
+            val p = normalizedPathWithoutQuery(path)
+            if (p.endsWith(".m3u8") || p.endsWith(".m3u") || p.endsWith(".mpd"))
+                return true
+            if (p.startsWith("rtsp://") || p.startsWith("rtmp://") || p.startsWith("rtmps://") ||
+                p.startsWith("srt://") || p.startsWith("udp://") || p.startsWith("rtp://") ||
+                p.startsWith("dvb://"))
+                return true
+        }
+
+        return false
+    }
+
+    private fun isNearCurrentStreamEnd(targetSec: Double): Boolean {
+        val durationSec = (streamDurationMaxSec.takeIf { it > 0.0 } ?: (psc.duration / 1000.0))
+        if (durationSec <= 0.0 || targetSec < 0.0)
+            return false
+        return targetSec >= durationSec - LIVE_EDGE_GUARD_MARGIN_SEC
+    }
+
+    private fun protectLiveStreamSeekIfNeeded(targetSec: Double) {
+        if (!isNearCurrentStreamEnd(targetSec)) {
+            streamEdgeSeekPending = false
+            streamEdgeSeekTargetSec = null
+            if (streamKeepOpenActive)
+                restoreLiveStreamEndGuard()
+            return
+        }
+
+        streamEdgeSeekPending = true
+        streamEdgeSeekTargetSec = targetSec
+
+        if (isKnownLiveLikeInput())
+            enableLiveStreamEndGuard()
+    }
+
+    private fun maybeNudgeLiveStreamAfterGrowth(newDurationSec: Double) {
+        if (!streamKeepOpenActive)
+            return
+        val target = streamEdgeSeekTargetSec ?: return
+        if (newDurationSec <= target + LIVE_EDGE_RESUME_EPS_SEC)
+            return
+        if (newDurationSec <= streamLastNudgedDurationSec + LIVE_EDGE_RESUME_EPS_SEC)
+            return
+
+        try {
+            val currentPos = MPVLib.getPropertyDouble("time-pos/full") ?: (psc.position / 1000.0)
+            val eofReached = MPVLib.getPropertyBoolean("eof-reached") == true
+            // Do not jump backwards after playback has already moved beyond the old edge. We only
+            // nudge when mpv is still parked at EOF/edge and new media has just appeared after it.
+            if (!eofReached && currentPos > target + LIVE_EDGE_RESUME_EPS_SEC)
+                return
+
+            streamLastNudgedDurationSec = newDurationSec
+            MPVLib.command(arrayOf("seek", target.toString(), "absolute+keyframes"))
+            MPVLib.setPropertyBoolean("pause", false)
+            Log.v(TAG, "nudged live stream after duration growth to $target / $newDurationSec")
+        } catch (e: Throwable) {
+            Log.w(TAG, "failed to nudge live stream after duration growth", e)
+        }
+    }
+
+    private fun handleStreamDurationUpdate(value: Double) {
+        if (value <= 0.0 || value.isNaN() || value.isInfinite())
+            return
+
+        val oldMax = streamDurationMaxSec
+        if (oldMax > 0.0 && value > oldMax + LIVE_DURATION_GROWTH_EPS_SEC) {
+            streamDurationIsGrowing = true
+            if (streamEdgeSeekPending)
+                enableLiveStreamEndGuard()
+            maybeNudgeLiveStreamAfterGrowth(value)
+        }
+
+        if (value > streamDurationMaxSec)
+            streamDurationMaxSec = value
+    }
+
     private val mediaSessionCallback = object : MediaSessionCompat.Callback() {
         override fun onPause() {
             player.paused = true
@@ -3200,7 +3367,9 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
             player.paused = false
         }
         override fun onSeekTo(pos: Long) {
-            player.timePos = (pos / 1000.0)
+            val targetSec = pos / 1000.0
+            protectLiveStreamSeekIfNeeded(targetSec)
+            player.timePos = targetSec
         }
         override fun onSkipToNext() = playlistNext()
         override fun onSkipToPrevious() = playlistPrev()
@@ -3353,6 +3522,9 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
     }
 
     override fun eventProperty(property: String, value: Double) {
+        if (property == "duration/full")
+            handleStreamDurationUpdate(value)
+
         if (psc.update(property, value))
             updateMediaSession()
 
@@ -3361,6 +3533,11 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
     }
 
     override fun eventProperty(property: String, value: String) {
+        when (property) {
+            "path" -> currentInputPath = value
+            "file-format" -> currentInputFormat = value
+        }
+
         val metaUpdated = psc.update(property, value)
         if (metaUpdated)
             updateMediaSession()
@@ -3371,8 +3548,20 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
 
     override fun event(eventId: Int) {
         if (eventId == MpvEvent.MPV_EVENT_END_FILE) {
-            psc.eof()
-            updateMediaSession()
+            if (streamKeepOpenActive && isKnownLiveLikeInput()) {
+                try {
+                    // Keep the media session/UI state at the current live window instead of treating
+                    // this as a final EOF. New duration updates will nudge playback forward again.
+                    MPVLib.getPropertyDouble("time-pos/full")?.let { pos ->
+                        if (pos >= 0.0)
+                            streamEdgeSeekTargetSec = pos
+                    }
+                    MPVLib.setPropertyBoolean("pause", false)
+                } catch (_: Throwable) {}
+            } else {
+                psc.eof()
+                updateMediaSession()
+            }
         }
 
         if (eventId == MpvEvent.MPV_EVENT_SHUTDOWN)
@@ -3400,6 +3589,7 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
         }
 
         if (eventId == MpvEvent.MPV_EVENT_START_FILE) {
+            resetLiveStreamEndGuardForNewFile()
             // Reset any view-level zoom/pan when a new file starts.
 
             // Apply orientation as early as possible for playlist items, so we don't show the wrong orientation first.
@@ -3451,6 +3641,7 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
     }
 
     private fun sendScrubSeek(targetSec: Double, exact: Boolean) {
+        protectLiveStreamSeekIfNeeded(targetSec)
         // Cancel the previous async seek so the latest target wins.
         abortLastScrubSeek()
         val ud = scrubAsyncCounter++
@@ -3636,6 +3827,7 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
 
                 val seekTime = diff * 10f
                 val newPos = psc.positionSec + seekTime.toInt() // only for display
+                protectLiveStreamSeekIfNeeded(newPos.toDouble())
                 MPVLib.command(arrayOf("seek", seekTime.toString(), "relative"))
 
                 val diffText = Utils.prettyTime(seekTime.toInt(), true)
@@ -3700,6 +3892,11 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
 
         // When scrubbing, wait briefly for the finger to stop moving before doing an exact seek.
         private const val SCRUB_IDLE_SEEK_DELAY_MS = 140L
+
+        // Live/dynamic stream EOF guard.
+        private const val LIVE_EDGE_GUARD_MARGIN_SEC = 12.0
+        private const val LIVE_DURATION_GROWTH_EPS_SEC = 0.75
+        private const val LIVE_EDGE_RESUME_EPS_SEC = 0.25
 
         // Per-file subtitle persistence keys
         private const val PREF_SUB_KIND = "sub_kind"
