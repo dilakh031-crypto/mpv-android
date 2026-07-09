@@ -153,13 +153,12 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
     private var deferPlayerInit: Boolean = false
     private var uiInitialized: Boolean = false
 
-    // One owner for hiding the mpv texture while video geometry is changing.
-    // New files wait for FILE_LOADED + VIDEO_RECONFIG/geometry. Aspect menu changes
-    // wait only for a new frame after the requested aspect geometry has been applied.
+    // One owner for hiding the mpv texture while a new file/reconfig is waiting
+    // for reliable video geometry. Aspect changes from the in-app menu bypass this
+    // blackout and use predictive geometry instead.
     private var videoGeometryBlackoutActive = true
     private var videoGeometryBlackoutGeneration = 0
     private var videoGeometryBlackoutRevealArmed = false
-    private var videoGeometryBlackoutWaitsForFileLoaded = true
     private var videoGeometryBlackoutFileLoadedSeen = false
     private var suppressAspectMenuGeometrySyncUntilMs = 0L
 
@@ -579,15 +578,11 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
         }
     }
 
-    private fun setVideoGeometryBlackout(
-        visible: Boolean,
-        waitForFileLoaded: Boolean = true,
-    ) {
+    private fun setVideoGeometryBlackout(visible: Boolean) {
         if (visible) {
             videoGeometryBlackoutGeneration += 1
             videoGeometryBlackoutRevealArmed = false
-            videoGeometryBlackoutWaitsForFileLoaded = waitForFileLoaded
-            videoGeometryBlackoutFileLoadedSeen = !waitForFileLoaded
+            videoGeometryBlackoutFileLoadedSeen = false
         }
         videoGeometryBlackoutActive = visible
         if (!::binding.isInitialized || !uiInitialized)
@@ -596,21 +591,11 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
         binding.videoBlackoutOverlay.visibility = if (visible) View.VISIBLE else View.GONE
     }
 
-    private fun beginVideoGeometryBlackout(
-        waitForFileLoaded: Boolean = true,
-        resetZoomForNewFile: Boolean = true,
-    ) {
-        setVideoGeometryBlackout(true, waitForFileLoaded = waitForFileLoaded)
-        if (resetZoomForNewFile && ::zoomGestures.isInitialized) {
+    private fun beginVideoGeometryBlackout() {
+        setVideoGeometryBlackout(true)
+        if (::zoomGestures.isInitialized) {
             try { zoomGestures.resetForNewFile() } catch (_: Throwable) {}
         }
-    }
-
-    private fun beginAspectMenuGeometryBlackout() {
-        beginVideoGeometryBlackout(
-            waitForFileLoaded = false,
-            resetZoomForNewFile = false,
-        )
     }
 
     private fun armVideoGeometryBlackoutReveal() {
@@ -627,10 +612,8 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
 
         if (!videoGeometryBlackoutActive || !videoGeometryBlackoutRevealArmed)
             return
-        if (videoGeometryBlackoutActive &&
-            videoGeometryBlackoutWaitsForFileLoaded &&
-            !videoGeometryBlackoutFileLoadedSeen
-        ) return
+        if (videoGeometryBlackoutActive && !videoGeometryBlackoutFileLoadedSeen)
+            return
         if (!hasDisplayableVideoGeometry())
             return
 
@@ -639,7 +622,7 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
             if (videoGeometryBlackoutActive &&
                 videoGeometryBlackoutRevealArmed &&
                 generation == videoGeometryBlackoutGeneration &&
-                (!videoGeometryBlackoutWaitsForFileLoaded || videoGeometryBlackoutFileLoadedSeen) &&
+                videoGeometryBlackoutFileLoadedSeen &&
                 hasDisplayableVideoGeometry()
             ) {
                 videoGeometryBlackoutRevealArmed = false
@@ -685,10 +668,8 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
         if (!::zoomGestures.isInitialized)
             return
 
-        if (videoGeometryBlackoutActive &&
-            videoGeometryBlackoutWaitsForFileLoaded &&
-            !videoGeometryBlackoutFileLoadedSeen
-        ) return
+        if (videoGeometryBlackoutActive && !videoGeometryBlackoutFileLoadedSeen)
+            return
         if (!hasDisplayableVideoGeometry())
             return
 
@@ -2654,17 +2635,6 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
             return abs(currentValue - ratioValue) < 0.001
         }
 
-        fun aspectRatioRequestIsActive(ratio: String): Boolean {
-            val currentPanscanValue = MPVLib.getPropertyDouble("panscan") ?: 0.0
-            val currentOverrideValue = MPVLib.getPropertyString("video-aspect-override")?.trim() ?: ""
-
-            return if (ratio == "panscan") {
-                currentPanscanValue > 0.0
-            } else {
-                currentPanscanValue <= 0.0 && aspectRatioMatches(currentOverrideValue, ratio)
-            }
-        }
-
         val currentPanscan = MPVLib.getPropertyDouble("panscan") ?: 0.0
         val currentOverride = MPVLib.getPropertyString("video-aspect-override")?.trim() ?: ""
         val panscanIndex = ratios.indexOf("panscan")
@@ -2689,15 +2659,10 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
                     parseAspectRatio(ratio) ?: try { player.getVideoAspect() } catch (_: Throwable) { null }
                 }
                 val targetPixelSize = try { player.getVideoPixelSize() } catch (_: Throwable) { null }
-                val aspectActuallyChanges = !aspectRatioRequestIsActive(ratio)
-
-                if (aspectActuallyChanges)
-                    beginAspectMenuGeometryBlackout()
 
                 // Menu selections are the only transition where we already know the
-                // requested geometry. Apply it while the single blackout owner is
-                // covering mpv, then reveal only after TextureView reports a new
-                // frame for the updated aspect.
+                // requested geometry. Apply it before asking mpv to redraw so the
+                // user never sees the temporary fullscreen/base layout.
                 if (::zoomGestures.isInitialized) {
                     try {
                         zoomGestures.applyPredictedAspectMenuGeometry(
@@ -2710,6 +2675,10 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
 
                 val suppressUntil = SystemClock.uptimeMillis() + ASPECT_MENU_PREDICTIVE_SYNC_GRACE_MS
                 suppressAspectMenuGeometrySyncUntilMs = suppressUntil
+                eventUiHandler.postDelayed({
+                    if (SystemClock.uptimeMillis() >= suppressUntil)
+                        syncZoomVideoGeometry(prepareNormalSurface = true, immediate = true)
+                }, ASPECT_MENU_PREDICTIVE_SYNC_GRACE_MS + 20L)
 
                 if (ratio == "panscan") {
                     MPVLib.setPropertyString("video-aspect-override", "-1")
@@ -2717,18 +2686,6 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
                 } else {
                     MPVLib.setPropertyString("video-aspect-override", ratio)
                     MPVLib.setPropertyDouble("panscan", 0.0)
-                }
-
-                if (aspectActuallyChanges) {
-                    eventUiHandler.postDelayed({
-                        if (SystemClock.uptimeMillis() >= suppressUntil)
-                            prepareZoomSurfaceAndRevealWhenReady()
-                    }, ASPECT_MENU_PREDICTIVE_SYNC_GRACE_MS + 20L)
-                } else {
-                    eventUiHandler.postDelayed({
-                        if (SystemClock.uptimeMillis() >= suppressUntil)
-                            syncZoomVideoGeometry(prepareNormalSurface = true, immediate = true)
-                    }, ASPECT_MENU_PREDICTIVE_SYNC_GRACE_MS + 20L)
                 }
                 // Keep dialog open (apply-in-place).
             }
