@@ -658,13 +658,21 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
         startupPreviewBitmap = null
     }
 
+    private fun syncZoomVideoGeometry() {
+        if (!::zoomGestures.isInitialized)
+            return
+
+        try { zoomGestures.setVideoAspect(player.getEffectiveVideoAspect()) } catch (_: Throwable) {}
+        try { zoomGestures.setVideoPixelSize(player.getVideoPixelSize()) } catch (_: Throwable) {}
+        try { zoomGestures.setPanscan(player.getPanscan()) } catch (_: Throwable) {}
+    }
+
     private fun prepareZoomSurfaceAndHideStartupPreview() {
         if (::zoomGestures.isInitialized) {
             // Property observers can arrive after FILE_LOADED/VIDEO_RECONFIG on some
             // devices. Pull the current mpv dimensions here so the compact surface is
             // prepared while the startup preview is still covering the player.
-            try { zoomGestures.setVideoAspect(player.getVideoAspect()) } catch (_: Throwable) {}
-            try { zoomGestures.setVideoPixelSize(player.getVideoPixelSize()) } catch (_: Throwable) {}
+            syncZoomVideoGeometry()
             zoomGestures.prepareForVisibleMedia()
         }
 
@@ -2657,6 +2665,7 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
                     MPVLib.setPropertyString("video-aspect-override", ratios[item])
                     MPVLib.setPropertyDouble("panscan", 0.0)
                 }
+                syncZoomVideoGeometry()
                 // Keep dialog open (apply-in-place).
             }
             // "Cancel" behaves like Back (up to the advanced menu).
@@ -3231,7 +3240,7 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
         when (property) {
             "time-pos" -> updatePlaybackPos(psc.positionSec)
             "playlist-pos", "playlist-count" -> updatePlaylistButtons()
-            "video-params/w", "video-params/h" -> zoomGestures.setVideoPixelSize(player.getVideoPixelSize())
+            "video-params/w", "video-params/h" -> syncZoomVideoGeometry()
         }
     }
 
@@ -3242,9 +3251,9 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
             "video-params/aspect", "video-params/rotate" -> {
                 updateOrientation()
                 updatePiPParams()
-                zoomGestures.setVideoAspect(player.getVideoAspect())
-                zoomGestures.setVideoPixelSize(player.getVideoPixelSize())
+                syncZoomVideoGeometry()
             }
+            "panscan" -> syncZoomVideoGeometry()
         }
     }
 
@@ -3252,6 +3261,7 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
         if (!activityIsForeground) return
         when (property) {
             "speed" -> updateSpeedButton()
+            "video-aspect-override" -> syncZoomVideoGeometry()
         }
         if (metaUpdated)
             updateMetadataDisplay()
