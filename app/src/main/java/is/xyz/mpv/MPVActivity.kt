@@ -162,15 +162,6 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
     private var videoGeometryBlackoutFileLoadedSeen = false
     private var suppressAspectMenuGeometrySyncUntilMs = 0L
 
-    // Changing mpv's video-aspect-override while an embedded cover image is the
-    // active video track can reconfigure the still-image chain and briefly mute
-    // the accompanying audio. Keep cover-art aspect choices at the Android View
-    // layer instead. The render aspect is the geometry mpv is already producing;
-    // the display aspect is the geometry requested by the user.
-    private var coverArtAspectSelection: String? = null
-    private var coverArtDisplayAspect: Double? = null
-    private var coverArtRenderAspect: Double? = null
-
     private val psc = Utils.PlaybackStateCache()
     private var mediaSession: MediaSessionCompat? = null
 
@@ -601,22 +592,10 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
     }
 
     private fun beginVideoGeometryBlackout() {
-        clearCoverArtAspectOverride()
         setVideoGeometryBlackout(true)
         if (::zoomGestures.isInitialized) {
             try { zoomGestures.resetForNewFile() } catch (_: Throwable) {}
         }
-    }
-
-    private fun clearCoverArtAspectOverride() {
-        coverArtAspectSelection = null
-        coverArtDisplayAspect = null
-        coverArtRenderAspect = null
-    }
-
-    private fun hasAudioCoverArt(): Boolean {
-        return MPVLib.getPropertyBoolean("current-tracks/audio/selected") == true &&
-            MPVLib.getPropertyString("current-tracks/video/image") == "yes"
     }
 
     private fun armVideoGeometryBlackoutReveal() {
@@ -670,18 +649,13 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
         if (!::zoomGestures.isInitialized || isAspectMenuGeometrySyncSuppressed())
             return
 
-        val mpvAspect = try { player.getEffectiveVideoAspect() } catch (_: Throwable) { null }
+        val aspect = try { player.getEffectiveVideoAspect() } catch (_: Throwable) { null }
         val size = try { player.getVideoPixelSize() } catch (_: Throwable) { null }
-        val useCoverArtOverride = coverArtAspectSelection != null && hasAudioCoverArt()
-        val aspect = if (useCoverArtOverride) coverArtDisplayAspect ?: mpvAspect else mpvAspect
-        val renderAspect = if (useCoverArtOverride) coverArtRenderAspect ?: mpvAspect else mpvAspect
-        val pan = if (useCoverArtOverride) 0.0 else
-            try { player.getPanscan() } catch (_: Throwable) { 0.0 }
+        val pan = try { player.getPanscan() } catch (_: Throwable) { 0.0 }
 
         try {
             zoomGestures.setVideoGeometry(
                 aspect = aspect,
-                renderAspect = renderAspect,
                 pixelSize = size,
                 panscanValue = pan,
                 prepareNormalSurface = prepareNormalSurface,
@@ -2665,13 +2639,7 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
         val currentOverride = MPVLib.getPropertyString("video-aspect-override")?.trim() ?: ""
         val panscanIndex = ratios.indexOf("panscan")
         val originalIndex = ratios.indexOf("-1").takeIf { it >= 0 } ?: 0
-        val coverArtSelectionIndex = if (hasAudioCoverArt())
-            coverArtAspectSelection?.let { ratios.indexOf(it) } ?: -1
-        else
-            -1
-        var selectedIndex = if (coverArtSelectionIndex >= 0) {
-            coverArtSelectionIndex
-        } else if (currentPanscan > 0.0 && panscanIndex >= 0) {
+        var selectedIndex = if (currentPanscan > 0.0 && panscanIndex >= 0) {
             panscanIndex
         } else {
             ratios.indexOfFirst { ratio ->
@@ -2691,27 +2659,6 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
                     parseAspectRatio(ratio) ?: try { player.getVideoAspect() } catch (_: Throwable) { null }
                 }
                 val targetPixelSize = try { player.getVideoPixelSize() } catch (_: Throwable) { null }
-                val livePanscan = MPVLib.getPropertyDouble("panscan") ?: 0.0
-                val coverArtRenderCandidate = coverArtRenderAspect
-                    ?: try { player.getEffectiveVideoAspect() } catch (_: Throwable) { null }
-                    ?: try { player.getVideoAspect() } catch (_: Throwable) { null }
-                val validCoverArtRenderAspect = coverArtRenderCandidate?.takeIf { it > 0.001 }
-                val useViewOnlyCoverArtAspect = ratio != "panscan" &&
-                    hasAudioCoverArt() &&
-                    (coverArtAspectSelection != null || livePanscan <= 0.0) &&
-                    validCoverArtRenderAspect != null
-                val targetRenderAspect = if (useViewOnlyCoverArtAspect)
-                    validCoverArtRenderAspect!!
-                else
-                    targetAspect
-
-                if (useViewOnlyCoverArtAspect) {
-                    coverArtAspectSelection = ratio
-                    coverArtDisplayAspect = targetAspect
-                    coverArtRenderAspect = targetRenderAspect
-                } else {
-                    clearCoverArtAspectOverride()
-                }
 
                 // Menu selections are the only transition where we already know the
                 // requested geometry. Apply it before asking mpv to redraw so the
@@ -2720,9 +2667,8 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
                     try {
                         zoomGestures.applyPredictedAspectMenuGeometry(
                             aspect = targetAspect,
-                            renderAspect = targetRenderAspect,
                             pixelSize = targetPixelSize,
-                            panscanValue = if (useViewOnlyCoverArtAspect) 0.0 else targetPanscan,
+                            panscanValue = targetPanscan,
                         )
                     } catch (_: Throwable) {}
                 }
@@ -2734,21 +2680,12 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
                         syncZoomVideoGeometry(prepareNormalSurface = true, immediate = true)
                 }, ASPECT_MENU_PREDICTIVE_SYNC_GRACE_MS + 20L)
 
-                if (!useViewOnlyCoverArtAspect) {
-                    if (ratio == "panscan") {
-                        if (MPVLib.getPropertyString("video-aspect-override") != "-1")
-                            MPVLib.setPropertyString("video-aspect-override", "-1")
-                        if ((MPVLib.getPropertyDouble("panscan") ?: 0.0) != 1.0)
-                            MPVLib.setPropertyDouble("panscan", 1.0)
-                    } else {
-                        if (!aspectRatioMatches(
-                                MPVLib.getPropertyString("video-aspect-override")?.trim() ?: "",
-                                ratio,
-                            ))
-                            MPVLib.setPropertyString("video-aspect-override", ratio)
-                        if ((MPVLib.getPropertyDouble("panscan") ?: 0.0) != 0.0)
-                            MPVLib.setPropertyDouble("panscan", 0.0)
-                    }
+                if (ratio == "panscan") {
+                    MPVLib.setPropertyString("video-aspect-override", "-1")
+                    MPVLib.setPropertyDouble("panscan", 1.0)
+                } else {
+                    MPVLib.setPropertyString("video-aspect-override", ratio)
+                    MPVLib.setPropertyDouble("panscan", 0.0)
                 }
                 // Keep dialog open (apply-in-place).
             }
@@ -3304,13 +3241,7 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
         if (!activityIsForeground) return
         when (property) {
             "track-list" -> player.loadTracks()
-            "current-tracks/audio/selected", "current-tracks/video/image" -> {
-                updateAudioUI()
-                if (coverArtAspectSelection != null && !hasAudioCoverArt()) {
-                    clearCoverArtAspectOverride()
-                    syncZoomVideoGeometry(prepareNormalSurface = true, immediate = true)
-                }
-            }
+            "current-tracks/audio/selected", "current-tracks/video/image" -> updateAudioUI()
             "hwdec-current" -> updateDecoderButton()
         }
         if (metaUpdated)
