@@ -45,6 +45,17 @@ internal class VideoZoomGestures(
 
     /** currently displayed aspect ratio, including video-aspect-override. 0 => unknown */
     private var videoAspect = 0.0
+    /**
+     * Aspect ratio of the pixels mpv renders into the SurfaceTexture.
+     *
+     * Normally this is identical to [videoAspect]. Audio files with embedded
+     * cover art are the exception: changing mpv's video-aspect-override makes
+     * the still-image video chain reconfigure and can briefly interrupt audio.
+     * For those files MPVActivity leaves mpv untouched, keeps this value at the
+     * aspect mpv is already rendering, and changes [videoAspect] only. Android
+     * then performs the visual aspect conversion without restarting playback.
+     */
+    private var renderAspect = 0.0
     private var videoPixelWidth = 0
     private var videoPixelHeight = 0
     private var panscan = 0.0
@@ -191,6 +202,7 @@ internal class VideoZoomGestures(
     fun setVideoAspect(aspect: Double?) {
         setVideoGeometry(
             aspect = aspect,
+            renderAspect = aspect,
             pixelSize = videoPixelSizeOrNull(),
             panscanValue = panscan,
             prepareNormalSurface = false,
@@ -201,6 +213,7 @@ internal class VideoZoomGestures(
     fun setVideoPixelSize(size: Pair<Int, Int>?) {
         setVideoGeometry(
             aspect = videoAspect.takeIf { it > 0.001 },
+            renderAspect = renderAspect.takeIf { it > 0.001 },
             pixelSize = size,
             panscanValue = panscan,
             prepareNormalSurface = false,
@@ -211,6 +224,7 @@ internal class VideoZoomGestures(
     fun setPanscan(value: Double?) {
         setVideoGeometry(
             aspect = videoAspect.takeIf { it > 0.001 },
+            renderAspect = renderAspect.takeIf { it > 0.001 },
             pixelSize = videoPixelSizeOrNull(),
             panscanValue = value,
             prepareNormalSurface = false,
@@ -220,12 +234,14 @@ internal class VideoZoomGestures(
 
     fun setVideoGeometry(
         aspect: Double?,
+        renderAspect: Double? = aspect,
         pixelSize: Pair<Int, Int>?,
         panscanValue: Double?,
         prepareNormalSurface: Boolean = false,
         immediate: Boolean = false,
     ) {
         videoAspect = aspect ?: 0.0
+        this.renderAspect = renderAspect ?: videoAspect
         videoPixelWidth = pixelSize?.first ?: 0
         videoPixelHeight = pixelSize?.second ?: 0
         panscan = panscanValue ?: 0.0
@@ -245,11 +261,13 @@ internal class VideoZoomGestures(
 
     fun applyPredictedAspectMenuGeometry(
         aspect: Double?,
+        renderAspect: Double? = aspect,
         pixelSize: Pair<Int, Int>?,
         panscanValue: Double?,
     ) {
         setVideoGeometry(
             aspect = aspect,
+            renderAspect = renderAspect,
             pixelSize = pixelSize,
             panscanValue = panscanValue,
             prepareNormalSurface = true,
@@ -283,6 +301,7 @@ internal class VideoZoomGestures(
     fun resetForNewFile() {
         resetTransformState()
         videoAspect = 0.0
+        renderAspect = 0.0
         videoPixelWidth = 0
         videoPixelHeight = 0
         panscan = 0.0
@@ -557,8 +576,17 @@ internal class VideoZoomGestures(
         }
     }
 
-    /** Compute the content/video rect within the view at base scale. */
-    private fun contentRect(): ContentRect {
+    /** Compute the displayed content/video rect within the view at base scale. */
+    private fun contentRect(): ContentRect = contentRectForAspect(videoAspect)
+
+    /**
+     * Compute the rect whose aspect matches the pixels currently produced by
+     * mpv. This can differ from [contentRect] for view-only cover-art aspect
+     * changes.
+     */
+    private fun renderContentRect(): ContentRect = contentRectForAspect(renderAspect)
+
+    private fun contentRectForAspect(aspect: Double): ContentRect {
         val w = viewWidth
         val h = viewHeight
         if (w <= 1f || h <= 1f)
@@ -567,7 +595,7 @@ internal class VideoZoomGestures(
         if (isPanscanActive())
             return ContentRect(0f, 0f, w, h)
 
-        val ar = if (videoAspect > 0.001) videoAspect.toFloat() else (w / h)
+        val ar = if (aspect > 0.001) aspect.toFloat() else (w / h)
         val viewAr = w / h
         val cw: Float
         val ch: Float
@@ -689,7 +717,7 @@ internal class VideoZoomGestures(
             return
         }
 
-        val c = contentRect()
+        val c = renderContentRect()
         if (c.w <= 1f || c.h <= 1f) {
             requestBaseRenderSurfaceSize(force = true)
             return
@@ -722,7 +750,7 @@ internal class VideoZoomGestures(
             return
         }
 
-        val c = contentRect()
+        val c = renderContentRect()
         if (c.w <= 1f || c.h <= 1f) {
             requestBaseRenderSurfaceSize(force = true)
             return
@@ -752,12 +780,12 @@ internal class VideoZoomGestures(
         if (!force && renderSurfaceMode == RenderSurfaceMode.MEDIA_ASPECT_BASE)
             return
 
-        if (viewWidth <= 1f || viewHeight <= 1f || videoAspect <= 0.001) {
+        if (viewWidth <= 1f || viewHeight <= 1f || renderAspect <= 0.001) {
             requestBaseRenderSurfaceSize(force = true)
             return
         }
 
-        val c = contentRect()
+        val c = renderContentRect()
         if (c.w <= 1f || c.h <= 1f) {
             requestBaseRenderSurfaceSize(force = true)
             return
