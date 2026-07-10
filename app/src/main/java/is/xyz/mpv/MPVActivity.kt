@@ -2914,8 +2914,6 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
             binding.controlsTitleGroup.visibility = View.VISIBLE
             Utils.viewGroupReorder(binding.controlsTitleGroup, arrayOf(R.id.titleTextView, R.id.minorTitleTextView))
             updateMetadataDisplay()
-
-            hideControls()
         } else {
             Utils.viewGroupMove(buttonGroup, R.id.prevBtn, seekbarGroup, 0)
             Utils.viewGroupMove(buttonGroup, R.id.nextBtn, seekbarGroup, -1)
@@ -3032,15 +3030,16 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
         if (initial || player.vid == -1)
             return
 
-        // Use the video's decoded aspect before display overrides are applied. This keeps the
-        // automatic screen-orientation behavior tied to the media itself, so changing the
-        // in-player aspect ratio cannot rotate the device.
-        val ratio = player.getVideoAspectForOrientation()?.toFloat() ?: 0f
+        // Base automatic orientation on the media's native pixel dimensions, not on mpv's
+        // displayed aspect ratio. The latter can change when the user selects an aspect-ratio
+        // override, and that UI-only choice must never rotate the Android screen.
+        val pixelSize = player.getVideoPixelSize() ?: return
+        val ratio = pixelSize.first.toFloat() / pixelSize.second.toFloat()
 
-        // If the aspect ratio is unknown (0), don't change orientation. In practice this can
-        // happen briefly while mpv is still probing the file (and reacting to it can cause a
+        // If the dimensions are unavailable/invalid, don't change orientation. In practice this
+        // can happen briefly while mpv is still probing the file (and reacting to it can cause a
         // portrait "bounce" that sometimes sticks).
-        if (ratio == 0f)
+        if (!ratio.isFinite() || ratio == 0f)
             return
 
         if (ratio in (1f / ASPECT_RATIO_MIN) .. ASPECT_RATIO_MIN) {
@@ -3281,7 +3280,6 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
                 syncZoomVideoGeometry()
                 prepareZoomSurfaceAndRevealWhenReady()
             }
-            "video-dec-params/aspect" -> updateOrientation()
             "panscan" -> {
                 syncZoomVideoGeometry()
                 prepareZoomSurfaceAndRevealWhenReady()

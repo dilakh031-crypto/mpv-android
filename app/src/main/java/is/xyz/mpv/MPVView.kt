@@ -190,7 +190,6 @@ internal class MPVView(context: Context, attrs: AttributeSet) : BaseMPVView(cont
             Property("track-list"),
             Property("video-params/aspect", MPV_FORMAT_DOUBLE),
             Property("video-params/rotate", MPV_FORMAT_DOUBLE),
-            Property("video-dec-params/aspect", MPV_FORMAT_DOUBLE),
             Property("video-params/w", MPV_FORMAT_INT64),
             Property("video-params/h", MPV_FORMAT_INT64),
             Property("video-aspect-override", MPV_FORMAT_STRING),
@@ -321,22 +320,6 @@ internal class MPVView(context: Context, attrs: AttributeSet) : BaseMPVView(cont
      */
     fun getVideoAspect(): Double? {
         return MPVLib.getPropertyDouble("video-params/aspect")?.let {
-            if (it < 0.001)
-                return 0.0
-            val rot = MPVLib.getPropertyInt("video-params/rotate") ?: 0
-            if (rot % 180 == 90)
-                1.0 / it
-            else
-                it
-        }
-    }
-
-    /**
-     * Returns the video's decoded aspect ratio before display overrides such as
-     * video-aspect-override are applied. Rotation is taken into account.
-     */
-    fun getVideoAspectForOrientation(): Double? {
-        return MPVLib.getPropertyDouble("video-dec-params/aspect")?.let {
             if (it < 0.001)
                 return 0.0
             val rot = MPVLib.getPropertyInt("video-params/rotate") ?: 0
