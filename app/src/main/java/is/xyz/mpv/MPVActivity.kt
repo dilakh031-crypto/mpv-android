@@ -153,19 +153,12 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
     private var deferPlayerInit: Boolean = false
     private var uiInitialized: Boolean = false
 
-    // Hide the mpv texture while a new file/reconfig is waiting for reliable
-    // video geometry. Aspect-menu changes have their own short blackout so an
-    // old frame is never exposed after the SurfaceTexture has already been
-    // resized to the newly selected aspect ratio.
+    // One owner for hiding the mpv texture while a new file/reconfig is waiting
+    // for reliable video geometry.
     private var videoGeometryBlackoutActive = true
     private var videoGeometryBlackoutGeneration = 0
     private var videoGeometryBlackoutRevealArmed = false
     private var videoGeometryBlackoutFileLoadedSeen = false
-    private var aspectRatioSwitchBlackoutActive = false
-    private var aspectRatioSwitchGeneration = 0
-    private var aspectRatioSwitchRevealArmed = false
-    private var aspectRatioSwitchTargetOverride = ""
-    private var aspectRatioSwitchTargetPanscan = 0.0
 
     private val psc = Utils.PlaybackStateCache()
     private var mediaSession: MediaSessionCompat? = null
@@ -593,115 +586,14 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
         if (!::binding.isInitialized || !uiInitialized)
             return
 
-        updateVideoBlackoutOverlayVisibility()
+        binding.videoBlackoutOverlay.visibility = if (visible) View.VISIBLE else View.GONE
     }
 
     private fun beginVideoGeometryBlackout() {
-        aspectRatioSwitchBlackoutActive = false
-        aspectRatioSwitchRevealArmed = false
         setVideoGeometryBlackout(true)
         if (::zoomGestures.isInitialized) {
             try { zoomGestures.resetForNewFile() } catch (_: Throwable) {}
         }
-    }
-
-    private fun updateVideoBlackoutOverlayVisibility() {
-        if (!::binding.isInitialized || !uiInitialized)
-            return
-        binding.videoBlackoutOverlay.visibility =
-            if (videoGeometryBlackoutActive || aspectRatioSwitchBlackoutActive)
-                View.VISIBLE
-            else
-                View.GONE
-    }
-
-    private fun parseAspectRatioValue(value: String?): Double? {
-        val trimmed = value?.trim() ?: return null
-        if (trimmed.isEmpty() || trimmed == "-1" || trimmed.equals("no", true) || trimmed == "panscan")
-            return null
-
-        val parts = trimmed.split(':', limit = 2)
-        val parsed = if (parts.size == 2) {
-            val width = parts[0].toDoubleOrNull()
-            val height = parts[1].toDoubleOrNull()
-            if (width != null && height != null && height != 0.0)
-                width / height
-            else
-                null
-        } else {
-            trimmed.toDoubleOrNull()
-        }
-        return parsed?.takeIf { it > 0.001 }
-    }
-
-    private fun aspectOverrideMatches(current: String?, target: String): Boolean {
-        if (current?.trim() == target.trim())
-            return true
-
-        val targetValue = parseAspectRatioValue(target)
-        val currentValue = parseAspectRatioValue(current)
-        return if (targetValue == null)
-            currentValue == null
-        else
-            currentValue != null && abs(currentValue - targetValue) < 0.001
-    }
-
-    private fun beginAspectRatioSwitchBlackout(
-        targetOverride: String,
-        targetPanscan: Double,
-        targetAspect: Double?,
-        targetPixelSize: Pair<Int, Int>?,
-    ) {
-        aspectRatioSwitchGeneration += 1
-        val generation = aspectRatioSwitchGeneration
-        aspectRatioSwitchBlackoutActive = true
-        aspectRatioSwitchRevealArmed = false
-        aspectRatioSwitchTargetOverride = targetOverride
-        aspectRatioSwitchTargetPanscan = targetPanscan
-        updateVideoBlackoutOverlayVisibility()
-
-        // Resize and position the TextureView only while it is covered. Otherwise
-        // Android can briefly stretch the last frame from the old SurfaceTexture
-        // buffer before mpv produces the first frame with the new aspect ratio.
-        if (::zoomGestures.isInitialized) {
-            try {
-                zoomGestures.applyPredictedAspectMenuGeometry(
-                    aspect = targetAspect,
-                    pixelSize = targetPixelSize,
-                    panscanValue = targetPanscan,
-                )
-            } catch (_: Throwable) {}
-        }
-
-        // Safety fallback for paused/static media or devices which fail to send
-        // an additional SurfaceTexture frame callback after the property update.
-        eventUiHandler.postDelayed({
-            if (aspectRatioSwitchBlackoutActive && generation == aspectRatioSwitchGeneration) {
-                syncZoomVideoGeometry(prepareNormalSurface = true, immediate = true)
-                aspectRatioSwitchRevealArmed = true
-                ViewCompat.postOnAnimation(binding.player) {
-                    if (aspectRatioSwitchBlackoutActive && generation == aspectRatioSwitchGeneration) {
-                        aspectRatioSwitchBlackoutActive = false
-                        aspectRatioSwitchRevealArmed = false
-                        updateVideoBlackoutOverlayVisibility()
-                    }
-                }
-            }
-        }, ASPECT_RATIO_SWITCH_BLACKOUT_FALLBACK_MS)
-    }
-
-    private fun maybeArmAspectRatioSwitchReveal() {
-        if (!aspectRatioSwitchBlackoutActive || aspectRatioSwitchRevealArmed)
-            return
-
-        val currentOverride = MPVLib.getPropertyString("video-aspect-override")
-        val currentPanscan = MPVLib.getPropertyDouble("panscan") ?: 0.0
-        if (!aspectOverrideMatches(currentOverride, aspectRatioSwitchTargetOverride) ||
-            abs(currentPanscan - aspectRatioSwitchTargetPanscan) >= 0.001
-        ) return
-
-        syncZoomVideoGeometry(prepareNormalSurface = true, immediate = true)
-        aspectRatioSwitchRevealArmed = true
     }
 
     private fun armVideoGeometryBlackoutReveal() {
@@ -714,20 +606,6 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
         if (Looper.myLooper() != Looper.getMainLooper()) {
             eventUiHandler.post { onPlayerSurfaceFrameAvailable() }
             return
-        }
-
-        if (aspectRatioSwitchBlackoutActive && aspectRatioSwitchRevealArmed) {
-            val generation = aspectRatioSwitchGeneration
-            ViewCompat.postOnAnimation(binding.player) {
-                if (aspectRatioSwitchBlackoutActive &&
-                    aspectRatioSwitchRevealArmed &&
-                    generation == aspectRatioSwitchGeneration
-                ) {
-                    aspectRatioSwitchBlackoutActive = false
-                    aspectRatioSwitchRevealArmed = false
-                    updateVideoBlackoutOverlayVisibility()
-                }
-            }
         }
 
         if (!videoGeometryBlackoutActive || !videoGeometryBlackoutRevealArmed)
@@ -758,7 +636,6 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
     }
 
     private fun syncZoomVideoGeometry(
-        prepareNormalSurface: Boolean = false,
         immediate: Boolean = false,
     ) {
         if (!::zoomGestures.isInitialized)
@@ -773,7 +650,6 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
                 aspect = aspect,
                 pixelSize = size,
                 panscanValue = pan,
-                prepareNormalSurface = prepareNormalSurface,
                 immediate = immediate,
             )
         } catch (_: Throwable) {}
@@ -792,7 +668,7 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
         // The blackout is removed only after TextureView reports a real frame
         // update with this geometry, which avoids revealing a stale fullscreen
         // or old-aspect buffer on heavy images/videos.
-        syncZoomVideoGeometry(prepareNormalSurface = true, immediate = true)
+        syncZoomVideoGeometry(immediate = true)
         try { zoomGestures.prepareForVisibleMedia() } catch (_: Throwable) {}
         armVideoGeometryBlackoutReveal()
     }
@@ -920,18 +796,14 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
         isPlayingAudio = (haveAudio && MPVLib.getPropertyBoolean("mute") != true)
     }
 
-    private fun isPlayingAudioOnly(): Boolean {
-        if (!isPlayingAudio)
-            return false
-        return isAudioOnlyMedia()
-    }
-
     private fun isAudioOnlyMedia(): Boolean {
         if (MPVLib.getPropertyBoolean("current-tracks/audio/selected") != true)
             return false
         val image = MPVLib.getPropertyString("current-tracks/video/image")
         return image.isNullOrEmpty() || image == "yes"
     }
+
+    private fun isPlayingAudioOnly(): Boolean = isPlayingAudio && isAudioOnlyMedia()
 
     private fun shouldBackground(): Boolean {
         if (isFinishing) // about to exit?
@@ -2730,6 +2602,32 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
         val ratios = resources.getStringArray(R.array.aspect_ratios)
         val names = resources.getStringArray(R.array.aspect_ratio_names)
 
+        fun parseAspectRatio(value: String): Double? {
+            val trimmed = value.trim()
+            if (trimmed.isEmpty() || trimmed == "panscan" || trimmed == "-1" || trimmed.equals("no", true))
+                return null
+
+            val parts = trimmed.split(':', limit = 2)
+            return if (parts.size == 2) {
+                val width = parts[0].toDoubleOrNull()
+                val height = parts[1].toDoubleOrNull()
+                if (width != null && height != null && height != 0.0)
+                    width / height
+                else
+                    null
+            } else {
+                trimmed.toDoubleOrNull()
+            }
+        }
+
+        fun aspectRatioMatches(current: String, ratio: String): Boolean {
+            if (current == ratio)
+                return true
+            val currentValue = parseAspectRatio(current) ?: return false
+            val ratioValue = parseAspectRatio(ratio) ?: return false
+            return abs(currentValue - ratioValue) < 0.001
+        }
+
         val currentPanscan = MPVLib.getPropertyDouble("panscan") ?: 0.0
         val currentOverride = MPVLib.getPropertyString("video-aspect-override")?.trim() ?: ""
         val panscanIndex = ratios.indexOf("panscan")
@@ -2738,57 +2636,43 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
             panscanIndex
         } else {
             ratios.indexOfFirst { ratio ->
-                ratio != "panscan" && aspectOverrideMatches(currentOverride, ratio)
+                ratio != "panscan" && aspectRatioMatches(currentOverride, ratio)
             }
         }
         if (selectedIndex < 0) selectedIndex = originalIndex
 
         var handled = false
         val dialog = with(AlertDialog.Builder(this)) {
-            setSingleChoiceItems(names, selectedIndex) choice@{ _, item ->
-                // Aspect ratio has no visual meaning for an audio-only item. More
-                // importantly, touching video output properties for embedded cover
-                // art can make mpv rebuild the VO and briefly interrupt audio.
-                if (isAudioOnlyMedia())
-                    return@choice
-
+            setSingleChoiceItems(names, selectedIndex) { _, item ->
                 val ratio = ratios[item]
-                val targetOverride = if (ratio == "panscan") "-1" else ratio
                 val targetPanscan = if (ratio == "panscan") 1.0 else 0.0
                 val targetAspect = if (ratio == "panscan") {
                     try { player.getVideoAspect() } catch (_: Throwable) { null }
                 } else {
-                    parseAspectRatioValue(ratio) ?: try { player.getVideoAspect() } catch (_: Throwable) { null }
+                    parseAspectRatio(ratio) ?: try { player.getVideoAspect() } catch (_: Throwable) { null }
                 }
                 val targetPixelSize = try { player.getVideoPixelSize() } catch (_: Throwable) { null }
-                val previousOverride = MPVLib.getPropertyString("video-aspect-override")
-                val previousPanscan = MPVLib.getPropertyDouble("panscan") ?: 0.0
-
-                if (aspectOverrideMatches(previousOverride, targetOverride) &&
-                    abs(previousPanscan - targetPanscan) < 0.001
-                ) return@choice
-
-                beginAspectRatioSwitchBlackout(
-                    targetOverride = targetOverride,
-                    targetPanscan = targetPanscan,
-                    targetAspect = targetAspect,
-                    targetPixelSize = targetPixelSize,
-                )
 
                 if (ratio == "panscan") {
-                    if (!aspectOverrideMatches(previousOverride, targetOverride))
-                        MPVLib.setPropertyString("video-aspect-override", targetOverride)
-                    if (abs(previousPanscan - targetPanscan) >= 0.001)
-                        MPVLib.setPropertyDouble("panscan", targetPanscan)
+                    MPVLib.setPropertyString("video-aspect-override", "-1")
+                    MPVLib.setPropertyDouble("panscan", 1.0)
                 } else {
-                    // Disable panscan first, then apply the explicit ratio. Both
-                    // operations happen behind the transition blackout.
-                    if (abs(previousPanscan - targetPanscan) >= 0.001)
-                        MPVLib.setPropertyDouble("panscan", targetPanscan)
-                    if (!aspectOverrideMatches(previousOverride, targetOverride))
-                        MPVLib.setPropertyString("video-aspect-override", targetOverride)
+                    MPVLib.setPropertyString("video-aspect-override", ratio)
+                    MPVLib.setPropertyDouble("panscan", 0.0)
                 }
-                eventUiHandler.post { maybeArmAspectRatioSwitchReveal() }
+
+                // Apply the predicted geometry only after mpv owns the new aspect.
+                // The Android render surface remains view-shaped, so the change is
+                // presented by mpv directly without a second fit/resize transition.
+                if (::zoomGestures.isInitialized) {
+                    try {
+                        zoomGestures.applyPredictedAspectMenuGeometry(
+                            aspect = targetAspect,
+                            pixelSize = targetPixelSize,
+                            panscanValue = targetPanscan,
+                        )
+                    } catch (_: Throwable) {}
+                }
                 // Keep dialog open (apply-in-place).
             }
             // "Cancel" behaves like Back (up to the advanced menu).
@@ -2930,7 +2814,7 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
         openSubDelayDialog()
     })
 
-    if (player.vid == -1 || isAudioOnlyMedia())
+    if (player.vid == -1)
         hiddenButtons.addAll(arrayOf(R.id.rowVideo1, R.id.rowVideo2, R.id.aspectBtn))
     if (player.aid == -1 || player.vid == -1)
         hiddenButtons.add(R.id.audioDelayBtn)
@@ -2995,7 +2879,9 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
         val videoButtons = arrayOf(R.id.cycleAudioBtn, R.id.cycleSubsBtn, R.id.playBtn,
                 R.id.cycleDecoderBtn, R.id.cycleSpeedBtn)
 
-        val shouldUseAudioUI = isAudioOnlyMedia()
+        val shouldUseAudioUI = isPlayingAudioOnly()
+        if (::zoomGestures.isInitialized)
+            zoomGestures.setAudioOnlyMode(isAudioOnlyMedia())
         if (shouldUseAudioUI == useAudioUI)
             return
         useAudioUI = shouldUseAudioUI
@@ -3017,8 +2903,6 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
             Utils.viewGroupReorder(binding.controlsTitleGroup, arrayOf(R.id.titleTextView, R.id.minorTitleTextView))
             updateMetadataDisplay()
 
-            // Match video startup behavior: switching to the audio layout must
-            // not force the controls on-screen. The user can reveal them with a tap.
             hideControls()
         } else {
             Utils.viewGroupMove(buttonGroup, R.id.prevBtn, seekbarGroup, 0)
@@ -3385,7 +3269,6 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
             "panscan" -> {
                 syncZoomVideoGeometry()
                 prepareZoomSurfaceAndRevealWhenReady()
-                maybeArmAspectRatioSwitchReveal()
             }
         }
     }
@@ -3397,7 +3280,6 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
             "video-aspect-override" -> {
                 syncZoomVideoGeometry()
                 prepareZoomSurfaceAndRevealWhenReady()
-                maybeArmAspectRatioSwitchReveal()
             }
         }
         if (metaUpdated)
@@ -3772,10 +3654,6 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
         // Controls fade-in/out durations (ms). Keep them very fast but non-zero to avoid a harsh pop.
         private const val CONTROLS_FADE_IN_DURATION = 80L
         private const val CONTROLS_FADE_OUT_DURATION = 80L
-        // Maximum time to keep the old/asynchronously resized frame covered if a
-        // device does not report a fresh SurfaceTexture frame after an aspect change.
-        private const val ASPECT_RATIO_SWITCH_BLACKOUT_FALLBACK_MS = 450L
-
         // Tap timing (must match TouchGestures.TAP_DURATION).
         // - Double-tap gestures: fast window (ms)
         // - Single-tap control toggle: delayed slightly longer so double-tap can cancel it (ms)
