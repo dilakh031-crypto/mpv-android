@@ -49,10 +49,9 @@ internal class VideoZoomGestures(
     private var videoPixelHeight = 0
     private var panscan = 0.0
 
-    // Cover art attached to audio should not make aspect-menu changes resize the real
-    // SurfaceTexture. A surface-size reconfiguration can briefly starve/restart audio on
-    // some devices. In this mode mpv renders into the stable view-sized surface and handles
-    // the selected display aspect inside it, just like a regular untransformed player view.
+    // Cover art attached to audio uses a stable, view-shaped SurfaceTexture. mpv stretches
+    // once into that surface, while aspect and panscan choices are applied only as Android
+    // transforms. Menu changes therefore never reconfigure mpv's still-image video output.
     private var audioOnlyVisual = false
 
     private val touchSlop = ViewConfiguration.get(target.context).scaledTouchSlop.toFloat()
@@ -281,6 +280,8 @@ internal class VideoZoomGestures(
     }
 
     fun isZoomed(): Boolean = scale > 1f + EPS
+
+    fun isUsingMediaAspectRenderSurface(): Boolean = renderSurfaceMode.usesMediaAspectFit
 
     fun shouldBlockOtherGestures(e: MotionEvent): Boolean {
         return isZoomed() || pendingPinchDoubleTapReset || scaleDetector.isInProgress || e.pointerCount > 1
@@ -643,10 +644,23 @@ internal class VideoZoomGestures(
     }
 
     private fun renderSurfaceFitTransform(): SurfaceFitTransform {
-        if (!renderSurfaceMode.usesMediaAspectFit || viewWidth <= 1f || viewHeight <= 1f)
+        if (viewWidth <= 1f || viewHeight <= 1f)
             return SurfaceFitTransform.IDENTITY
 
-        val c = contentRect()
+        if (audioOnlyVisual) {
+            return if (isPanscanActive())
+                audioOnlyPanscanTransform()
+            else
+                fitTransformForRect(contentRect())
+        }
+
+        if (!renderSurfaceMode.usesMediaAspectFit)
+            return SurfaceFitTransform.IDENTITY
+
+        return fitTransformForRect(contentRect())
+    }
+
+    private fun fitTransformForRect(c: ContentRect): SurfaceFitTransform {
         if (c.w <= 1f || c.h <= 1f)
             return SurfaceFitTransform.IDENTITY
 
@@ -656,6 +670,29 @@ internal class VideoZoomGestures(
             translationX = c.ox.toDouble(),
             translationY = c.oy.toDouble(),
         )
+    }
+
+    private fun audioOnlyPanscanTransform(): SurfaceFitTransform {
+        val viewAspect = viewWidth / viewHeight
+        val sourceAspect = videoAspect.toFloat().takeIf { it > 0.001f } ?: viewAspect
+
+        return if (sourceAspect > viewAspect) {
+            val scaleX = sourceAspect / viewAspect
+            SurfaceFitTransform(
+                scaleX = scaleX,
+                scaleY = 1f,
+                translationX = ((viewWidth - viewWidth * scaleX) * 0.5f).toDouble(),
+                translationY = 0.0,
+            )
+        } else {
+            val scaleY = viewAspect / sourceAspect
+            SurfaceFitTransform(
+                scaleX = 1f,
+                scaleY = scaleY,
+                translationX = 0.0,
+                translationY = ((viewHeight - viewHeight * scaleY) * 0.5f).toDouble(),
+            )
+        }
     }
 
     private fun updateRenderSurfaceForCurrentState(force: Boolean) {
