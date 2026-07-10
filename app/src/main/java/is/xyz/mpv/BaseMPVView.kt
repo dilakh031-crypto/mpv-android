@@ -99,7 +99,33 @@ abstract class BaseMPVView(context: Context, attrs: AttributeSet) : TextureView(
     private var renderSurfaceHeight = 0
     private var customRenderSurfaceSize = false
 
-    var onSurfaceTextureFrameAvailable: (() -> Unit)? = null
+    // SurfaceTexture buffer-size changes are asynchronous.  The activity uses this
+    // serial to keep its transition cover visible until mpv has actually submitted
+    // a frame after the final surface geometry was selected.
+    private var surfaceFrameSerial = 0L
+    private var renderSurfaceRevision = 0L
+    private var pendingFrameAfterSerial = Long.MAX_VALUE
+    private var pendingSurfaceFrameCallback: (() -> Unit)? = null
+
+    fun getSurfaceFrameSerial(): Long = surfaceFrameSerial
+    fun getRenderSurfaceRevision(): Long = renderSurfaceRevision
+
+    fun runAfterSurfaceFrame(afterSerial: Long, callback: () -> Unit) {
+        if (surfaceFrameSerial > afterSerial) {
+            post { callback() }
+            return
+        }
+
+        // Only the newest geometry request matters. Replacing the previous waiter
+        // prevents an obsolete aspect update from revealing the TextureView.
+        pendingFrameAfterSerial = afterSerial
+        pendingSurfaceFrameCallback = callback
+    }
+
+    fun clearPendingSurfaceFrameCallback() {
+        pendingFrameAfterSerial = Long.MAX_VALUE
+        pendingSurfaceFrameCallback = null
+    }
 
     /**
      * Set the real SurfaceTexture buffer size used by mpv without changing the
@@ -150,6 +176,7 @@ abstract class BaseMPVView(context: Context, attrs: AttributeSet) : TextureView(
 
         texture.setDefaultBufferSize(renderSurfaceWidth, renderSurfaceHeight)
         MPVLib.setPropertyString("android-surface-size", "${renderSurfaceWidth}x${renderSurfaceHeight}")
+        renderSurfaceRevision++
     }
 
     private fun attachSurfaceTexture(texture: SurfaceTexture, width: Int, height: Int) {
@@ -159,6 +186,7 @@ abstract class BaseMPVView(context: Context, attrs: AttributeSet) : TextureView(
         attachedTexture = texture
         ensureRenderSurfaceSize(width, height)
         texture.setDefaultBufferSize(renderSurfaceWidth, renderSurfaceHeight)
+        renderSurfaceRevision++
 
         Log.w(TAG, "attaching texture surface ${renderSurfaceWidth}x${renderSurfaceHeight}")
         val surface = Surface(texture)
@@ -206,12 +234,19 @@ abstract class BaseMPVView(context: Context, attrs: AttributeSet) : TextureView(
     }
 
     override fun onSurfaceTextureDestroyed(surface: SurfaceTexture): Boolean {
+        clearPendingSurfaceFrameCallback()
         detachSurfaceTexture()
         return true
     }
 
     override fun onSurfaceTextureUpdated(surface: SurfaceTexture) {
-        onSurfaceTextureFrameAvailable?.invoke()
+        surfaceFrameSerial++
+        if (surfaceFrameSerial <= pendingFrameAfterSerial)
+            return
+
+        val callback = pendingSurfaceFrameCallback ?: return
+        clearPendingSurfaceFrameCallback()
+        callback()
     }
 
     companion object {
