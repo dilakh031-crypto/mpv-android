@@ -17,6 +17,8 @@ import android.content.pm.ActivityInfo
 import android.content.pm.PackageManager
 import android.content.res.ColorStateList
 import android.content.res.Configuration
+import android.graphics.Bitmap
+import android.graphics.Matrix
 import android.graphics.drawable.Icon
 import android.graphics.Color
 import android.util.Log
@@ -32,6 +34,8 @@ import androidx.core.content.ContextCompat
 import android.view.*
 import android.view.ViewGroup.MarginLayoutParams
 import android.widget.Button
+import android.widget.ImageView
+import android.widget.RelativeLayout
 import android.widget.SeekBar
 import android.widget.Toast
 import androidx.activity.addCallback
@@ -168,6 +172,7 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
     private lateinit var binding: PlayerBinding
     private lateinit var gestures: TouchGestures
     private lateinit var zoomGestures: VideoZoomGestures
+    private lateinit var audioCoverZoomGestures: VideoZoomGestures
 
     // convenience alias
     private val player get() = binding.player
@@ -358,8 +363,14 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
             if (e.actionMasked == MotionEvent.ACTION_POINTER_DOWN)
                 gestures.cancel()
 
-            val blockDefault = zoomGestures.shouldBlockOtherGestures(e)
-            val handledByZoom = zoomGestures.onTouchEvent(e)
+            val activeZoomGestures = if (
+                audioOnlyAspectRenderingActive &&
+                audioOnlyCoverBitmap != null &&
+                ::audioCoverZoomGestures.isInitialized
+            ) audioCoverZoomGestures else zoomGestures
+
+            val blockDefault = activeZoomGestures.shouldBlockOtherGestures(e)
+            val handledByZoom = activeZoomGestures.onTouchEvent(e)
 
             when {
                 blockDefault -> handledByZoom
@@ -497,6 +508,7 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
 
         setContentView(binding.root)
         uiInitialized = true
+        ensureAudioOnlyCoverView()
         refreshPlayerOverlay()
 
         // Init controls to be hidden and view fullscreen
@@ -592,6 +604,7 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
     }
 
     private fun beginVideoGeometryBlackout() {
+        clearAudioOnlyCoverSnapshot()
         setVideoGeometryBlackout(true)
         if (::zoomGestures.isInitialized) {
             try { zoomGestures.resetForNewFile() } catch (_: Throwable) {}
@@ -609,6 +622,9 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
             eventUiHandler.post { onPlayerSurfaceFrameAvailable() }
             return
         }
+
+        if (audioOnlyAspectRenderingActive && audioOnlyCoverBitmap == null)
+            captureAudioOnlyCoverSnapshot()
 
         if (!videoGeometryBlackoutActive || !videoGeometryBlackoutRevealArmed)
             return
@@ -632,7 +648,11 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
     }
 
     private fun hasDisplayableVideoGeometry(): Boolean {
-        val aspect = try { player.getEffectiveVideoAspect() ?: 0.0 } catch (_: Throwable) { 0.0 }
+        val aspect = if (audioOnlyAspectRenderingActive) {
+            audioOnlyAspectGeometry().first ?: 0.0
+        } else {
+            try { player.getEffectiveVideoAspect() ?: 0.0 } catch (_: Throwable) { 0.0 }
+        }
         val size = try { player.getVideoPixelSize() } catch (_: Throwable) { null }
         return aspect > 0.001 && size != null
     }
@@ -649,9 +669,23 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
         if (!::zoomGestures.isInitialized || isAspectMenuGeometrySyncSuppressed())
             return
 
-        val aspect = try { player.getEffectiveVideoAspect() } catch (_: Throwable) { null }
+        // Do not transform or resize mpv's TextureView for audio cover art. On some devices,
+        // even an Android-side TextureView transform briefly stalls the audio output. The cover
+        // is mirrored into a separate ImageView and all aspect changes are applied there.
+        if (audioOnlyAspectRenderingActive) {
+            if (audioOnlyCoverBitmap == null)
+                scheduleAudioOnlyCoverCapture()
+            return
+        }
+
         val size = try { player.getVideoPixelSize() } catch (_: Throwable) { null }
-        val pan = try { player.getPanscan() } catch (_: Throwable) { 0.0 }
+        val geometry = run {
+            val aspect = try { player.getEffectiveVideoAspect() } catch (_: Throwable) { null }
+            val pan = try { player.getPanscan() } catch (_: Throwable) { 0.0 }
+            aspect to pan
+        }
+        val aspect = geometry.first
+        val pan = geometry.second
 
         try {
             zoomGestures.setVideoGeometry(
@@ -672,6 +706,14 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
             return
         if (!hasDisplayableVideoGeometry())
             return
+
+        if (audioOnlyAspectRenderingActive) {
+            // Keep the real mpv TextureView in its plain startup geometry for audio cover art.
+            // The ImageView snapshot will provide every later aspect/zoom change.
+            scheduleAudioOnlyCoverCapture()
+            armVideoGeometryBlackoutReveal()
+            return
+        }
 
         // Pull all geometry at once while the blackout is still covering mpv.
         // The blackout is removed only after TextureView reports a real frame
@@ -766,6 +808,7 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
         stopServiceRunnable.run()
 
         player.removeObserver(this)
+        clearAudioOnlyCoverSnapshot()
         player.destroy()
         super.onDestroy()
     }
@@ -810,6 +853,267 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
             return false
         val image = MPVLib.getPropertyString("current-tracks/video/image")
         return image.isNullOrEmpty() || image == "yes"
+    }
+
+    private fun parseAspectRatioValue(value: String?): Double? {
+        val trimmed = value?.trim() ?: return null
+        if (trimmed.isEmpty() || trimmed == "panscan" || trimmed == "-1" || trimmed.equals("no", true))
+            return null
+
+        val parts = trimmed.split(':', limit = 2)
+        return if (parts.size == 2) {
+            val width = parts[0].toDoubleOrNull()
+            val height = parts[1].toDoubleOrNull()
+            if (width != null && height != null && height != 0.0)
+                width / height
+            else
+                null
+        } else {
+            trimmed.toDoubleOrNull()
+        }
+    }
+
+    private fun audioOnlyAspectGeometry(): Pair<Double?, Double> {
+        val nativeAspect = audioOnlyCoverNativeAspect
+            ?: try { player.getVideoAspect() } catch (_: Throwable) { null }
+        val selection = audioOnlyAspectSelection
+        return if (selection == "panscan") {
+            nativeAspect to 1.0
+        } else {
+            (parseAspectRatioValue(selection) ?: nativeAspect) to 0.0
+        }
+    }
+
+    private fun ensureAudioOnlyCoverView(): ImageView {
+        audioOnlyCoverView?.let { return it }
+
+        val coverView = ImageView(this).apply {
+            visibility = View.GONE
+            scaleType = ImageView.ScaleType.MATRIX
+            setBackgroundColor(Color.BLACK)
+            isClickable = false
+            isFocusable = false
+            importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO
+            addOnLayoutChangeListener { _, _, _, _, _, _, _, _, _ ->
+                applyAudioOnlyCoverAspect()
+            }
+        }
+
+        val params = RelativeLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT,
+            ViewGroup.LayoutParams.MATCH_PARENT,
+        )
+        val playerIndex = binding.root.indexOfChild(binding.player)
+        val insertIndex = (playerIndex + 1).coerceIn(0, binding.root.childCount)
+        binding.root.addView(coverView, insertIndex, params)
+        audioOnlyCoverView = coverView
+        audioCoverZoomGestures = VideoZoomGestures(coverView)
+        return coverView
+    }
+
+    private fun clearAudioOnlyCoverSnapshot() {
+        audioOnlyCoverView?.apply {
+            setImageDrawable(null)
+            visibility = View.GONE
+        }
+        audioOnlyCoverBitmap?.let {
+            try { if (!it.isRecycled) it.recycle() } catch (_: Throwable) {}
+        }
+        audioOnlyCoverBitmap = null
+        audioOnlyCoverNativeAspect = null
+        audioOnlyCoverCaptureAttempts = 0
+        audioOnlyCoverCaptureScheduled = false
+        if (::audioCoverZoomGestures.isInitialized) {
+            try { audioCoverZoomGestures.resetForNewFile() } catch (_: Throwable) {}
+        }
+    }
+
+    private fun scheduleAudioOnlyCoverCapture() {
+        if (!audioOnlyAspectRenderingActive || !uiInitialized || audioOnlyCoverBitmap != null)
+            return
+        if (audioOnlyCoverCaptureScheduled)
+            return
+        if (audioOnlyCoverCaptureAttempts >= AUDIO_ONLY_COVER_CAPTURE_MAX_ATTEMPTS)
+            return
+
+        val delay = if (audioOnlyCoverCaptureAttempts == 0) 0L else AUDIO_ONLY_COVER_CAPTURE_RETRY_MS
+        audioOnlyCoverCaptureAttempts += 1
+        audioOnlyCoverCaptureScheduled = true
+        binding.player.postDelayed({
+            audioOnlyCoverCaptureScheduled = false
+            if (!audioOnlyAspectRenderingActive || audioOnlyCoverBitmap != null)
+                return@postDelayed
+            if (!captureAudioOnlyCoverSnapshot())
+                scheduleAudioOnlyCoverCapture()
+        }, delay)
+    }
+
+    private fun hasVisibleAudioOnlyCoverPixels(bitmap: Bitmap): Boolean {
+        if (bitmap.width <= 1 || bitmap.height <= 1)
+            return false
+
+        // Reject only a nearly uniform black/transparent frame. This protects devices where a
+        // screenshot requested during the first render callback still returns the cleared buffer.
+        // The real mpv surface remains visible while another capture is attempted.
+        val samplesPerAxis = 12
+        var visibleSamples = 0
+        var brightest = 0
+        var darkest = 255
+        for (iy in 0 until samplesPerAxis) {
+            val y = ((bitmap.height - 1L) * iy / (samplesPerAxis - 1)).toInt()
+            for (ix in 0 until samplesPerAxis) {
+                val x = ((bitmap.width - 1L) * ix / (samplesPerAxis - 1)).toInt()
+                val pixel = bitmap.getPixel(x, y)
+                if (Color.alpha(pixel) <= 16)
+                    continue
+                visibleSamples += 1
+                val level = maxOf(Color.red(pixel), Color.green(pixel), Color.blue(pixel))
+                brightest = maxOf(brightest, level)
+                darkest = minOf(darkest, level)
+            }
+        }
+        return visibleSamples > 0 && (brightest > 12 || brightest - darkest > 8)
+    }
+
+    private fun captureAudioOnlyCoverSnapshot(): Boolean {
+        if (!audioOnlyAspectRenderingActive || !uiInitialized || player.vid == -1)
+            return false
+        val imageTrack = try {
+            MPVLib.getPropertyString("current-tracks/video/image")
+        } catch (_: Throwable) {
+            null
+        }
+        if (imageTrack != "yes")
+            return false
+        if (videoGeometryBlackoutActive &&
+            (!videoGeometryBlackoutFileLoadedSeen || !hasDisplayableVideoGeometry())
+        ) return false
+
+        // TextureView.getBitmap() can return a completely black buffer on some devices even
+        // though mpv is already showing the embedded cover. Read the decoded frame directly
+        // from mpv instead. This happens only once per file; later aspect/zoom changes affect
+        // the detached ImageView and never touch mpv's surface or video properties.
+        val cover = try {
+            MPVLib.grabVideoFrame(AUDIO_ONLY_COVER_CAPTURE_MAX_EDGE)
+        } catch (_: Throwable) {
+            null
+        } ?: return false
+        if (!hasVisibleAudioOnlyCoverPixels(cover)) {
+            try { cover.recycle() } catch (_: Throwable) {}
+            return false
+        }
+
+        audioOnlyCoverView?.setImageDrawable(null)
+        audioOnlyCoverBitmap?.let {
+            try { if (!it.isRecycled) it.recycle() } catch (_: Throwable) {}
+        }
+        audioOnlyCoverBitmap = cover
+        audioOnlyCoverNativeAspect = try { player.getVideoAspect() } catch (_: Throwable) { null }
+            ?.takeIf { it > 0.001 }
+            ?: (cover.width.toDouble() / cover.height.toDouble())
+
+        ensureAudioOnlyCoverView().apply {
+            setImageBitmap(cover)
+            visibility = View.VISIBLE
+        }
+        applyAudioOnlyCoverAspect()
+        return true
+    }
+
+    private fun applyAudioOnlyCoverAspect() {
+        if (!audioOnlyAspectRenderingActive)
+            return
+
+        val coverView = audioOnlyCoverView ?: return
+        val cover = audioOnlyCoverBitmap ?: return
+        val viewWidth = coverView.width.toFloat()
+        val viewHeight = coverView.height.toFloat()
+        if (viewWidth <= 1f || viewHeight <= 1f || cover.width <= 0 || cover.height <= 0)
+            return
+
+        val nativeAspect = (audioOnlyCoverNativeAspect
+            ?: (cover.width.toDouble() / cover.height.toDouble()))
+            .coerceAtLeast(0.001)
+        val selected = audioOnlyAspectSelection
+        val targetAspect = (parseAspectRatioValue(selected) ?: nativeAspect)
+            .coerceAtLeast(0.001)
+        val viewAspect = viewWidth / viewHeight
+
+        val targetWidth: Float
+        val targetHeight: Float
+        if (selected == "panscan") {
+            // Fill the screen while preserving the cover's original aspect, cropping the excess.
+            if (nativeAspect > viewAspect) {
+                targetHeight = viewHeight
+                targetWidth = (viewHeight * nativeAspect).toFloat()
+            } else {
+                targetWidth = viewWidth
+                targetHeight = (viewWidth / nativeAspect).toFloat()
+            }
+        } else if (targetAspect > viewAspect) {
+            targetWidth = viewWidth
+            targetHeight = (viewWidth / targetAspect).toFloat()
+        } else {
+            targetHeight = viewHeight
+            targetWidth = (viewHeight * targetAspect).toFloat()
+        }
+
+        val dx = (viewWidth - targetWidth) * 0.5f
+        val dy = (viewHeight - targetHeight) * 0.5f
+        val matrix = Matrix().apply {
+            setScale(targetWidth / cover.width.toFloat(), targetHeight / cover.height.toFloat())
+            postTranslate(dx, dy)
+        }
+        coverView.imageMatrix = matrix
+        coverView.invalidate()
+
+        if (::audioCoverZoomGestures.isInitialized) {
+            val geometry = audioOnlyAspectGeometry()
+            try {
+                audioCoverZoomGestures.setVideoGeometry(
+                    aspect = geometry.first,
+                    pixelSize = cover.width to cover.height,
+                    panscanValue = geometry.second,
+                    prepareNormalSurface = true,
+                    immediate = true,
+                )
+            } catch (_: Throwable) {}
+        }
+    }
+
+    private fun beginAudioOnlyAspectRendering() {
+        if (audioOnlyAspectRenderingActive) {
+            if (audioOnlyCoverBitmap == null)
+                scheduleAudioOnlyCoverCapture()
+            return
+        }
+
+        val currentPanscan = try { player.getPanscan() } catch (_: Throwable) { 0.0 }
+        val currentOverride = try {
+            MPVLib.getPropertyString("video-aspect-override")?.trim()
+        } catch (_: Throwable) {
+            null
+        }
+
+        audioOnlyAspectSelection = if (currentPanscan > 0.0) {
+            "panscan"
+        } else if (parseAspectRatioValue(currentOverride) != null) {
+            currentOverride
+        } else {
+            "-1"
+        }
+        audioOnlyAspectRenderingActive = true
+        ensureAudioOnlyCoverView()
+        scheduleAudioOnlyCoverCapture()
+    }
+
+    private fun endAudioOnlyAspectRendering() {
+        if (!audioOnlyAspectRenderingActive)
+            return
+
+        audioOnlyAspectRenderingActive = false
+        audioOnlyAspectSelection = null
+        clearAudioOnlyCoverSnapshot()
     }
 
     private fun shouldBackground(): Boolean {
@@ -1110,6 +1414,18 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
     private var isPlayingAudio = false
 
     private var useAudioUI = false
+
+    // For audio-only files with cover art, keep mpv's TextureView completely untouched after
+    // startup. A one-frame ImageView mirror handles aspect/zoom changes independently, because
+    // either mpv property changes or TextureView transforms can briefly starve audio on some
+    // devices (notably older Samsung hardware).
+    private var audioOnlyAspectRenderingActive = false
+    private var audioOnlyAspectSelection: String? = null
+    private var audioOnlyCoverView: ImageView? = null
+    private var audioOnlyCoverBitmap: Bitmap? = null
+    private var audioOnlyCoverNativeAspect: Double? = null
+    private var audioOnlyCoverCaptureAttempts = 0
+    private var audioOnlyCoverCaptureScheduled = false
 
     private var lockedUI = false
 
@@ -1631,6 +1947,8 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
             if (v.width > 1 && v.height > 1) {
                 gestures.setMetrics(v.width.toFloat(), v.height.toFloat())
                 zoomGestures.setMetrics(v.width.toFloat(), v.height.toFloat())
+                if (::audioCoverZoomGestures.isInitialized)
+                    audioCoverZoomGestures.setMetrics(v.width.toFloat(), v.height.toFloat())
             }
         }
         binding.gestureLayer.post { updateGestureMetricsFromView() }
@@ -1654,6 +1972,8 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
         if (w > 1 && h > 1) {
             gestures.setMetrics(w.toFloat(), h.toFloat())
             zoomGestures.setMetrics(w.toFloat(), h.toFloat())
+            if (::audioCoverZoomGestures.isInitialized)
+                audioCoverZoomGestures.setMetrics(w.toFloat(), h.toFloat())
         }
     }
 
@@ -1671,6 +1991,7 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
         val isLandscape = newConfig.orientation == Configuration.ORIENTATION_LANDSCAPE
 
         updateGestureMetricsFromView()
+        audioOnlyCoverView?.post { applyAudioOnlyCoverAspect() }
 
         // Adjust control margins (only after the player UI is attached)
         if (uiInitialized) {
@@ -2609,34 +2930,24 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
         val ratios = resources.getStringArray(R.array.aspect_ratios)
         val names = resources.getStringArray(R.array.aspect_ratio_names)
 
-        fun parseAspectRatio(value: String): Double? {
-            val trimmed = value.trim()
-            if (trimmed.isEmpty() || trimmed == "panscan" || trimmed == "-1" || trimmed.equals("no", true))
-                return null
-
-            val parts = trimmed.split(':', limit = 2)
-            return if (parts.size == 2) {
-                val width = parts[0].toDoubleOrNull()
-                val height = parts[1].toDoubleOrNull()
-                if (width != null && height != null && height != 0.0)
-                    width / height
-                else
-                    null
-            } else {
-                trimmed.toDoubleOrNull()
-            }
-        }
-
         fun aspectRatioMatches(current: String, ratio: String): Boolean {
             if (current == ratio)
                 return true
-            val currentValue = parseAspectRatio(current) ?: return false
-            val ratioValue = parseAspectRatio(ratio) ?: return false
+            val currentValue = parseAspectRatioValue(current) ?: return false
+            val ratioValue = parseAspectRatioValue(ratio) ?: return false
             return abs(currentValue - ratioValue) < 0.001
         }
 
-        val currentPanscan = MPVLib.getPropertyDouble("panscan") ?: 0.0
-        val currentOverride = MPVLib.getPropertyString("video-aspect-override")?.trim() ?: ""
+        val currentPanscan = if (audioOnlyAspectRenderingActive && audioOnlyAspectSelection == "panscan") {
+            1.0
+        } else {
+            MPVLib.getPropertyDouble("panscan") ?: 0.0
+        }
+        val currentOverride = if (audioOnlyAspectRenderingActive) {
+            audioOnlyAspectSelection ?: "-1"
+        } else {
+            MPVLib.getPropertyString("video-aspect-override")?.trim() ?: ""
+        }
         val panscanIndex = ratios.indexOf("panscan")
         val originalIndex = ratios.indexOf("-1").takeIf { it >= 0 } ?: 0
         var selectedIndex = if (currentPanscan > 0.0 && panscanIndex >= 0) {
@@ -2652,11 +2963,23 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
         val dialog = with(AlertDialog.Builder(this)) {
             setSingleChoiceItems(names, selectedIndex) { _, item ->
                 val ratio = ratios[item]
+
+                if (audioOnlyAspectRenderingActive) {
+                    // Never touch mpv's TextureView, surface size, or video properties for an
+                    // audio cover. The still frame is shown by a separate ImageView, so changing
+                    // this matrix cannot interrupt the native audio output.
+                    audioOnlyAspectSelection = ratio
+                    if (audioOnlyCoverBitmap == null)
+                        scheduleAudioOnlyCoverCapture()
+                    applyAudioOnlyCoverAspect()
+                    return@setSingleChoiceItems
+                }
+
                 val targetPanscan = if (ratio == "panscan") 1.0 else 0.0
                 val targetAspect = if (ratio == "panscan") {
                     try { player.getVideoAspect() } catch (_: Throwable) { null }
                 } else {
-                    parseAspectRatio(ratio) ?: try { player.getVideoAspect() } catch (_: Throwable) { null }
+                    parseAspectRatioValue(ratio) ?: try { player.getVideoAspect() } catch (_: Throwable) { null }
                 }
                 val targetPixelSize = try { player.getVideoPixelSize() } catch (_: Throwable) { null }
 
@@ -2894,6 +3217,14 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
                 R.id.cycleDecoderBtn, R.id.cycleSpeedBtn)
 
         val shouldUseAudioUI = isPlayingAudioOnly()
+
+        // Audio cover-art aspect changes are handled on a detached ImageView. This avoids both a
+        // SurfaceTexture resize and mpv's still-image video-output reconfiguration.
+        if (shouldUseAudioUI)
+            beginAudioOnlyAspectRendering()
+        else
+            endAudioOnlyAspectRendering()
+
         if (shouldUseAudioUI == useAudioUI)
             return
         useAudioUI = shouldUseAudioUI
@@ -2914,6 +3245,9 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
             binding.controlsTitleGroup.visibility = View.VISIBLE
             Utils.viewGroupReorder(binding.controlsTitleGroup, arrayOf(R.id.titleTextView, R.id.minorTitleTextView))
             updateMetadataDisplay()
+
+            // Match video/image startup behavior: controls stay hidden until the user taps.
+            hideControls()
         } else {
             Utils.viewGroupMove(buttonGroup, R.id.prevBtn, seekbarGroup, 0)
             Utils.viewGroupMove(buttonGroup, R.id.nextBtn, seekbarGroup, -1)
@@ -3030,16 +3364,17 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
         if (initial || player.vid == -1)
             return
 
-        // Base automatic orientation on the media's native pixel dimensions, not on mpv's
-        // displayed aspect ratio. The latter can change when the user selects an aspect-ratio
-        // override, and that UI-only choice must never rotate the Android screen.
+        // Screen orientation must follow the media's own dimensions, not a display-only
+        // video-aspect-override selected from the aspect-ratio menu. mpv can report the
+        // overridden display aspect through its aspect property, while width/height remain
+        // the source geometry. Rotation metadata is already applied by getVideoPixelSize().
         val pixelSize = player.getVideoPixelSize() ?: return
         val ratio = pixelSize.first.toFloat() / pixelSize.second.toFloat()
 
-        // If the dimensions are unavailable/invalid, don't change orientation. In practice this
-        // can happen briefly while mpv is still probing the file (and reacting to it can cause a
+        // If the aspect ratio is unknown (0), don't change orientation. In practice this can
+        // happen briefly while mpv is still probing the file (and reacting to it can cause a
         // portrait "bounce" that sometimes sticks).
-        if (!ratio.isFinite() || ratio == 0f)
+        if (ratio == 0f)
             return
 
         if (ratio in (1f / ASPECT_RATIO_MIN) .. ASPECT_RATIO_MIN) {
@@ -3671,6 +4006,9 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
         // Predictive aspect-menu geometry is held briefly so asynchronous mpv
         // property notifications cannot momentarily restore an intermediate state.
         private const val ASPECT_MENU_PREDICTIVE_SYNC_GRACE_MS = 120L
+        private const val AUDIO_ONLY_COVER_CAPTURE_RETRY_MS = 60L
+        private const val AUDIO_ONLY_COVER_CAPTURE_MAX_ATTEMPTS = 12
+        private const val AUDIO_ONLY_COVER_CAPTURE_MAX_EDGE = 1440
 
         // Tap timing (must match TouchGestures.TAP_DURATION).
         // - Double-tap gestures: fast window (ms)

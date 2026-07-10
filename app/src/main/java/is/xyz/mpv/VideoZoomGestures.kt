@@ -49,6 +49,11 @@ internal class VideoZoomGestures(
     private var videoPixelHeight = 0
     private var panscan = 0.0
 
+    // Cover art attached to audio uses a stable, view-shaped SurfaceTexture. mpv stretches
+    // once into that surface, while aspect and panscan choices are applied only as Android
+    // transforms. Menu changes therefore never reconfigure mpv's still-image video output.
+    private var audioOnlyVisual = false
+
     private val touchSlop = ViewConfiguration.get(target.context).scaledTouchSlop.toFloat()
     private val panStartSlop = max(1f, min(2.5f, touchSlop * 0.22f))
 
@@ -174,6 +179,17 @@ internal class VideoZoomGestures(
         }
     )
 
+    fun setAudioOnlyVisual(value: Boolean) {
+        if (audioOnlyVisual == value)
+            return
+
+        audioOnlyVisual = value
+        if (target.width > 1 && target.height > 1) {
+            updateRenderSurfaceForCurrentState(force = true)
+            applyToView()
+        }
+    }
+
     fun setMetrics(width: Float, height: Float) {
         viewWidth = width
         viewHeight = height
@@ -264,6 +280,8 @@ internal class VideoZoomGestures(
     }
 
     fun isZoomed(): Boolean = scale > 1f + EPS
+
+    fun isUsingMediaAspectRenderSurface(): Boolean = renderSurfaceMode.usesMediaAspectFit
 
     fun shouldBlockOtherGestures(e: MotionEvent): Boolean {
         return isZoomed() || pendingPinchDoubleTapReset || scaleDetector.isInProgress || e.pointerCount > 1
@@ -626,10 +644,23 @@ internal class VideoZoomGestures(
     }
 
     private fun renderSurfaceFitTransform(): SurfaceFitTransform {
-        if (!renderSurfaceMode.usesMediaAspectFit || viewWidth <= 1f || viewHeight <= 1f)
+        if (viewWidth <= 1f || viewHeight <= 1f)
             return SurfaceFitTransform.IDENTITY
 
-        val c = contentRect()
+        if (audioOnlyVisual) {
+            return if (isPanscanActive())
+                audioOnlyPanscanTransform()
+            else
+                fitTransformForRect(contentRect())
+        }
+
+        if (!renderSurfaceMode.usesMediaAspectFit)
+            return SurfaceFitTransform.IDENTITY
+
+        return fitTransformForRect(contentRect())
+    }
+
+    private fun fitTransformForRect(c: ContentRect): SurfaceFitTransform {
         if (c.w <= 1f || c.h <= 1f)
             return SurfaceFitTransform.IDENTITY
 
@@ -641,8 +672,43 @@ internal class VideoZoomGestures(
         )
     }
 
+    private fun audioOnlyPanscanTransform(): SurfaceFitTransform {
+        val viewAspect = viewWidth / viewHeight
+        val sourceAspect = videoAspect.toFloat().takeIf { it > 0.001f } ?: viewAspect
+
+        return if (sourceAspect > viewAspect) {
+            val scaleX = sourceAspect / viewAspect
+            SurfaceFitTransform(
+                scaleX = scaleX,
+                scaleY = 1f,
+                translationX = ((viewWidth - viewWidth * scaleX) * 0.5f).toDouble(),
+                translationY = 0.0,
+            )
+        } else {
+            val scaleY = viewAspect / sourceAspect
+            SurfaceFitTransform(
+                scaleX = 1f,
+                scaleY = scaleY,
+                translationX = 0.0,
+                translationY = ((viewHeight - viewHeight * scaleY) * 0.5f).toDouble(),
+            )
+        }
+    }
+
     private fun updateRenderSurfaceForCurrentState(force: Boolean) {
         val zooming = isZoomed() || scaleDetector.isInProgress
+
+        if (audioOnlyVisual) {
+            // Keep a view-shaped SurfaceTexture while changing cover-art aspect. Its dimensions
+            // do not depend on videoAspect, so selecting another ratio cannot trigger an
+            // android-surface-size reconfiguration. Zoom may upgrade resolution once, but keeps
+            // the same stable view aspect for every subsequent ratio selection.
+            if (zooming)
+                requestStableAudioOriginalRenderSurfaceSize(force)
+            else
+                requestBaseRenderSurfaceSize(force)
+            return
+        }
 
         if (isPanscanActive()) {
             // panscan needs a view-shaped mpv output window. A media-aspect surface
@@ -675,6 +741,42 @@ internal class VideoZoomGestures(
 
         renderSurfaceMode = RenderSurfaceMode.BASE
         player.resetRenderSurfaceSize()
+    }
+
+    private fun requestStableAudioOriginalRenderSurfaceSize(force: Boolean) {
+        val player = renderTarget ?: return
+        refreshMetricsFromTarget()
+
+        if (!force && renderSurfaceMode == RenderSurfaceMode.VIEW_ASPECT_ORIGINAL)
+            return
+
+        if (viewWidth <= 1f || viewHeight <= 1f || videoPixelWidth <= 1 || videoPixelHeight <= 1) {
+            requestBaseRenderSurfaceSize(force = true)
+            return
+        }
+
+        // Size only from the source pixels and the window aspect, never from the selected
+        // display aspect. This preserves useful cover-art detail while guaranteeing that an
+        // aspect-menu change itself cannot resize the SurfaceTexture.
+        val desiredScale = max(
+            videoPixelWidth.toDouble() / viewWidth.toDouble(),
+            videoPixelHeight.toDouble() / viewHeight.toDouble(),
+        ).coerceAtLeast(1.0)
+        val maxByEdge = MAX_RENDER_SURFACE_EDGE /
+            max(viewWidth.toDouble(), viewHeight.toDouble()).coerceAtLeast(1.0)
+        val maxByPixels = sqrt(
+            MAX_RENDER_SURFACE_PIXELS /
+                (viewWidth.toDouble() * viewHeight.toDouble()).coerceAtLeast(1.0),
+        )
+        val bufferScale = desiredScale
+            .coerceAtMost(maxByEdge)
+            .coerceAtMost(maxByPixels)
+            .coerceAtLeast(1.0)
+
+        val bufferWidth = ceilToIntAtLeastOne(viewWidth.toDouble() * bufferScale)
+        val bufferHeight = ceilToIntAtLeastOne(viewHeight.toDouble() * bufferScale)
+        player.setRenderSurfaceSize(bufferWidth, bufferHeight)
+        renderSurfaceMode = RenderSurfaceMode.VIEW_ASPECT_ORIGINAL
     }
 
     private fun requestViewAspectOriginalRenderSurfaceSize(force: Boolean) {
