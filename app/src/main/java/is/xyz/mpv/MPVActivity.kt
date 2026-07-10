@@ -115,11 +115,6 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
     private var audioFocusRequest: AudioFocusRequestCompat? = null
     private var audioFocusRestore: () -> Unit = {}
 
-    // Preserve the last reliable media type through the brief property-unavailable window
-    // caused by an image-track reconfiguration. Otherwise a cover-art aspect change can
-    // temporarily disable audio-only surface protection and resize the TextureView.
-    private var lastKnownAudioOnlyMedia = false
-
     
     // Orientation smoothing / fast rotation
     private var entryConfigOrientation: Int = Configuration.ORIENTATION_UNDEFINED
@@ -159,11 +154,13 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
     private var uiInitialized: Boolean = false
 
     // One owner for hiding the mpv texture while a new file/reconfig is waiting
-    // for reliable video geometry.
+    // for reliable video geometry. Aspect changes from the in-app menu bypass this
+    // blackout and use predictive geometry instead.
     private var videoGeometryBlackoutActive = true
     private var videoGeometryBlackoutGeneration = 0
     private var videoGeometryBlackoutRevealArmed = false
     private var videoGeometryBlackoutFileLoadedSeen = false
+    private var suppressAspectMenuGeometrySyncUntilMs = 0L
 
     private val psc = Utils.PlaybackStateCache()
     private var mediaSession: MediaSessionCompat? = null
@@ -640,10 +637,16 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
         return aspect > 0.001 && size != null
     }
 
+    private fun isAspectMenuGeometrySyncSuppressed(): Boolean {
+        return !videoGeometryBlackoutActive &&
+            SystemClock.uptimeMillis() < suppressAspectMenuGeometrySyncUntilMs
+    }
+
     private fun syncZoomVideoGeometry(
+        prepareNormalSurface: Boolean = false,
         immediate: Boolean = false,
     ) {
-        if (!::zoomGestures.isInitialized)
+        if (!::zoomGestures.isInitialized || isAspectMenuGeometrySyncSuppressed())
             return
 
         val aspect = try { player.getEffectiveVideoAspect() } catch (_: Throwable) { null }
@@ -655,6 +658,7 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
                 aspect = aspect,
                 pixelSize = size,
                 panscanValue = pan,
+                prepareNormalSurface = prepareNormalSurface,
                 immediate = immediate,
             )
         } catch (_: Throwable) {}
@@ -673,7 +677,7 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
         // The blackout is removed only after TextureView reports a real frame
         // update with this geometry, which avoids revealing a stale fullscreen
         // or old-aspect buffer on heavy images/videos.
-        syncZoomVideoGeometry(immediate = true)
+        syncZoomVideoGeometry(prepareNormalSurface = true, immediate = true)
         try { zoomGestures.prepareForVisibleMedia() } catch (_: Throwable) {}
         armVideoGeometryBlackoutReveal()
     }
@@ -801,17 +805,12 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
         isPlayingAudio = (haveAudio && MPVLib.getPropertyBoolean("mute") != true)
     }
 
-    private fun isAudioOnlyMedia(): Boolean {
-        val haveAudio = MPVLib.getPropertyBoolean("current-tracks/audio/selected")
-        if (haveAudio == null)
-            return lastKnownAudioOnlyMedia
-
+    private fun isPlayingAudioOnly(): Boolean {
+        if (!isPlayingAudio)
+            return false
         val image = MPVLib.getPropertyString("current-tracks/video/image")
-        lastKnownAudioOnlyMedia = haveAudio && (image.isNullOrEmpty() || image == "yes")
-        return lastKnownAudioOnlyMedia
+        return image.isNullOrEmpty() || image == "yes"
     }
-
-    private fun isPlayingAudioOnly(): Boolean = isPlayingAudio && isAudioOnlyMedia()
 
     private fun shouldBackground(): Boolean {
         if (isFinishing) // about to exit?
@@ -2661,24 +2660,9 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
                 }
                 val targetPixelSize = try { player.getVideoPixelSize() } catch (_: Throwable) { null }
 
-                // Re-assert audio-only mode before mpv reconfigures an attached cover image.
-                // During that reconfiguration current-tracks/audio/selected can be temporarily
-                // unavailable; retaining this mode prevents a costly SurfaceTexture resize.
-                if (::zoomGestures.isInitialized) {
-                    try { zoomGestures.setAudioOnlyMode(isAudioOnlyMedia()) } catch (_: Throwable) {}
-                }
-
-                if (ratio == "panscan") {
-                    MPVLib.setPropertyString("video-aspect-override", "-1")
-                    MPVLib.setPropertyDouble("panscan", 1.0)
-                } else {
-                    MPVLib.setPropertyString("video-aspect-override", ratio)
-                    MPVLib.setPropertyDouble("panscan", 0.0)
-                }
-
-                // Apply the predicted geometry only after mpv owns the new aspect.
-                // The Android render surface remains view-shaped, so the change is
-                // presented by mpv directly without a second fit/resize transition.
+                // Menu selections are the only transition where we already know the
+                // requested geometry. Apply it before asking mpv to redraw so the
+                // user never sees the temporary fullscreen/base layout.
                 if (::zoomGestures.isInitialized) {
                     try {
                         zoomGestures.applyPredictedAspectMenuGeometry(
@@ -2687,6 +2671,21 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
                             panscanValue = targetPanscan,
                         )
                     } catch (_: Throwable) {}
+                }
+
+                val suppressUntil = SystemClock.uptimeMillis() + ASPECT_MENU_PREDICTIVE_SYNC_GRACE_MS
+                suppressAspectMenuGeometrySyncUntilMs = suppressUntil
+                eventUiHandler.postDelayed({
+                    if (SystemClock.uptimeMillis() >= suppressUntil)
+                        syncZoomVideoGeometry(prepareNormalSurface = true, immediate = true)
+                }, ASPECT_MENU_PREDICTIVE_SYNC_GRACE_MS + 20L)
+
+                if (ratio == "panscan") {
+                    MPVLib.setPropertyString("video-aspect-override", "-1")
+                    MPVLib.setPropertyDouble("panscan", 1.0)
+                } else {
+                    MPVLib.setPropertyString("video-aspect-override", ratio)
+                    MPVLib.setPropertyDouble("panscan", 0.0)
                 }
                 // Keep dialog open (apply-in-place).
             }
@@ -2895,8 +2894,13 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
                 R.id.cycleDecoderBtn, R.id.cycleSpeedBtn)
 
         val shouldUseAudioUI = isPlayingAudioOnly()
+
+        // Audio files with embedded cover art use mpv's still-image video track. Keep that
+        // track on the normal window-sized render surface so changing only its display aspect
+        // does not resize/reconfigure the SurfaceTexture and momentarily interrupt audio.
         if (::zoomGestures.isInitialized)
-            zoomGestures.setAudioOnlyMode(isAudioOnlyMedia())
+            zoomGestures.setAudioOnlyVisual(shouldUseAudioUI)
+
         if (shouldUseAudioUI == useAudioUI)
             return
         useAudioUI = shouldUseAudioUI
@@ -2918,6 +2922,7 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
             Utils.viewGroupReorder(binding.controlsTitleGroup, arrayOf(R.id.titleTextView, R.id.minorTitleTextView))
             updateMetadataDisplay()
 
+            // Match video/image startup behavior: controls stay hidden until the user taps.
             hideControls()
         } else {
             Utils.viewGroupMove(buttonGroup, R.id.prevBtn, seekbarGroup, 0)
@@ -3035,11 +3040,12 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
         if (initial || player.vid == -1)
             return
 
-        // Use decoder/source geometry for orientation. video-params/aspect includes
-        // video-aspect-override, so using it here lets the aspect-ratio menu rotate the screen.
-        // That rotation also resizes the TextureView and can briefly interrupt audio when the
-        // active video track is only an embedded cover image.
-        val ratio = player.getSourceVideoAspect()?.toFloat() ?: 0f
+        // Screen orientation must follow the media's own dimensions, not a display-only
+        // video-aspect-override selected from the aspect-ratio menu. mpv can report the
+        // overridden display aspect through its aspect property, while width/height remain
+        // the source geometry. Rotation metadata is already applied by getVideoPixelSize().
+        val pixelSize = player.getVideoPixelSize() ?: return
+        val ratio = pixelSize.first.toFloat() / pixelSize.second.toFloat()
 
         // If the aspect ratio is unknown (0), don't change orientation. In practice this can
         // happen briefly while mpv is still probing the file (and reacting to it can cause a
@@ -3272,11 +3278,6 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
                 syncZoomVideoGeometry()
                 prepareZoomSurfaceAndRevealWhenReady()
             }
-            "video-dec-params/w", "video-dec-params/h", "video-dec-params/rotate" -> {
-                // Source geometry is not affected by video-aspect-override, so aspect-menu
-                // changes must never be able to rotate the Activity or resize its surface.
-                updateOrientation()
-            }
         }
     }
 
@@ -3284,20 +3285,12 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
         if (!activityIsForeground) return
         when (property) {
             "duration/full" -> updatePlaybackDuration(psc.durationSec)
-            "video-params/aspect" -> {
-                updatePiPParams()
-                syncZoomVideoGeometry()
-                prepareZoomSurfaceAndRevealWhenReady()
-            }
-            "video-params/rotate" -> {
-                // Keep the existing rotate/orientation behavior; only aspect overrides are
-                // excluded from automatic screen orientation.
+            "video-params/aspect", "video-params/rotate" -> {
                 updateOrientation()
                 updatePiPParams()
                 syncZoomVideoGeometry()
                 prepareZoomSurfaceAndRevealWhenReady()
             }
-            "video-dec-params/aspect" -> updateOrientation()
             "panscan" -> {
                 syncZoomVideoGeometry()
                 prepareZoomSurfaceAndRevealWhenReady()
@@ -3421,7 +3414,6 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
 
         if (eventId == MpvEvent.MPV_EVENT_START_FILE) {
             // Reset any view-level zoom/pan when a new file starts.
-            lastKnownAudioOnlyMedia = false
 
             // Apply orientation as early as possible for playlist items, so we don't show the wrong orientation first.
             // Must run on the UI thread.
@@ -3687,6 +3679,10 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
         // Controls fade-in/out durations (ms). Keep them very fast but non-zero to avoid a harsh pop.
         private const val CONTROLS_FADE_IN_DURATION = 80L
         private const val CONTROLS_FADE_OUT_DURATION = 80L
+        // Predictive aspect-menu geometry is held briefly so asynchronous mpv
+        // property notifications cannot momentarily restore an intermediate state.
+        private const val ASPECT_MENU_PREDICTIVE_SYNC_GRACE_MS = 120L
+
         // Tap timing (must match TouchGestures.TAP_DURATION).
         // - Double-tap gestures: fast window (ms)
         // - Single-tap control toggle: delayed slightly longer so double-tap can cancel it (ms)
