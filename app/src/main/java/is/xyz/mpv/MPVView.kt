@@ -98,15 +98,7 @@ internal class MPVView(context: Context, attrs: AttributeSet) : BaseMPVView(cont
         MPVLib.setOptionString("opengl-es", "yes")
         MPVLib.setOptionString("hwdec", hwdec)
         MPVLib.setOptionString("hwdec-codecs", "h264,hevc,mpeg4,mpeg2video,vp8,vp9,av1")
-        // Prefer AAudio on Android 8.0+ because it supports a real hardware pause/resume.
-        // The AudioTrack backend resets and flushes its device buffer on pause, which can
-        // skip/repeat a tiny slice of audio when pause is toggled rapidly. Keep the older
-        // backends as fallbacks for unsupported or older devices.
-        val audioOutputs = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O)
-            "aaudio,audiotrack,opensles"
-        else
-            "audiotrack,opensles"
-        MPVLib.setOptionString("ao", audioOutputs)
+        MPVLib.setOptionString("ao", "audiotrack,opensles")
         MPVLib.setOptionString("audio-set-media-role", "yes")
         MPVLib.setOptionString("tls-verify", "yes")
         MPVLib.setOptionString("tls-ca-file", "${this.context.filesDir.path}/cacert.pem")
