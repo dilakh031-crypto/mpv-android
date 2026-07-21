@@ -123,10 +123,6 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
     private val seekbarIdleSeekRunnable = Runnable { performSeekbarIdleSeek() }
 
     private var toast: Toast? = null
-    private val toastCancelRunnable = Runnable {
-        toast?.cancel()
-        toast = null
-    }
 
     private var audioManager: AudioManager? = null
     private var audioFocusRequest: AudioFocusRequestCompat? = null
@@ -1832,20 +1828,12 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
     private fun playlistPrev() = MPVLib.command(arrayOf("playlist-prev"))
     private fun playlistNext() = MPVLib.command(arrayOf("playlist-next"))
 
-    private fun showToast(
-        msg: String,
-        cancel: Boolean = false,
-        durationMillis: Long? = null,
-    ) {
-        eventUiHandler.removeCallbacks(toastCancelRunnable)
+    private fun showToast(msg: String, cancel: Boolean = false) {
         if (cancel)
             toast?.cancel()
         toast = Toast.makeText(this, msg, Toast.LENGTH_SHORT).apply {
             setGravity(Gravity.TOP or Gravity.CENTER_HORIZONTAL, 0, 0)
             show()
-        }
-        durationMillis?.let {
-            eventUiHandler.postDelayed(toastCancelRunnable, it)
         }
     }
 
@@ -2231,11 +2219,7 @@ private fun restoreSubtitleSelectionForCurrentFile() {
             val trackName = player.tracks[track_type]?.firstOrNull{ it.mpvId == track_id }?.name ?: "???"
             "$trackPrefix $trackName"
         }
-        val shortenedDuration = if (track_type == "audio" || track_type == "sub")
-            TRACK_SELECTION_TOAST_DURATION_MS
-        else
-            null
-        showToast(msg, true, shortenedDuration)
+        showToast(msg, true)
     }
 
     private fun cycleAudio() = trackSwitchNotification {
@@ -3826,7 +3810,6 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
         private const val RESULT_INTENT = "is.xyz.mpv.MPVActivity.result"
         // stream type used with AudioManager
         private const val STREAM_TYPE = AudioManager.STREAM_MUSIC
-        private const val TRACK_SELECTION_TOAST_DURATION_MS = 500L
         // precision used by seekbar (1/s)
         private const val SEEK_BAR_PRECISION = 2
 

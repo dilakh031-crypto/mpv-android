@@ -18,14 +18,13 @@ import kotlin.math.sqrt
  * Pinch-to-zoom + pan for mpv output.
  *
  * Important quality detail:
- *  - The unzoomed media-aspect surface keeps the OSD inside the video frame,
- *    but its longest edge is rendered at the phone's longest display edge. This
- *    gives mpv OSD/script text phone-resolution detail without moving it into
- *    the surrounding letterbox area.
+ *  - Unzoomed view uses a display-sized mpv-rendered compact surface, so mpv,
+ *    not Android's TextureView compositor, performs the huge downscale. This
+ *    avoids moire / false-color artifacts on high-frequency scans at 720p.
  *  - After the first mpv frame is ready, the unzoomed view is prepared with the
  *    same media-aspect fit that will be used while zoomed. At normal size it
- *    uses a phone-resolution media-aspect buffer; when the user starts zooming
- *    it upgrades the same geometry to preserve original source detail as well.
+ *    uses only a display-sized compact buffer; when the user starts zooming it
+ *    upgrades the same geometry to an original-detail buffer.
  *  - New-file and window-exit transitions are forced back to the plain mpv/base
  *    surface so Android never animates a transformed TextureView while entering
  *    or leaving the player.
@@ -288,6 +287,7 @@ internal class VideoZoomGestures(
         videoPixelHeight = 0
         panscan = 0.0
         normalCompactSurfacePrepared = false
+        renderTarget?.setAdaptiveOsdScale(1.0)
         requestBaseRenderSurfaceSize(force = true)
         applyToView()
     }
@@ -305,6 +305,7 @@ internal class VideoZoomGestures(
         resetTransformState()
         normalCompactSurfacePrepared = false
         target.alpha = 0f
+        renderTarget?.setAdaptiveOsdScale(1.0)
         requestBaseRenderSurfaceSize(force = true)
         applyToView()
     }
@@ -643,6 +644,7 @@ internal class VideoZoomGestures(
     }
 
     private fun updateRenderSurfaceForCurrentState(force: Boolean) {
+        updateAdaptiveOsdScale()
         val zooming = isZoomed() || scaleDetector.isInProgress
 
         if (isPanscanActive()) {
@@ -729,19 +731,26 @@ internal class VideoZoomGestures(
             return
         }
 
-        // Media-aspect path: do not pad the render surface to the phone's
-        // portrait/landscape aspect. A view-aspect buffer can contain mostly
-        // black bars for panoramic/tall images and may lose source detail or hit
-        // GPU limits. applyToView() places this compact buffer into the normal
-        // content rect with View scale/translation.
+        // Keep the surface media-shaped (and therefore free of letterbox bars),
+        // but start from the phone-resolution size for this media orientation.
+        // This keeps mpv's OSD rasterization sharp even when the phone and media
+        // have opposite orientations. Zoom may increase it further to retain the
+        // source's original detail.
+        val displaySize = displayResolutionMediaSurfaceSize(c)
+        val fullSurfaceContent = ContentRect(
+            0f,
+            0f,
+            displaySize.w.toFloat(),
+            displaySize.h.toFloat(),
+        )
         val bufferScale = limitedOriginalDetailBufferScale(
-            baseWidth = c.w.toDouble(),
-            baseHeight = c.h.toDouble(),
-            content = c,
+            baseWidth = displaySize.w,
+            baseHeight = displaySize.h,
+            content = fullSurfaceContent,
         )
 
-        val bufferWidth = ceilToIntAtLeastOne(c.w.toDouble() * bufferScale)
-        val bufferHeight = ceilToIntAtLeastOne(c.h.toDouble() * bufferScale)
+        val bufferWidth = ceilToIntAtLeastOne(displaySize.w * bufferScale)
+        val bufferHeight = ceilToIntAtLeastOne(displaySize.h * bufferScale)
         player.setRenderSurfaceSize(bufferWidth, bufferHeight)
         renderSurfaceMode = RenderSurfaceMode.MEDIA_ASPECT_ORIGINAL
     }
@@ -765,18 +774,66 @@ internal class VideoZoomGestures(
         }
 
         // Keep the same media-aspect geometry used by the high-quality zoom
-        // surface, but render it with at least the phone's longest display edge.
-        // The OSD therefore remains inside the video rectangle while retaining
-        // phone-resolution glyph detail even in opposite orientations.
-        val bufferScale = limitedRenderSurfaceScale(
-            baseWidth = c.w.toDouble(),
-            baseHeight = c.h.toDouble(),
-            desiredScale = phoneResolutionBufferScale(c.w.toDouble(), c.h.toDouble()),
-        )
-        val bufferWidth = ceilToIntAtLeastOne(c.w.toDouble() * bufferScale)
-        val bufferHeight = ceilToIntAtLeastOne(c.h.toDouble() * bufferScale)
+        // surface. For opposite phone/media orientations, use the phone's full
+        // resolution rotated into the media orientation instead of rasterizing
+        // the OSD at only the small on-screen content rectangle.
+        val displaySize = displayResolutionMediaSurfaceSize(c)
+        val bufferWidth = ceilToIntAtLeastOne(displaySize.w)
+        val bufferHeight = ceilToIntAtLeastOne(displaySize.h)
         player.setRenderSurfaceSize(bufferWidth, bufferHeight)
         renderSurfaceMode = RenderSurfaceMode.MEDIA_ASPECT_BASE
+    }
+
+    /**
+     * Return the media-only surface size at the phone's physical view
+     * resolution. When media and phone orientations differ, rotate the
+     * resolution bounds before fitting the media. The surface itself still has
+     * the media aspect, so mpv cannot draw OSD text in the black bars.
+     */
+    private fun displayResolutionMediaSurfaceSize(content: ContentRect): SurfaceSize {
+        if (!usesOppositeOrientationMediaAspectRenderSurface())
+            return SurfaceSize(content.w.toDouble(), content.h.toDouble())
+
+        val orientedWidth = viewHeight.toDouble()
+        val orientedHeight = viewWidth.toDouble()
+        val aspect = videoAspect.coerceAtLeast(0.001)
+        val orientedAspect = orientedWidth / orientedHeight
+
+        return if (aspect > orientedAspect) {
+            SurfaceSize(orientedWidth, orientedWidth / aspect)
+        } else {
+            SurfaceSize(orientedHeight * aspect, orientedHeight)
+        }
+    }
+
+    /**
+     * mpv already scales OSD text from the render height. Only add the missing
+     * width compensation: fit the same full-screen text rectangle uniformly
+     * into the current video rectangle, never enlarging it above the configured
+     * size.
+     */
+    private fun updateAdaptiveOsdScale() {
+        val player = renderTarget ?: return
+        refreshMetricsFromTarget()
+
+        if (viewWidth <= 1f || viewHeight <= 1f) {
+            player.setAdaptiveOsdScale(1.0)
+            return
+        }
+
+        val content = contentRect()
+        if (content.w <= 1f || content.h <= 1f) {
+            player.setAdaptiveOsdScale(1.0)
+            return
+        }
+
+        val widthRatio = content.w.toDouble() / viewWidth.toDouble()
+        val heightRatio = content.h.toDouble() / viewHeight.toDouble()
+        val scale = if (heightRatio > 0.0)
+            (widthRatio / heightRatio).coerceIn(0.0, 1.0)
+        else
+            1.0
+        player.setAdaptiveOsdScale(scale)
     }
 
     private fun usesOppositeOrientationMediaAspectRenderSurface(): Boolean {
@@ -827,27 +884,7 @@ internal class VideoZoomGestures(
         baseHeight: Double,
         content: ContentRect,
     ): Double {
-        // Never downgrade from the phone-resolution normal surface when zooming
-        // into low-resolution media. Higher-resolution media can still request its
-        // original detail as before.
-        val desired = max(
-            originalDetailBufferScale(content),
-            phoneResolutionBufferScale(baseWidth, baseHeight),
-        )
-        return limitedRenderSurfaceScale(baseWidth, baseHeight, desired)
-    }
-
-    private fun phoneResolutionBufferScale(baseWidth: Double, baseHeight: Double): Double {
-        val displayLongEdge = max(viewWidth.toDouble(), viewHeight.toDouble()).coerceAtLeast(1.0)
-        val surfaceLongEdge = max(baseWidth, baseHeight).coerceAtLeast(1.0)
-        return (displayLongEdge / surfaceLongEdge).coerceAtLeast(1.0)
-    }
-
-    private fun limitedRenderSurfaceScale(
-        baseWidth: Double,
-        baseHeight: Double,
-        desiredScale: Double,
-    ): Double {
+        val desired = originalDetailBufferScale(content)
         val maxEdge = max(baseWidth, baseHeight).coerceAtLeast(1.0)
         val maxByEdge = MAX_RENDER_SURFACE_EDGE / maxEdge
         val maxByPixels = sqrt(
@@ -857,7 +894,7 @@ internal class VideoZoomGestures(
         // Avoid requesting oversized SurfaceTexture buffers. Very wide overridden
         // ratios such as 2.35:1 on huge images can otherwise exceed the device
         // texture limit and leave the TextureView black even after resetting zoom.
-        return desiredScale
+        return desired
             .coerceAtMost(maxByEdge)
             .coerceAtMost(maxByPixels)
             .coerceAtLeast(1.0)
@@ -893,6 +930,7 @@ internal class VideoZoomGestures(
     private fun lerp(a: Float, b: Float, t: Float): Float = a + (b - a) * t
 
     private data class ContentRect(val ox: Float, val oy: Float, val w: Float, val h: Float)
+    private data class SurfaceSize(val w: Double, val h: Double)
     private data class SurfaceFitTransform(
         val scaleX: Float,
         val scaleY: Float,
