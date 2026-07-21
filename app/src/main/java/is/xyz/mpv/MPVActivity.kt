@@ -551,6 +551,11 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
 
     private var playbackInitialized: Boolean = false
 
+    // True once the current file has had another playlist item beside it. Keep
+    // this sticky until on_unload: deleting/replacing playlist entries can reduce
+    // playlist-count before the outgoing file's unload hook is delivered.
+    private var currentFileHadPlaylistContext: Boolean = false
+
     private fun startPlayback(filepath: String) {
         if (playbackInitialized)
             return
@@ -1029,7 +1034,7 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
             Log.d(TAG, "player indicates EOF, not saving watch-later config")
             return
         }
-        MPVLib.command(arrayOf("write-watch-later-config"))
+        player.writePlaylistItemWatchLaterConfig(includePosition = true)
     }
 
     /**
@@ -3479,6 +3484,9 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
     }
 
     override fun eventProperty(property: String, value: Long) {
+        if (property == "playlist-count" && value > 1L)
+            currentFileHadPlaylistContext = true
+
         if (psc.update(property, value))
             updateMediaSession()
 
@@ -3501,6 +3509,30 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
 
         if (!activityIsForeground) return
         eventUiHandler.post { eventPropertyUi(property, value, metaUpdated) }
+    }
+
+    override fun eventHook(name: String, id: Long): Boolean {
+        if (name != "on_unload")
+            return false
+
+        try {
+            val playlistCount = MPVLib.getPropertyInt("playlist-count") ?: 0
+            val outgoingFileWasInPlaylist = currentFileHadPlaylistContext || playlistCount > 1
+            if (outgoingFileWasInPlaylist) {
+                // At natural EOF, keep this file's visual/audio/subtitle settings,
+                // but deliberately remove an old resume point so replay starts at 0.
+                val atEof = MPVLib.getPropertyBoolean("eof-reached") ?: true
+                val includePosition = shouldSavePosition && !atEof
+                player.writePlaylistItemWatchLaterConfig(includePosition)
+            }
+        } catch (t: Throwable) {
+            Log.w(TAG, "Failed to save outgoing playlist item state", t)
+        } finally {
+            currentFileHadPlaylistContext = false
+            // mpv hooks are blocking; always continue even if persistence failed.
+            MPVLib.hookContinue(id)
+        }
+        return true
     }
 
     override fun event(eventId: Int) {
@@ -3534,7 +3566,11 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
         }
 
         if (eventId == MpvEvent.MPV_EVENT_START_FILE) {
-            // Reset any view-level zoom/pan when a new file starts.
+            // Reset any view-level zoom/pan when a new file starts. File-local mpv
+            // options (aspect, panscan, delays, image controls, etc.) are reset by
+            // reset-on-next-file and then restored from this file's watch-later data.
+            currentFileHadPlaylistContext = currentFileHadPlaylistContext ||
+                (MPVLib.getPropertyInt("playlist-count") ?: 0) > 1
 
             // Apply orientation as early as possible for playlist items, so we don't show the wrong orientation first.
             // Must run on the UI thread.
@@ -3548,7 +3584,6 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
                 MPVLib.setPropertyDouble("video-zoom", 0.0)
                 MPVLib.setPropertyDouble("video-pan-x", 0.0)
                 MPVLib.setPropertyDouble("video-pan-y", 0.0)
-                MPVLib.setPropertyDouble("panscan", 0.0)
             } catch (_: Throwable) {
                 // ignore
             }
