@@ -16,61 +16,6 @@ import `is`.xyz.mpv.MPVLib.MpvFormat.MPV_FORMAT_STRING
 import kotlin.reflect.KProperty
 
 internal class MPVView(context: Context, attrs: AttributeSet) : BaseMPVView(context, attrs) {
-    /**
-     * Runtime options which are expected to belong to one media file, rather than
-     * to the whole mpv playlist. mpv intentionally carries runtime option changes
-     * to the next playlist entry unless they are listed in reset-on-next-file.
-     *
-     * Keep global/session controls (pause, volume, mute, loop, shuffle, etc.) out
-     * of this list: those should continue to apply to the player as a whole.
-     */
-    private val playlistItemStateOptions = linkedSetOf(
-        "speed",
-        "video-aspect-override",
-        "panscan",
-        "contrast",
-        "brightness",
-        "gamma",
-        "saturation",
-        "hue",
-        "audio-delay",
-        "audio-balance",
-        "audio-pitch-correction",
-        "sub-delay",
-        "secondary-sub-delay",
-        "sub-visibility",
-        "secondary-sub-visibility",
-        "sub-pos",
-        "secondary-sub-pos",
-        "sub-scale",
-        "sub-speed",
-        "sub-ass-override",
-        "secondary-sub-ass-override",
-        "aid",
-        "vid",
-        "sid",
-        "secondary-sid",
-        "edition",
-        "hwdec",
-        "deinterlace",
-        "video-rotate",
-        "video-unscaled",
-        "video-crop",
-        "video-scale-x",
-        "video-scale-y",
-        "video-align-x",
-        "video-align-y",
-        "video-recenter",
-        "vf",
-        "af",
-    )
-
-    private fun parseOptionList(value: String?): LinkedHashSet<String> =
-        value.orEmpty()
-            .split(',')
-            .mapTo(linkedSetOf()) { it.trim() }
-            .apply { remove("") }
-
     override fun initOptions() {
         val sharedPreferences = PreferenceManager.getDefaultSharedPreferences(context)
 
@@ -174,66 +119,8 @@ internal class MPVView(context: Context, attrs: AttributeSet) : BaseMPVView(cont
     }
 
     override fun postInitOptions() {
-        // We need to call write-watch-later manually so playlist transitions can
-        // save the outgoing file before mpv unloads it.
+        // we need to call write-watch-later manually
         MPVLib.setOptionString("save-position-on-quit", "no")
-
-        // Preserve any reset list supplied by mpv.conf, then add every option the
-        // app treats as file-local. This prevents a changed value from flashing or
-        // leaking into the next item before its own watch-later state is restored.
-        val resetOptions = parseOptionList(MPVLib.getPropertyString("reset-on-next-file"))
-        if ("all" !in resetOptions) {
-            for (option in playlistItemStateOptions) {
-                if (option !in resetOptions) {
-                    // Append independently: if a future/older mpv build does not
-                    // recognize one option, the rest of the isolation list still works.
-                    MPVLib.command(arrayOf(
-                        "change-list", "reset-on-next-file", "append", option
-                    ))
-                }
-            }
-        }
-    }
-
-    /**
-     * Persist the current file's position and file-local runtime options.
-     *
-     * watch-later-options is changed only around the synchronous write command,
-     * then restored. Synchronizing this method prevents an activity lifecycle save
-     * and an on_unload hook save from temporarily overwriting each other's list.
-     */
-    @Synchronized
-    fun writePlaylistItemWatchLaterConfig(includePosition: Boolean) {
-        val original = MPVLib.getPropertyString("watch-later-options") ?: ""
-        val originalOptions = parseOptionList(original)
-
-        try {
-            // Change the list one item at a time. This avoids one unsupported
-            // optional property invalidating every other state item on a build
-            // using a slightly different mpv revision.
-            for (option in playlistItemStateOptions) {
-                if (option !in originalOptions) {
-                    MPVLib.command(arrayOf(
-                        "change-list", "watch-later-options", "append", option
-                    ))
-                }
-            }
-
-            if (includePosition && "start" !in originalOptions) {
-                MPVLib.command(arrayOf(
-                    "change-list", "watch-later-options", "append", "start"
-                ))
-            } else if (!includePosition && "start" in originalOptions) {
-                MPVLib.command(arrayOf(
-                    "change-list", "watch-later-options", "remove", "start"
-                ))
-            }
-
-            MPVLib.command(arrayOf("write-watch-later-config"))
-        } finally {
-            // Restore the exact user/config-provided list, including its order.
-            MPVLib.setPropertyString("watch-later-options", original)
-        }
     }
 
     fun onPointerEvent(event: MotionEvent): Boolean {

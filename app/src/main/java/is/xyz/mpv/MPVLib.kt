@@ -24,7 +24,6 @@ object MPVLib {
     external fun command(cmd: Array<out String>)
     external fun commandAsync(cmd: Array<out String>, userdata: Long): Int
     external fun abortAsyncCommand(userdata: Long)
-    external fun hookContinue(id: Long)
 
     external fun setOptionString(name: String, value: String): Int
 
@@ -105,25 +104,6 @@ object MPVLib {
         }
     }
 
-    /**
-     * Dispatch an mpv hook to observers. Hooks pause mpv until one observer
-     * explicitly continues them. If nobody claims a hook, continue it here so
-     * playback can never become stuck because an activity/service disappeared.
-     */
-    @JvmStatic
-    fun eventHook(name: String, id: Long) {
-        val snapshot = synchronized(observers) { observers.toList() }
-        for (o in snapshot) {
-            try {
-                if (o.eventHook(name, id))
-                    return
-            } catch (_: Throwable) {
-                // A broken observer must not leave the mpv core blocked.
-            }
-        }
-        hookContinue(id)
-    }
-
     private val log_observers = mutableListOf<LogObserver>()
 
     @JvmStatic
@@ -155,9 +135,6 @@ object MPVLib {
         fun eventProperty(property: String, value: String)
         fun eventProperty(property: String, value: Double)
         fun event(eventId: Int)
-
-        /** Return true only when the observer will call [hookContinue]. */
-        fun eventHook(name: String, id: Long): Boolean = false
     }
 
     interface LogObserver {
