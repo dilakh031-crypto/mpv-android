@@ -3095,7 +3095,6 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
                 binding.controlsTitleGroup.visibility = View.GONE
             }
 
-            hideControls() // do NOT use fade runnable
         }
 
         // Visibility might have changed, so update
