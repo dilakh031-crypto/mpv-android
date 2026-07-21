@@ -408,12 +408,6 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
     private var playbackHasStarted = false
     private var onloadCommands = mutableListOf<Array<String>>()
 
-    // Options changed from the player UI must not leak into the next playlist item.
-    // mpv normally keeps runtime option changes across files, so make these changes
-    // file-local and remember them for the lifetime of this playlist session.
-    private val playlistFileOptionsLock = Any()
-    private val playlistFileOptions = mutableMapOf<String, LinkedHashMap<String, String>>()
-
     // Activity lifetime
 
         override fun onCreate(icicle: Bundle?) {
@@ -1833,20 +1827,8 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
         }
     }
 
-    private fun savePositionBeforePlaylistSwitch() {
-        if ((MPVLib.getPropertyInt("playlist-count") ?: 0) > 1)
-            savePosition()
-    }
-
-    private fun playlistPrev() {
-        savePositionBeforePlaylistSwitch()
-        MPVLib.command(arrayOf("playlist-prev"))
-    }
-
-    private fun playlistNext() {
-        savePositionBeforePlaylistSwitch()
-        MPVLib.command(arrayOf("playlist-next"))
-    }
+    private fun playlistPrev() = MPVLib.command(arrayOf("playlist-prev"))
+    private fun playlistNext() = MPVLib.command(arrayOf("playlist-next"))
 
     private fun showToast(msg: String, cancel: Boolean = false, durationMs: Long? = null) {
         toastCancelRunnable?.let(toastHandler::removeCallbacks)
@@ -1972,64 +1954,6 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
     }
 
     private fun perFileKey(suffix: String, path: String): String = "perfile_${suffix}_${sha1Hex(path)}"
-
-    private fun currentPlaylistFilePath(): String? {
-        if ((MPVLib.getPropertyInt("playlist-count") ?: 0) <= 1)
-            return null
-        return MPVLib.getPropertyString("path")
-    }
-
-    private fun rememberPlaylistFileOption(path: String, property: String, value: String) {
-        synchronized(playlistFileOptionsLock) {
-            playlistFileOptions.getOrPut(path) { linkedMapOf() }[property] = value
-        }
-    }
-
-    private fun setPlaybackOption(property: String, value: String) {
-        val path = currentPlaylistFilePath()
-        if (path == null) {
-            MPVLib.setPropertyString(property, value)
-            return
-        }
-
-        MPVLib.setPropertyString("file-local-options/$property", value)
-        rememberPlaylistFileOption(path, property, value)
-    }
-
-    private fun setPlaybackOption(property: String, value: Int) {
-        val path = currentPlaylistFilePath()
-        if (path == null) {
-            MPVLib.setPropertyInt(property, value)
-            return
-        }
-
-        val text = value.toString()
-        MPVLib.setPropertyString("file-local-options/$property", text)
-        rememberPlaylistFileOption(path, property, text)
-    }
-
-    private fun setPlaybackOption(property: String, value: Double) {
-        val path = currentPlaylistFilePath()
-        if (path == null) {
-            MPVLib.setPropertyDouble(property, value)
-            return
-        }
-
-        val text = value.toString()
-        MPVLib.setPropertyString("file-local-options/$property", text)
-        rememberPlaylistFileOption(path, property, text)
-    }
-
-    private fun restorePlaylistFileOptionsForCurrentFile() {
-        val path = currentPlaylistFilePath() ?: return
-        val options = synchronized(playlistFileOptionsLock) {
-            playlistFileOptions[path]?.toMap()
-        } ?: return
-
-        for ((property, value) in options)
-            MPVLib.setPropertyString("file-local-options/$property", value)
-    }
-
 private fun rememberSubtitleSelectionForCurrentFile(secondary: Boolean = false) {
     val mediaPath = MPVLib.getPropertyString("path") ?: return
     val prefs = getDefaultSharedPreferences(applicationContext)
@@ -2441,10 +2365,7 @@ private fun openPlaylistMenu(restore: StateRestoreCallback, onBack: (() -> Unit)
         }
 
         override fun onItemPicked(item: MPVView.PlaylistItem) {
-            if ((MPVLib.getPropertyInt("playlist-pos") ?: -1) != item.index) {
-                savePositionBeforePlaylistSwitch()
-                MPVLib.setPropertyInt("playlist-pos", item.index)
-            }
+            MPVLib.setPropertyInt("playlist-pos", item.index)
             impl.refresh()
             // Keep dialog open (apply-in-place).
         }
@@ -2804,9 +2725,9 @@ private fun openTopMenu(existingRestoreState: StateRestoreCallback? = null) {
         dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener {
             picker.number?.let {
                 if (picker.isInteger())
-                    setPlaybackOption(property, it.toInt())
+                    MPVLib.setPropertyInt(property, it.toInt())
                 else
-                    setPlaybackOption(property, it)
+                    MPVLib.setPropertyDouble(property, it)
             }
             // Keep dialog open (apply-in-place).
         }
@@ -2892,11 +2813,11 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
                 }, ASPECT_MENU_PREDICTIVE_SYNC_GRACE_MS + 20L)
 
                 if (ratio == "panscan") {
-                    setPlaybackOption("video-aspect-override", "-1")
-                    setPlaybackOption("panscan", 1.0)
+                    MPVLib.setPropertyString("video-aspect-override", "-1")
+                    MPVLib.setPropertyDouble("panscan", 1.0)
                 } else {
-                    setPlaybackOption("video-aspect-override", ratio)
-                    setPlaybackOption("panscan", 0.0)
+                    MPVLib.setPropertyString("video-aspect-override", ratio)
+                    MPVLib.setPropertyDouble("panscan", 0.0)
                 }
                 // Keep dialog open (apply-in-place).
             }
@@ -2984,8 +2905,8 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
 
             applyImmersiveToDialog(dialog)
             dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener {
-                picker.delay1?.let { setPlaybackOption("sub-delay", it) }
-                picker.delay2?.let { setPlaybackOption("secondary-sub-delay", it) }
+                picker.delay1?.let { player.subDelay = it }
+                picker.delay2?.let { player.secondarySubDelay = it }
                 // Keep dialog open (apply-in-place).
             }
         }
@@ -3636,10 +3557,6 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
             onloadCommands.clear()
             for (c in cmds)
                 MPVLib.command(c)
-
-            // Re-apply only the settings previously changed for this playlist item.
-            // They remain file-local, so a new item starts from its own/default values.
-            try { restorePlaylistFileOptionsForCurrentFile() } catch (_: Throwable) {}
 
             // Restore the user's previously chosen subtitle and audio track for this video.
             try { restoreSubtitleSelectionForCurrentFile() } catch (_: Throwable) {}
