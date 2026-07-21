@@ -18,18 +18,20 @@ import kotlin.math.sqrt
  * Pinch-to-zoom + pan for mpv output.
  *
  * Important quality detail:
- *  - The mpv render target always keeps the TextureView/screen aspect ratio.
- *    This makes mpv rasterize its own OSD (stats, messages, ASS overlays, etc.)
- *    at the full display resolution even when the phone and video orientations
- *    are opposite.
- *  - Unzoomed playback uses the display-sized base surface, so mpv, not Android's
- *    TextureView compositor, performs the video downscale.
- *  - While zoomed, the same screen-aspect geometry is upgraded to an
- *    original-detail buffer. The geometry therefore does not switch at zoom
- *    start/end, while source detail is retained for magnification.
+ *  - Unzoomed view uses a display-sized mpv-rendered compact surface, so mpv,
+ *    not Android's TextureView compositor, performs the huge downscale. This
+ *    avoids moire / false-color artifacts on high-frequency scans at 720p.
+ *  - After the first mpv frame is ready, the unzoomed view is prepared with the
+ *    same media-aspect fit that will be used while zoomed. At normal size it
+ *    uses only a display-sized compact buffer; when the user starts zooming it
+ *    upgrades the same geometry to an original-detail buffer.
  *  - New-file and window-exit transitions are forced back to the plain mpv/base
  *    surface so Android never animates a transformed TextureView while entering
  *    or leaving the player.
+ *  - Because the geometry does not switch at zoom start/end, Android never shows
+ *    the one-frame shrink/stretch tear. Because the zoom buffer has no oversized
+ *    black bars, it keeps full source detail in both matching and opposite
+ *    phone/media orientations.
  *
  * We do not use mpv video-pan/video-zoom for finger movement.
  */
@@ -270,9 +272,10 @@ internal class VideoZoomGestures(
     fun reset() {
         resetTransformState()
 
-        // Critical for scan and OSD quality: after returning to normal size, do
-        // not keep the original-resolution texture and let Android minify it.
-        // Return to the display-sized screen-aspect surface.
+        // Critical for scan quality: after returning to normal size, do not keep
+        // the original-resolution texture and let Android minify it. Return to
+        // the prepared compact normal surface so the next zoom starts from the
+        // same geometry, without a start/end tear.
         updateRenderSurfaceForCurrentState(force = true)
         applyToView()
     }
@@ -641,14 +644,26 @@ internal class VideoZoomGestures(
     private fun updateRenderSurfaceForCurrentState(force: Boolean) {
         val zooming = isZoomed() || scaleDetector.isInProgress
 
-        // Keep mpv's output window screen-shaped in every state. mpv composites
-        // video, subtitles and OSD into the same Android surface, so using a
-        // media-aspect-only buffer (for example 1080x608 on a 1080x2400 phone)
-        // also limits the OSD raster to that smaller buffer. A view-aspect target
-        // gives stats/messages the full screen pixel grid. While zoomed, increase
-        // only the backing resolution while preserving that screen aspect.
+        if (isPanscanActive()) {
+            // panscan needs a view-shaped mpv output window. A media-aspect surface
+            // has no letterbox area for mpv to crop into, so panscan would appear
+            // identical to the original aspect. While zoomed, keep source detail by
+            // using the same high-resolution sizing strategy on the view-shaped window.
+            if (zooming)
+                requestViewAspectOriginalRenderSurfaceSize(force)
+            else
+                requestBaseRenderSurfaceSize(force)
+            return
+        }
+
+        // Keep the same effective-aspect fit in every orientation. The only thing
+        // that changes at zoom start/end is the backing buffer resolution, not
+        // the on-screen rectangle, so there is no transient aspect jump. The aspect
+        // can come from mpv.conf / video-aspect-override, not only from the file.
         if (zooming)
-            requestViewAspectOriginalRenderSurfaceSize(force)
+            requestMediaAspectOriginalRenderSurfaceSize(force)
+        else if (normalCompactSurfacePrepared)
+            requestMediaAspectBaseRenderSurfaceSize(force)
         else
             requestBaseRenderSurfaceSize(force)
     }
