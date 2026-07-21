@@ -32,6 +32,7 @@ import androidx.core.content.ContextCompat
 import android.view.*
 import android.view.ViewGroup.MarginLayoutParams
 import android.widget.Button
+import android.widget.EditText
 import android.widget.SeekBar
 import android.widget.Toast
 import androidx.activity.addCallback
@@ -67,6 +68,10 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
     private val fadeHandler = Handler(Looper.getMainLooper())
     // for use with stopServiceRunnable
     private val stopServiceHandler = Handler(Looper.getMainLooper())
+    // Re-applies immersive mode after temporary focus owners such as Google Assistant return
+    // control to the player window.
+    private val immersiveHandler = Handler(Looper.getMainLooper())
+    private val immersiveReapplyRunnable = Runnable { reapplyPlayerImmersiveMode() }
     // Delayed single-tap toggling (we wait a bit so a faster double-tap can be recognized
     // without flashing the control UI).
     private val tapToggleHandler = Handler(Looper.getMainLooper())
@@ -860,6 +865,7 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
 
         activityIsForeground = false
         eventUiHandler.removeCallbacksAndMessages(null)
+        immersiveHandler.removeCallbacks(immersiveReapplyRunnable)
         cancelPendingTapToggle()
         if (isFinishing) {
             savePosition()
@@ -954,6 +960,7 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
         if (activityIsForeground) {
             super.onResume()
             refreshPlayerOverlay()
+            schedulePlayerImmersiveReapply()
             return
         }
 
@@ -975,12 +982,17 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
         refreshPlayerOverlay()
 
         super.onResume()
+        schedulePlayerImmersiveReapply()
     }
 
     override fun onWindowFocusChanged(hasFocus: Boolean) {
         super.onWindowFocusChanged(hasFocus)
-        if (hasFocus)
+        if (hasFocus) {
             refreshPlayerOverlay()
+            // Assistant, permission overlays and some OEM system windows can restore the status
+            // bar after this callback. Apply now and once more after their focus transition ends.
+            schedulePlayerImmersiveReapply()
+        }
     }
 
     private fun savePosition() {
@@ -1272,6 +1284,72 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
         controller.hide(WindowInsetsCompat.Type.systemBars())
     }
 
+    /** Restore immersive mode only for the active video-player activity. */
+    private fun reapplyPlayerImmersiveMode() {
+        if (!uiInitialized || isFinishing || !activityIsForeground)
+            return
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N && isInPictureInPictureMode)
+            return
+        applyImmersiveToWindow(window)
+        // The player intentionally exposes only the navigation bar while controls are visible.
+        // Restoring immersive mode after an overlay must not change that existing behavior.
+        if (::binding.isInitialized && binding.controls.visibility == View.VISIBLE) {
+            WindowCompat.getInsetsController(window, window.decorView)
+                .show(WindowInsetsCompat.Type.navigationBars())
+        }
+    }
+
+    private fun schedulePlayerImmersiveReapply() {
+        immersiveHandler.removeCallbacks(immersiveReapplyRunnable)
+        reapplyPlayerImmersiveMode()
+        // A system overlay may finish restoring its own insets one or two frames after focus
+        // returns, so repeat after that transition without continuously policing visibility.
+        immersiveHandler.post(immersiveReapplyRunnable)
+        immersiveHandler.postDelayed(immersiveReapplyRunnable, IMMERSIVE_FOCUS_REAPPLY_DELAY_MS)
+    }
+
+    /**
+     * Guard a player dialog against OEM focus/IME transitions that make the status bar visible.
+     * Re-application is event-based (focus or IME opening), not continuous, so the user's normal
+     * top-edge swipe can still reveal transient system bars.
+     */
+    private fun installImmersiveDialogGuards(dialog: AlertDialog, w: Window) {
+        val decor = w.decorView
+        val reapply = Runnable {
+            if (dialog.isShowing)
+                applyImmersiveToWindow(w)
+        }
+
+        decor.viewTreeObserver.addOnWindowFocusChangeListener { hasFocus ->
+            if (hasFocus) {
+                decor.post(reapply)
+                decor.postDelayed(reapply, IMMERSIVE_DIALOG_REAPPLY_DELAY_MS)
+            }
+        }
+
+        // Run before the IME appears when an editable field receives focus. This prevents the
+        // common status-bar flash seen when editing subtitle delay.
+        decor.viewTreeObserver.addOnGlobalFocusChangeListener { _, newFocus ->
+            if (newFocus is EditText) {
+                reapply.run()
+                decor.post(reapply)
+                decor.postDelayed(reapply, IMMERSIVE_DIALOG_REAPPLY_DELAY_MS)
+            }
+        }
+
+        var imeWasVisible = false
+        ViewCompat.setOnApplyWindowInsetsListener(decor) { _, insets ->
+            val imeVisible = insets.isVisible(WindowInsetsCompat.Type.ime())
+            if (imeVisible && !imeWasVisible) {
+                decor.post(reapply)
+                decor.postDelayed(reapply, IMMERSIVE_IME_REAPPLY_DELAY_MS)
+            }
+            imeWasVisible = imeVisible
+            insets
+        }
+        ViewCompat.requestApplyInsets(decor)
+    }
+
     /**
      * Show an AlertDialog in true immersive mode (prevents the status bar from appearing at all).
      * This uses FLAG_NOT_FOCUSABLE to keep the dialog from taking focus until after we apply
@@ -1296,6 +1374,7 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
         w.decorView.systemUiVisibility = window.decorView.systemUiVisibility
 
         applyImmersiveToWindow(w)
+        installImmersiveDialogGuards(dialog, w)
 
         // Now allow focus/input again.
         w.clearFlags(WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE)
@@ -3665,6 +3744,9 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
         private const val TAG = "mpv"
         // how long should controls be displayed on screen (ms)
         private const val CONTROLS_DISPLAY_TIMEOUT = 1500L
+        private const val IMMERSIVE_FOCUS_REAPPLY_DELAY_MS = 160L
+        private const val IMMERSIVE_DIALOG_REAPPLY_DELAY_MS = 80L
+        private const val IMMERSIVE_IME_REAPPLY_DELAY_MS = 220L
         // Controls fade-in/out durations (ms). Keep them very fast but non-zero to avoid a harsh pop.
         private const val CONTROLS_FADE_IN_DURATION = 80L
         private const val CONTROLS_FADE_OUT_DURATION = 80L

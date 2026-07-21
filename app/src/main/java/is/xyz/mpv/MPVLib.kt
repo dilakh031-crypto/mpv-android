@@ -28,7 +28,6 @@ object MPVLib {
     external fun setOptionString(name: String, value: String): Int
 
     external fun grabThumbnail(dimension: Int): Bitmap?
-    external fun grabVideoFrame(dimension: Int): Bitmap?
 
     external fun getPropertyInt(property: String): Int?
     external fun setPropertyInt(property: String, value: Int)
