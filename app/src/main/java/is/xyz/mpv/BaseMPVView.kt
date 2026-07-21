@@ -6,8 +6,6 @@ import android.util.AttributeSet
 import android.util.Log
 import android.view.Surface
 import android.view.TextureView
-import java.io.File
-import kotlin.math.abs
 
 // Contains only the essential code needed to get a picture on the screen
 
@@ -36,9 +34,6 @@ abstract class BaseMPVView(context: Context, attrs: AttributeSet) : TextureView(
         initOptions()
 
         MPVLib.init()
-        mpvInitialized = true
-        captureConfiguredOsdSizes()
-        applyAdaptiveOsdScale(force = true)
 
         /* set hardcoded options */
         postInitOptions()
@@ -64,7 +59,6 @@ abstract class BaseMPVView(context: Context, attrs: AttributeSet) : TextureView(
         surfaceTextureListener = null
         detachSurfaceTexture()
 
-        mpvInitialized = false
         MPVLib.destroy()
     }
 
@@ -105,117 +99,7 @@ abstract class BaseMPVView(context: Context, attrs: AttributeSet) : TextureView(
     private var renderSurfaceHeight = 0
     private var customRenderSurfaceSize = false
 
-    // mpv scales its regular OSD with the output height. That is a good default
-    // for a normal window, but a tall, narrow video can still have the full
-    // display height while providing only a small fraction of its width. Keep a
-    // separate multiplier so callers can compensate for that geometry without
-    // discarding the user's configured OSD size.
-    private var mpvInitialized = false
-    private var configuredOsdScale = 1.0
-    private var configuredStatsFontSize = DEFAULT_STATS_FONT_SIZE
-    private var configuredStatsFontSizeScriptOpt: String? = null
-    private var requestedAdaptiveOsdScale = 1.0
-    private var appliedAdaptiveOsdScale = Double.NaN
-    private var statsFontSizeOverridden = false
-
     var onSurfaceTextureFrameAvailable: (() -> Unit)? = null
-
-    /**
-     * Shrink mpv-owned text to fit the visible video rectangle.
-     *
-     * [scale] is deliberately capped at 1: sufficiently large videos keep the
-     * exact OSD size selected by mpv.conf. The built-in stats overlay supplies
-     * its own ASS font size, so it is adjusted alongside the regular OSD.
-     */
-    fun setAdaptiveOsdScale(scale: Double) {
-        requestedAdaptiveOsdScale = if (scale.isFinite())
-            scale.coerceIn(MIN_ADAPTIVE_OSD_SCALE, 1.0)
-        else
-            1.0
-
-        if (mpvInitialized)
-            applyAdaptiveOsdScale()
-    }
-
-    private fun captureConfiguredOsdSizes() {
-        configuredOsdScale = MPVLib.getPropertyDouble("osd-scale")
-            ?.takeIf { it.isFinite() && it > 0.0 }
-            ?: 1.0
-
-        configuredStatsFontSizeScriptOpt = MPVLib.getPropertyString("script-opts")
-            ?.let { STATS_FONT_SIZE_SCRIPT_OPT.find(it)?.groupValues?.getOrNull(1) }
-
-        configuredStatsFontSize = configuredStatsFontSizeScriptOpt
-            ?.toDoubleOrNull()
-            ?.takeIf { it.isFinite() && it > 0.0 }
-            ?: readStatsFontSizeFromConfig()
-            ?: DEFAULT_STATS_FONT_SIZE
-    }
-
-    private fun readStatsFontSizeFromConfig(): Double? {
-        val config = File(context.filesDir, "script-opts/stats.conf")
-        if (!config.isFile)
-            return null
-
-        return try {
-            config.useLines { lines ->
-                lines.mapNotNull { line ->
-                    val setting = line.substringBefore('#').trim()
-                    val separator = setting.indexOf('=')
-                    if (separator <= 0 || setting.substring(0, separator).trim() != "font_size")
-                        return@mapNotNull null
-
-                    setting.substring(separator + 1).trim()
-                        .toDoubleOrNull()
-                        ?.takeIf { it.isFinite() && it > 0.0 }
-                }.lastOrNull()
-            }
-        } catch (_: Exception) {
-            null
-        }
-    }
-
-    private fun applyAdaptiveOsdScale(force: Boolean = false) {
-        if (!mpvInitialized)
-            return
-
-        val scale = requestedAdaptiveOsdScale
-        if (!force && appliedAdaptiveOsdScale.isFinite() &&
-            abs(appliedAdaptiveOsdScale - scale) < OSD_SCALE_EPSILON
-        ) return
-
-        appliedAdaptiveOsdScale = scale
-        MPVLib.setPropertyDouble("osd-scale", configuredOsdScale * scale)
-
-        // stats.lua renders explicit ASS sizes, which do not inherit osd-scale.
-        // script-opts is a key/value list, so appending the same key atomically
-        // replaces its previous value and asks the live stats script to redraw.
-        if (scale < 1.0 - OSD_SCALE_EPSILON) {
-            val scaledFontSize = configuredStatsFontSize * scale
-            MPVLib.command(arrayOf(
-                "change-list",
-                "script-opts",
-                "append",
-                "stats-font_size=${formatMpvNumber(scaledFontSize)}"
-            ))
-            statsFontSizeOverridden = true
-        } else if (statsFontSizeOverridden) {
-            val original = configuredStatsFontSizeScriptOpt
-            MPVLib.command(arrayOf(
-                "change-list",
-                "script-opts",
-                if (original == null) "remove" else "append",
-                if (original == null) "stats-font_size" else "stats-font_size=$original"
-            ))
-            statsFontSizeOverridden = false
-        }
-    }
-
-    private fun formatMpvNumber(value: Double): String {
-        return String.format(java.util.Locale.US, "%.6f", value)
-            .trimEnd('0')
-            .trimEnd('.')
-    }
 
     /**
      * Set the real SurfaceTexture buffer size used by mpv without changing the
@@ -332,10 +216,5 @@ abstract class BaseMPVView(context: Context, attrs: AttributeSet) : TextureView(
 
     companion object {
         private const val TAG = "mpv"
-        private const val DEFAULT_STATS_FONT_SIZE = 20.0
-        private const val MIN_ADAPTIVE_OSD_SCALE = 0.001
-        private const val OSD_SCALE_EPSILON = 0.0001
-        private val STATS_FONT_SIZE_SCRIPT_OPT =
-            Regex("(?:^|,)stats-font_size=([^,]+)")
     }
 }

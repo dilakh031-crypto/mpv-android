@@ -287,7 +287,6 @@ internal class VideoZoomGestures(
         videoPixelHeight = 0
         panscan = 0.0
         normalCompactSurfacePrepared = false
-        renderTarget?.setAdaptiveOsdScale(1.0)
         requestBaseRenderSurfaceSize(force = true)
         applyToView()
     }
@@ -305,7 +304,6 @@ internal class VideoZoomGestures(
         resetTransformState()
         normalCompactSurfacePrepared = false
         target.alpha = 0f
-        renderTarget?.setAdaptiveOsdScale(1.0)
         requestBaseRenderSurfaceSize(force = true)
         applyToView()
     }
@@ -644,7 +642,6 @@ internal class VideoZoomGestures(
     }
 
     private fun updateRenderSurfaceForCurrentState(force: Boolean) {
-        updateAdaptiveOsdScale()
         val zooming = isZoomed() || scaleDetector.isInProgress
 
         if (isPanscanActive()) {
@@ -731,26 +728,19 @@ internal class VideoZoomGestures(
             return
         }
 
-        // Keep the surface media-shaped (and therefore free of letterbox bars),
-        // but start from the phone-resolution size for this media orientation.
-        // This keeps mpv's OSD rasterization sharp even when the phone and media
-        // have opposite orientations. Zoom may increase it further to retain the
-        // source's original detail.
-        val displaySize = displayResolutionMediaSurfaceSize(c)
-        val fullSurfaceContent = ContentRect(
-            0f,
-            0f,
-            displaySize.w.toFloat(),
-            displaySize.h.toFloat(),
-        )
+        // Media-aspect path: do not pad the render surface to the phone's
+        // portrait/landscape aspect. A view-aspect buffer can contain mostly
+        // black bars for panoramic/tall images and may lose source detail or hit
+        // GPU limits. applyToView() places this compact buffer into the normal
+        // content rect with View scale/translation.
         val bufferScale = limitedOriginalDetailBufferScale(
-            baseWidth = displaySize.w,
-            baseHeight = displaySize.h,
-            content = fullSurfaceContent,
+            baseWidth = c.w.toDouble(),
+            baseHeight = c.h.toDouble(),
+            content = c,
         )
 
-        val bufferWidth = ceilToIntAtLeastOne(displaySize.w * bufferScale)
-        val bufferHeight = ceilToIntAtLeastOne(displaySize.h * bufferScale)
+        val bufferWidth = ceilToIntAtLeastOne(c.w.toDouble() * bufferScale)
+        val bufferHeight = ceilToIntAtLeastOne(c.h.toDouble() * bufferScale)
         player.setRenderSurfaceSize(bufferWidth, bufferHeight)
         renderSurfaceMode = RenderSurfaceMode.MEDIA_ASPECT_ORIGINAL
     }
@@ -774,66 +764,12 @@ internal class VideoZoomGestures(
         }
 
         // Keep the same media-aspect geometry used by the high-quality zoom
-        // surface. For opposite phone/media orientations, use the phone's full
-        // resolution rotated into the media orientation instead of rasterizing
-        // the OSD at only the small on-screen content rectangle.
-        val displaySize = displayResolutionMediaSurfaceSize(c)
-        val bufferWidth = ceilToIntAtLeastOne(displaySize.w)
-        val bufferHeight = ceilToIntAtLeastOne(displaySize.h)
+        // surface, but render only at the on-screen content size while unzoomed.
+        // This avoids the start/end aspect switch that causes the visible tear.
+        val bufferWidth = ceilToIntAtLeastOne(c.w.toDouble())
+        val bufferHeight = ceilToIntAtLeastOne(c.h.toDouble())
         player.setRenderSurfaceSize(bufferWidth, bufferHeight)
         renderSurfaceMode = RenderSurfaceMode.MEDIA_ASPECT_BASE
-    }
-
-    /**
-     * Return the media-only surface size at the phone's physical view
-     * resolution. When media and phone orientations differ, rotate the
-     * resolution bounds before fitting the media. The surface itself still has
-     * the media aspect, so mpv cannot draw OSD text in the black bars.
-     */
-    private fun displayResolutionMediaSurfaceSize(content: ContentRect): SurfaceSize {
-        if (!usesOppositeOrientationMediaAspectRenderSurface())
-            return SurfaceSize(content.w.toDouble(), content.h.toDouble())
-
-        val orientedWidth = viewHeight.toDouble()
-        val orientedHeight = viewWidth.toDouble()
-        val aspect = videoAspect.coerceAtLeast(0.001)
-        val orientedAspect = orientedWidth / orientedHeight
-
-        return if (aspect > orientedAspect) {
-            SurfaceSize(orientedWidth, orientedWidth / aspect)
-        } else {
-            SurfaceSize(orientedHeight * aspect, orientedHeight)
-        }
-    }
-
-    /**
-     * mpv already scales OSD text from the render height. Only add the missing
-     * width compensation: fit the same full-screen text rectangle uniformly
-     * into the current video rectangle, never enlarging it above the configured
-     * size.
-     */
-    private fun updateAdaptiveOsdScale() {
-        val player = renderTarget ?: return
-        refreshMetricsFromTarget()
-
-        if (viewWidth <= 1f || viewHeight <= 1f) {
-            player.setAdaptiveOsdScale(1.0)
-            return
-        }
-
-        val content = contentRect()
-        if (content.w <= 1f || content.h <= 1f) {
-            player.setAdaptiveOsdScale(1.0)
-            return
-        }
-
-        val widthRatio = content.w.toDouble() / viewWidth.toDouble()
-        val heightRatio = content.h.toDouble() / viewHeight.toDouble()
-        val scale = if (heightRatio > 0.0)
-            (widthRatio / heightRatio).coerceIn(0.0, 1.0)
-        else
-            1.0
-        player.setAdaptiveOsdScale(scale)
     }
 
     private fun usesOppositeOrientationMediaAspectRenderSurface(): Boolean {
@@ -930,7 +866,6 @@ internal class VideoZoomGestures(
     private fun lerp(a: Float, b: Float, t: Float): Float = a + (b - a) * t
 
     private data class ContentRect(val ox: Float, val oy: Float, val w: Float, val h: Float)
-    private data class SurfaceSize(val w: Double, val h: Double)
     private data class SurfaceFitTransform(
         val scaleX: Float,
         val scaleY: Float,

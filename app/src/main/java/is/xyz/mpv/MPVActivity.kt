@@ -123,6 +123,8 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
     private val seekbarIdleSeekRunnable = Runnable { performSeekbarIdleSeek() }
 
     private var toast: Toast? = null
+    private val toastHandler = Handler(Looper.getMainLooper())
+    private var toastCancelRunnable: Runnable? = null
 
     private var audioManager: AudioManager? = null
     private var audioFocusRequest: AudioFocusRequestCompat? = null
@@ -1828,12 +1830,27 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
     private fun playlistPrev() = MPVLib.command(arrayOf("playlist-prev"))
     private fun playlistNext() = MPVLib.command(arrayOf("playlist-next"))
 
-    private fun showToast(msg: String, cancel: Boolean = false) {
+    private fun showToast(msg: String, cancel: Boolean = false, durationMs: Long? = null) {
+        toastCancelRunnable?.let(toastHandler::removeCallbacks)
+        toastCancelRunnable = null
+
         if (cancel)
             toast?.cancel()
-        toast = Toast.makeText(this, msg, Toast.LENGTH_SHORT).apply {
+
+        val shownToast = Toast.makeText(this, msg, Toast.LENGTH_SHORT).apply {
             setGravity(Gravity.TOP or Gravity.CENTER_HORIZONTAL, 0, 0)
             show()
+        }
+        toast = shownToast
+
+        if (durationMs != null) {
+            toastCancelRunnable = Runnable {
+                if (toast === shownToast) {
+                    shownToast.cancel()
+                    toast = null
+                }
+                toastCancelRunnable = null
+            }.also { toastHandler.postDelayed(it, durationMs) }
         }
     }
 
@@ -2219,7 +2236,11 @@ private fun restoreSubtitleSelectionForCurrentFile() {
             val trackName = player.tracks[track_type]?.firstOrNull{ it.mpvId == track_id }?.name ?: "???"
             "$trackPrefix $trackName"
         }
-        showToast(msg, true)
+        val durationMs = if (track_type == "audio" || track_type == "sub")
+            TRACK_SWITCH_TOAST_DURATION_MS
+        else
+            null
+        showToast(msg, true, durationMs)
     }
 
     private fun cycleAudio() = trackSwitchNotification {
@@ -3776,6 +3797,8 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
         private const val TAG = "mpv"
         // how long should controls be displayed on screen (ms)
         private const val CONTROLS_DISPLAY_TIMEOUT = 1500L
+        // Android's short toast is roughly two seconds; track changes use one quarter of that.
+        private const val TRACK_SWITCH_TOAST_DURATION_MS = 500L
         // Controls fade-in/out durations (ms). Keep them very fast but non-zero to avoid a harsh pop.
         private const val CONTROLS_FADE_IN_DURATION = 80L
         private const val CONTROLS_FADE_OUT_DURATION = 80L
