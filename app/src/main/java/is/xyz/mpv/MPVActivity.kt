@@ -1685,9 +1685,11 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
         var unhandled = 0
 
         when (event.unicodeChar.toChar()) {
-            // (overrides a default binding)
+            // (overrides default bindings)
             'j' -> cycleSub()
             '#' -> cycleAudio()
+            '<' -> playlistPrev()
+            '>' -> playlistNext()
 
             else -> unhandled++
         }
@@ -1699,6 +1701,8 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
             // (no default binding)
             KeyEvent.KEYCODE_CAPTIONS -> cycleSub()
             KeyEvent.KEYCODE_MEDIA_AUDIO_TRACK -> cycleAudio()
+            KeyEvent.KEYCODE_MEDIA_PREVIOUS -> playlistPrev()
+            KeyEvent.KEYCODE_MEDIA_NEXT -> playlistNext()
             KeyEvent.KEYCODE_INFO -> toggleControls()
             KeyEvent.KEYCODE_MENU -> openTopMenu()
             KeyEvent.KEYCODE_GUIDE -> openTopMenu()
@@ -1827,8 +1831,30 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
         }
     }
 
-    private fun playlistPrev() = MPVLib.command(arrayOf("playlist-prev"))
-    private fun playlistNext() = MPVLib.command(arrayOf("playlist-next"))
+    private fun persistBeforePlaylistJump() {
+        // Do not create a resume point at the physical end of a completed file. Per-file option
+        // changes are persisted when they are made, so skipping this write does not lose them.
+        if (MPVLib.getPropertyBoolean("eof-reached") == true)
+            return
+        player.persistCurrentFileState()
+    }
+
+    private fun playlistPrev() {
+        persistBeforePlaylistJump()
+        MPVLib.command(arrayOf("playlist-prev"))
+    }
+
+    private fun playlistNext() {
+        persistBeforePlaylistJump()
+        MPVLib.command(arrayOf("playlist-next"))
+    }
+
+    private fun playPlaylistItem(index: Int) {
+        if (MPVLib.getPropertyInt("playlist-pos") == index)
+            return
+        persistBeforePlaylistJump()
+        MPVLib.setPropertyInt("playlist-pos", index)
+    }
 
     private fun showToast(msg: String, cancel: Boolean = false, durationMs: Long? = null) {
         toastCancelRunnable?.let(toastHandler::removeCallbacks)
@@ -1996,7 +2022,7 @@ private fun restoreSubtitleSelectionForCurrentFile() {
     val prefs = getDefaultSharedPreferences(applicationContext)
 
     fun setSubProp(prop: String, id: Int) {
-        if (id == -1) MPVLib.setPropertyString(prop, "no") else MPVLib.setPropertyInt(prop, id)
+        if (id == -1) player.setFileLocalString(prop, "no") else player.setFileLocalInt(prop, id)
     }
 
     // Load primary selection
@@ -2048,7 +2074,7 @@ private fun restoreSubtitleSelectionForCurrentFile() {
 
                 // Restore primary selection to keep primary/secondary fully independent.
                 if (primarySidSnapshot != null) {
-                    MPVLib.setPropertyString("sid", primarySidSnapshot)
+                    player.setFileLocalString("sid", primarySidSnapshot)
                 }
 
                 if (sid != null) {
@@ -2158,8 +2184,8 @@ private fun restoreSubtitleSelectionForCurrentFile() {
             }
             PREF_AUD_KIND_SID -> {
                 if (aid != null) {
-                    if (aid == -1) MPVLib.setPropertyString("aid", "no")
-                    else MPVLib.setPropertyInt("aid", aid)
+                    if (aid == -1) player.setFileLocalString("aid", "no")
+                    else player.setFileLocalInt("aid", aid)
                 }
             }
         }
@@ -2246,11 +2272,13 @@ private fun restoreSubtitleSelectionForCurrentFile() {
     private fun cycleAudio() = trackSwitchNotification {
         player.cycleAudio()
         try { rememberAudioSelectionForCurrentFile() } catch (_: Throwable) {}
+        player.persistCurrentFileState()
         TrackData(player.aid, "audio")
     }
     private fun cycleSub() = trackSwitchNotification {
         player.cycleSub()
         try { rememberSubtitleSelectionForCurrentFile() } catch (_: Throwable) {}
+        player.persistCurrentFileState()
         TrackData(player.sid, "sub")
     }
 
@@ -2271,6 +2299,7 @@ private fun restoreSubtitleSelectionForCurrentFile() {
             } else if (type == "audio") {
                 try { rememberAudioSelectionForCurrentFile() } catch (_: Throwable) {}
             }
+            player.persistCurrentFileState()
             trackSwitchNotification { TrackData(trackId, type) }
             // Keep dialog open (apply-in-place).
         }
@@ -2303,6 +2332,7 @@ private fun pickAudio() = selectTrack("audio", { player.aid }, { player.aid = it
             player.sid = it.mpvId
 
         try { rememberSubtitleSelectionForCurrentFile(secondary = secondary) } catch (_: Throwable) {}
+        player.persistCurrentFileState()
         trackSwitchNotification { TrackData(it.mpvId, SubTrackDialog.TRACK_TYPE) }
         // Keep dialog open (apply-in-place).
     }
@@ -2365,7 +2395,7 @@ private fun openPlaylistMenu(restore: StateRestoreCallback, onBack: (() -> Unit)
         }
 
         override fun onItemPicked(item: MPVView.PlaylistItem) {
-            MPVLib.setPropertyInt("playlist-pos", item.index)
+            playPlaylistItem(item.index)
             impl.refresh()
             // Keep dialog open (apply-in-place).
         }
@@ -2421,7 +2451,8 @@ private fun pickDecoder() {
     var handled = false
     val dialog = with(AlertDialog.Builder(this)) {
         setSingleChoiceItems(items.map { it.first }.toTypedArray(), selectedIndex) { _, idx ->
-            MPVLib.setPropertyString("hwdec", items[idx].second)
+            player.setFileLocalString("hwdec", items[idx].second)
+            player.persistCurrentFileState()
             // Keep dialog open (apply-in-place).
         }
         setNegativeButton(R.string.dialog_cancel) { d, _ -> d.cancel() }
@@ -2725,9 +2756,10 @@ private fun openTopMenu(existingRestoreState: StateRestoreCallback? = null) {
         dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener {
             picker.number?.let {
                 if (picker.isInteger())
-                    MPVLib.setPropertyInt(property, it.toInt())
+                    player.setFileLocalInt(property, it.toInt())
                 else
-                    MPVLib.setPropertyDouble(property, it)
+                    player.setFileLocalDouble(property, it)
+                player.persistCurrentFileState()
             }
             // Keep dialog open (apply-in-place).
         }
@@ -2813,12 +2845,13 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
                 }, ASPECT_MENU_PREDICTIVE_SYNC_GRACE_MS + 20L)
 
                 if (ratio == "panscan") {
-                    MPVLib.setPropertyString("video-aspect-override", "-1")
-                    MPVLib.setPropertyDouble("panscan", 1.0)
+                    player.setFileLocalString("video-aspect-override", "-1")
+                    player.setFileLocalDouble("panscan", 1.0)
                 } else {
-                    MPVLib.setPropertyString("video-aspect-override", ratio)
-                    MPVLib.setPropertyDouble("panscan", 0.0)
+                    player.setFileLocalString("video-aspect-override", ratio)
+                    player.setFileLocalDouble("panscan", 0.0)
                 }
+                player.persistCurrentFileState()
                 // Keep dialog open (apply-in-place).
             }
             // "Cancel" behaves like Back (up to the advanced menu).
@@ -2907,6 +2940,7 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
             dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener {
                 picker.delay1?.let { player.subDelay = it }
                 picker.delay2?.let { player.secondarySubDelay = it }
+                player.persistCurrentFileState()
                 // Keep dialog open (apply-in-place).
             }
         }
@@ -3548,7 +3582,6 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
                 MPVLib.setPropertyDouble("video-zoom", 0.0)
                 MPVLib.setPropertyDouble("video-pan-x", 0.0)
                 MPVLib.setPropertyDouble("video-pan-y", 0.0)
-                MPVLib.setPropertyDouble("panscan", 0.0)
             } catch (_: Throwable) {
                 // ignore
             }

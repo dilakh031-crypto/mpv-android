@@ -119,8 +119,68 @@ internal class MPVView(context: Context, attrs: AttributeSet) : BaseMPVView(cont
     }
 
     override fun postInitOptions() {
-        // we need to call write-watch-later manually
+        // We call write-watch-later manually, including before every explicit playlist jump.
         MPVLib.setOptionString("save-position-on-quit", "no")
+
+        // Runtime option changes normally leak into the next playlist item. Reset every option
+        // exposed as a per-video control by this app, including changes made through input.conf.
+        mergeStringListProperty("reset-on-next-file", PER_FILE_PLAYBACK_OPTIONS + "start")
+
+        // Make sure the same options are written to each file's watch-later config, so revisiting
+        // an item restores its own values instead of merely falling back to the global defaults.
+        // The app's Save position preference remains authoritative for the `start` entry.
+        val sharedPreferences = PreferenceManager.getDefaultSharedPreferences(context)
+        val watchLaterOptions = PER_FILE_PLAYBACK_OPTIONS.toMutableSet()
+        val remove = mutableSetOf<String>()
+        if (sharedPreferences.getBoolean("save_position", false))
+            watchLaterOptions.add("start")
+        else
+            remove.add("start")
+        mergeStringListProperty("watch-later-options", watchLaterOptions, remove)
+    }
+
+    private fun mergeStringListProperty(
+        property: String,
+        required: Collection<String>,
+        remove: Collection<String> = emptyList()
+    ) {
+        val current = MPVLib.getPropertyString(property)
+            ?.split(',')
+            ?.map { it.trim() }
+            ?.filter { it.isNotEmpty() }
+            ?.toMutableList()
+            ?: mutableListOf()
+
+        current.removeAll(remove.toSet())
+        if (!current.contains("all")) {
+            for (option in required) {
+                if (!current.contains(option))
+                    current.add(option)
+            }
+        }
+        MPVLib.setPropertyString(property, current.joinToString(","))
+    }
+
+    /**
+     * Set an option only for the currently playing file. `file-local-options` guarantees that the
+     * value is restored to the pre-file value when this file unloads.
+     */
+    fun setFileLocalString(name: String, value: String) {
+        MPVLib.setPropertyString("file-local-options/$name", value)
+    }
+
+    fun setFileLocalInt(name: String, value: Int) {
+        MPVLib.setPropertyInt("file-local-options/$name", value)
+    }
+
+    fun setFileLocalDouble(name: String, value: Double) {
+        MPVLib.setPropertyDouble("file-local-options/$name", value)
+    }
+
+    fun persistCurrentFileState() {
+        // During teardown/pathological load failures there may be no writable current file.
+        if (MPVLib.getPropertyString("path") != null)
+            MPVLib.command(arrayOf("write-watch-later-config"))
     }
 
     fun onPointerEvent(event: MotionEvent): Boolean {
@@ -302,15 +362,15 @@ internal class MPVView(context: Context, attrs: AttributeSet) : BaseMPVView(cont
 
     var playbackSpeed: Double?
         get() = MPVLib.getPropertyDouble("speed")
-        set(speed) = MPVLib.setPropertyDouble("speed", speed!!)
+        set(speed) = setFileLocalDouble("speed", speed!!)
 
     var subDelay: Double?
         get() = MPVLib.getPropertyDouble("sub-delay")
-        set(speed) = MPVLib.setPropertyDouble("sub-delay", speed!!)
+        set(delay) = setFileLocalDouble("sub-delay", delay!!)
 
     var secondarySubDelay: Double?
         get() = MPVLib.getPropertyDouble("secondary-sub-delay")
-        set(speed) = MPVLib.setPropertyDouble("secondary-sub-delay", speed!!)
+        set(delay) = setFileLocalDouble("secondary-sub-delay", delay!!)
 
     val estimatedVfFps: Double?
         get() = MPVLib.getPropertyDouble("estimated-vf-fps")
@@ -379,7 +439,7 @@ internal class MPVView(context: Context, attrs: AttributeSet) : BaseMPVView(cont
         MPVLib.setPropertyInt("aaudio-session-id", id)
     }
 
-    class TrackDelegate(private val name: String) {
+    inner class TrackDelegate(private val name: String) {
         operator fun getValue(thisRef: Any?, property: KProperty<*>): Int {
             val v = MPVLib.getPropertyString(name)
             // we can get null here for "no" or other invalid value
@@ -387,9 +447,9 @@ internal class MPVView(context: Context, attrs: AttributeSet) : BaseMPVView(cont
         }
         operator fun setValue(thisRef: Any?, property: KProperty<*>, value: Int) {
             if (value == -1)
-                MPVLib.setPropertyString(name, "no")
+                setFileLocalString(name, "no")
             else
-                MPVLib.setPropertyInt(name, value)
+                setFileLocalInt(name, value)
         }
     }
 
@@ -401,15 +461,36 @@ internal class MPVView(context: Context, attrs: AttributeSet) : BaseMPVView(cont
     // Commands
 
     fun cyclePause() = MPVLib.command(arrayOf("cycle", "pause"))
-    fun cycleAudio() = MPVLib.command(arrayOf("cycle", "audio"))
-    fun cycleSub() = MPVLib.command(arrayOf("cycle", "sub"))
-    fun cycleHwdec() = MPVLib.command(arrayOf("cycle-values", "hwdec", HWDECS, "no"))
+
+    private fun makeCurrentOptionFileLocal(name: String): Boolean {
+        val current = MPVLib.getPropertyString(name) ?: return false
+        setFileLocalString(name, current)
+        return true
+    }
+
+    fun cycleAudio() {
+        if (makeCurrentOptionFileLocal("aid"))
+            MPVLib.command(arrayOf("cycle", "audio"))
+    }
+
+    fun cycleSub() {
+        if (makeCurrentOptionFileLocal("sid"))
+            MPVLib.command(arrayOf("cycle", "sub"))
+    }
+
+    fun cycleHwdec() {
+        if (!makeCurrentOptionFileLocal("hwdec"))
+            return
+        MPVLib.command(arrayOf("cycle-values", "hwdec", HWDECS, "no"))
+        persistCurrentFileState()
+    }
 
     fun cycleSpeed() {
         val speeds = arrayOf(0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0)
         val currentSpeed = playbackSpeed ?: 1.0
         val index = speeds.indexOfFirst { it > currentSpeed }
         playbackSpeed = speeds[if (index == -1) 0 else index]
+        persistCurrentFileState()
     }
 
     fun getRepeat(): Int {
@@ -448,6 +529,26 @@ internal class MPVView(context: Context, attrs: AttributeSet) : BaseMPVView(cont
 
     companion object {
         private const val TAG = "mpv"
+
+        // Options controlled per media item by the Android UI. These are both reset between
+        // playlist entries and included in watch-later persistence.
+        private val PER_FILE_PLAYBACK_OPTIONS = linkedSetOf(
+            "speed",
+            "audio-delay",
+            "sub-delay",
+            "secondary-sub-delay",
+            "video-aspect-override",
+            "panscan",
+            "contrast",
+            "brightness",
+            "gamma",
+            "saturation",
+            "hwdec",
+            "aid",
+            "sid",
+            "secondary-sid",
+            "vid",
+        )
 
         // mpv option `hwdec` is set to this
         private const val HWDECS = "mediacodec,mediacodec-copy"
