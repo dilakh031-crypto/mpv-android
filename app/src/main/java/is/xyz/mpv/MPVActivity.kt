@@ -72,6 +72,19 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
     private val tapToggleHandler = Handler(Looper.getMainLooper())
     private var pendingTapToggleRunnable: Runnable? = null
 
+    // Restores immersive mode after temporary system UI interruptions such as Google Assistant
+    // or the soft keyboard. A separate handler keeps these retries independent from player/event
+    // callbacks, which may be cleared while the activity is paused.
+    private val immersiveHandler = Handler(Looper.getMainLooper())
+    private var playerWindowLostFocus = false
+    private var manualSystemBarsRevealPending = false
+    private val clearManualSystemBarsRevealRunnable = Runnable {
+        manualSystemBarsRevealPending = false
+    }
+    private val restorePlayerImmersiveRunnable = Runnable {
+        applyPlayerImmersiveModeIfPossible()
+    }
+
     // We intentionally do *not* try to predict a double-tap here. Instead, we only cancel the
     // pending single-tap toggle if TouchGestures actually confirms and handles a double-tap
     // (PlayPause / SeekFixed / Custom). This avoids a "dead zone" where two quick taps that do
@@ -369,9 +382,6 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
 
         ViewCompat.setOnApplyWindowInsetsListener(binding.outside) { _, windowInsets ->
             // guidance: https://medium.com/androiddevelopers/gesture-navigation-handling-visual-overlaps-4aed565c134c
-            updateUserSystemBarsRevealState(
-                windowInsets.isVisible(WindowInsetsCompat.Type.statusBars())
-            )
             val insets = windowInsets.getInsets(WindowInsetsCompat.Type.systemBars())
             val insets2 = windowInsets.getInsets(WindowInsetsCompat.Type.displayCutout())
             binding.outside.updateLayoutParams<MarginLayoutParams> {
@@ -518,6 +528,7 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
         val insetsController = WindowCompat.getInsetsController(window, window.decorView)
         insetsController.systemBarsBehavior =
             WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+        installImeDismissImmersiveRestore(window, binding.root)
 
         // Hide PiP / lock buttons on devices that don't support them
         if (!packageManager.hasSystemFeature(PackageManager.FEATURE_PICTURE_IN_PICTURE))
@@ -747,6 +758,7 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
 
         // Suppress any further callbacks
         activityIsForeground = false
+        immersiveHandler.removeCallbacksAndMessages(null)
 
         if (becomingNoisyReceiverRegistered) {
             unregisterReceiver(becomingNoisyReceiver)
@@ -982,12 +994,29 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
 
     override fun onWindowFocusChanged(hasFocus: Boolean) {
         super.onWindowFocusChanged(hasFocus)
+        if (!hasFocus) {
+            playerWindowLostFocus = true
+
+            // A top-edge swipe may hand focus to the notification shade. Preserve that manual
+            // reveal until focus returns so Android can keep its existing transient-bar behavior.
+            if (manualSystemBarsRevealPending)
+                immersiveHandler.removeCallbacks(clearManualSystemBarsRevealRunnable)
+            return
+        }
+
         if (hasFocus) {
             refreshPlayerOverlay()
-            if (restorePlayerImmersiveOnFocus) {
-                eventUiHandler.removeCallbacks(restorePlayerImmersiveRunnable)
-                eventUiHandler.post(restorePlayerImmersiveRunnable)
-            }
+
+            val preserveManualReveal = playerWindowLostFocus && manualSystemBarsRevealPending
+            playerWindowLostFocus = false
+            manualSystemBarsRevealPending = false
+            immersiveHandler.removeCallbacks(clearManualSystemBarsRevealRunnable)
+
+            // Assistant/dialog windows can make the status bar visible after onResume() has
+            // already run. Re-apply immersive mode when player focus is restored, except when
+            // the focus change came from the user's own top-edge system-bar swipe.
+            if (!preserveManualReveal)
+                requestPlayerImmersiveRestore()
         }
     }
 
@@ -1099,15 +1128,6 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
     private var statusBarSwipeStartY = 0f
     private var statusBarSwipeCanceledToggle = false
 
-    // A system-bar reveal caused by the user's top-edge swipe must be left to Android's normal
-    // transient-bar timeout. Automatic reveals caused by an in-player dialog/IME are different:
-    // once that transient UI goes away, the player should immediately return to immersive mode.
-    private var userSystemBarsRevealActive = false
-    private var userSystemBarsRevealSeenVisible = false
-    private var userSystemBarsRevealDeadlineMs = 0L
-    private var restorePlayerImmersiveOnFocus = false
-    private val restorePlayerImmersiveRunnable = Runnable { restorePlayerImmersiveAfterTransientUi() }
-
     private fun isInTopSystemGestureDeadzone(y: Float): Boolean {
         // Use the gesture layer height if available (covers edge-to-edge/immersive scenarios).
         val h = when {
@@ -1121,45 +1141,6 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
 
     private fun statusBarSwipeCancelPx(): Float {
         return STATUS_BAR_SWIPE_CANCEL_DP * resources.displayMetrics.density
-    }
-
-    private fun markUserSystemBarsReveal() {
-        userSystemBarsRevealActive = true
-        userSystemBarsRevealSeenVisible = false
-        userSystemBarsRevealDeadlineMs =
-            SystemClock.uptimeMillis() + USER_SYSTEM_BARS_REVEAL_GRACE_MS
-    }
-
-    private fun updateUserSystemBarsRevealState(statusBarsVisible: Boolean) {
-        if (!userSystemBarsRevealActive)
-            return
-
-        if (statusBarsVisible) {
-            userSystemBarsRevealSeenVisible = true
-            return
-        }
-
-        // Only clear after the manually revealed bar has actually been visible. The deadline is a
-        // safety net for edge gestures that are canceled before Android reveals anything.
-        if (userSystemBarsRevealSeenVisible ||
-            SystemClock.uptimeMillis() >= userSystemBarsRevealDeadlineMs
-        ) {
-            userSystemBarsRevealActive = false
-            userSystemBarsRevealSeenVisible = false
-        }
-    }
-
-    private fun shouldPreserveUserRevealedSystemBars(): Boolean {
-        if (!userSystemBarsRevealActive)
-            return false
-
-        if (SystemClock.uptimeMillis() >= userSystemBarsRevealDeadlineMs &&
-            !userSystemBarsRevealSeenVisible
-        ) {
-            userSystemBarsRevealActive = false
-            return false
-        }
-        return true
     }
 
     /** true if we're actually outputting any audio (includes the mute state, but not pausing) */
@@ -1328,39 +1309,63 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
         controller.hide(WindowInsetsCompat.Type.systemBars())
     }
 
-    private fun requestPlayerImmersiveRestore() {
-        if (!uiInitialized || isFinishing || isDestroyed || isInPictureInPictureMode)
+    /** Apply immersive mode only to the active video player activity. */
+    private fun applyPlayerImmersiveModeIfPossible() {
+        if (!uiInitialized || !activityIsForeground || isFinishing || isDestroyed)
+            return
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N && isInMultiWindowMode)
+            return
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && isInPictureInPictureMode)
             return
 
-        restorePlayerImmersiveOnFocus = true
-        eventUiHandler.removeCallbacks(restorePlayerImmersiveRunnable)
-        if (window.decorView.hasWindowFocus())
-            eventUiHandler.post(restorePlayerImmersiveRunnable)
+        applyImmersiveToWindow(window)
     }
 
-    private fun restorePlayerImmersiveAfterTransientUi() {
-        if (!restorePlayerImmersiveOnFocus || !uiInitialized ||
-            isFinishing || isDestroyed || isInPictureInPictureMode
-        ) {
-            return
-        }
-        if (!window.decorView.hasWindowFocus())
-            return
+    /**
+     * Restore immersive mode immediately and once more after the current window-focus/insets
+     * transaction. The second pass handles OEMs that re-show the status bar just after focus is
+     * returned from Assistant or an input window.
+     */
+    private fun requestPlayerImmersiveRestore() {
+        immersiveHandler.removeCallbacks(restorePlayerImmersiveRunnable)
+        applyPlayerImmersiveModeIfPossible()
+        immersiveHandler.postDelayed(
+            restorePlayerImmersiveRunnable,
+            IMMERSIVE_RESTORE_RETRY_MS
+        )
+    }
 
-        restorePlayerImmersiveOnFocus = false
-        if (shouldPreserveUserRevealedSystemBars())
-            return
+    /**
+     * Re-hide system bars when the soft keyboard changes from visible to hidden. This listener is
+     * installed only on windows belonging to MPVActivity and its in-player dialogs.
+     */
+    private fun installImeDismissImmersiveRestore(w: Window, insetsHost: View) {
+        var imeWasVisible =
+            ViewCompat.getRootWindowInsets(insetsHost)
+                ?.isVisible(WindowInsetsCompat.Type.ime()) == true
 
-        // Re-hide immediately after the in-player dialog/IME gives focus back. Repeating once on
-        // the next frame handles OEMs that briefly re-apply stale insets after focus restoration.
-        applyImmersiveToWindow(window)
-        window.decorView.post {
-            if (!isFinishing && !isDestroyed && !isInPictureInPictureMode &&
-                !shouldPreserveUserRevealedSystemBars()
-            ) {
-                applyImmersiveToWindow(window)
+        ViewCompat.setOnApplyWindowInsetsListener(insetsHost) { view, insets ->
+            val imeIsVisible = insets.isVisible(WindowInsetsCompat.Type.ime())
+            if (imeWasVisible && !imeIsVisible) {
+                view.post {
+                    if (view.isAttachedToWindow)
+                        applyImmersiveToWindow(w)
+                    requestPlayerImmersiveRestore()
+                }
             }
+            imeWasVisible = imeIsVisible
+            insets
         }
+        ViewCompat.requestApplyInsets(insetsHost)
+    }
+
+    private fun markManualSystemBarsReveal() {
+        manualSystemBarsRevealPending = true
+        immersiveHandler.removeCallbacks(clearManualSystemBarsRevealRunnable)
+        immersiveHandler.postDelayed(
+            clearManualSystemBarsRevealRunnable,
+            MANUAL_SYSTEM_BARS_GESTURE_WINDOW_MS
+        )
     }
 
     /**
@@ -1382,8 +1387,18 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
         dialog.show()
 
         val w = dialog.window ?: return
-        val dialogDecor = w.decorView
-        dialogDecor.addOnAttachStateChangeListener(object : View.OnAttachStateChangeListener {
+        // Copy the current immersive flags from the activity.
+        @Suppress("DEPRECATION")
+        w.decorView.systemUiVisibility = window.decorView.systemUiVisibility
+
+        applyImmersiveToWindow(w)
+
+        val insetsHost = w.findViewById<View>(android.R.id.content) ?: w.decorView
+        installImeDismissImmersiveRestore(w, insetsHost)
+
+        // Dismissing a keyboard-backed dialog can detach its window before a final IME-insets
+        // callback arrives. Restore the player window as soon as that dialog view is detached.
+        w.decorView.addOnAttachStateChangeListener(object : View.OnAttachStateChangeListener {
             override fun onViewAttachedToWindow(v: View) = Unit
 
             override fun onViewDetachedFromWindow(v: View) {
@@ -1391,12 +1406,6 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
                 requestPlayerImmersiveRestore()
             }
         })
-
-        // Copy the current immersive flags from the activity.
-        @Suppress("DEPRECATION")
-        dialogDecor.systemUiVisibility = window.decorView.systemUiVisibility
-
-        applyImmersiveToWindow(w)
 
         // Now allow focus/input again.
         w.clearFlags(WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE)
@@ -1527,7 +1536,7 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
                 // User is likely pulling down the notification shade; don't show player controls.
                 if (ev.y - statusBarSwipeStartY > statusBarSwipeCancelPx()) {
                     statusBarSwipeCanceledToggle = true
-                    markUserSystemBarsReveal()
+                    markManualSystemBarsReveal()
                     mightWantToToggleControls = false
                     cancelPendingTapToggle()
                 }
@@ -1542,8 +1551,6 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
             // Always reset status-bar swipe tracking when a gesture ends, even if a child view
             // handled the event.
             if (ev.actionMasked == MotionEvent.ACTION_UP || ev.actionMasked == MotionEvent.ACTION_CANCEL) {
-                if (ev.actionMasked == MotionEvent.ACTION_CANCEL && statusBarSwipeCandidate)
-                    markUserSystemBarsReveal()
                 statusBarSwipeCandidate = false
                 statusBarSwipeCanceledToggle = false
             }
@@ -1565,10 +1572,6 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
             mightWantToToggleControls = false
         }
         if (ev.actionMasked == MotionEvent.ACTION_CANCEL) {
-            // Android may take ownership of a top-edge gesture before we receive enough MOVE
-            // events to cross our threshold. Treat that cancellation as a manual system-bar reveal.
-            if (statusBarSwipeCandidate)
-                markUserSystemBarsReveal()
             cancelPendingTapToggle()
             mightWantToToggleControls = false
             statusBarSwipeCandidate = false
@@ -3785,15 +3788,14 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
         // - Single-tap control toggle: delayed slightly longer so double-tap can cancel it (ms)
         private const val DOUBLE_TAP_TIMEOUT_MS = 225L
         private const val SINGLE_TAP_TOGGLE_DELAY_MS = DOUBLE_TAP_TIMEOUT_MS + 20L
+        private const val IMMERSIVE_RESTORE_RETRY_MS = 120L
+        private const val MANUAL_SYSTEM_BARS_GESTURE_WINDOW_MS = 2000L
 
         // Reserve the very top portion of the screen for Android system gestures (notification
         // shade/status bar). We only suppress the tap-to-toggle if the finger *moves down*
         // meaningfully from this region.
         private const val STATUS_BAR_DEADZONE_PERCENT = 5f
         private const val STATUS_BAR_SWIPE_CANCEL_DP = 16f
-        // Preserve Android's normal transient timeout after an explicit user swipe. This only
-        // suppresses our own immediate restore; Android still hides the transient bar normally.
-        private const val USER_SYSTEM_BARS_REVEAL_GRACE_MS = 5000L
         // resolution (px) of the thumbnail displayed with playback notification
         private const val THUMB_SIZE = 384
         // smallest aspect ratio that is considered non-square
