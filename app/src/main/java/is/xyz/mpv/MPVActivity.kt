@@ -123,6 +123,8 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
     private val seekbarIdleSeekRunnable = Runnable { performSeekbarIdleSeek() }
 
     private var toast: Toast? = null
+    private val toastHandler = Handler(Looper.getMainLooper())
+    private var toastCancelRunnable: Runnable? = null
 
     private var audioManager: AudioManager? = null
     private var audioFocusRequest: AudioFocusRequestCompat? = null
@@ -339,7 +341,7 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
             cycleAudioBtn.setOnClickListener { cycleAudio() }
             cycleSubsBtn.setOnClickListener { cycleSub() }
             playBtn.setOnClickListener { player.cyclePause() }
-            cycleDecoderBtn.setOnClickListener { player.cycleHwdec() }
+            cycleDecoderBtn.setOnClickListener { cycleDecoder() }
             cycleSpeedBtn.setOnClickListener { cycleSpeed() }
             topLockBtn.setOnClickListener { lockUI() }
             topPiPBtn.setOnClickListener { goIntoPiP() }
@@ -405,6 +407,15 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
 
     private var playbackHasStarted = false
     private var onloadCommands = mutableListOf<Array<String>>()
+
+    // mpv normally keeps runtime option changes when advancing through a playlist.
+    // Keep the state tied to the media path instead, and restore it when that item is
+    // selected again. Position tracking uses the same path key and is only active when
+    // the normal "save position" preference is enabled.
+    private var activePlaylistMediaPath: String? = null
+    private var activePlaylistCount = 0
+    private var lastKnownPlaylistPositionSec: Double? = null
+    private var pendingPlaylistResumePositionSec: Double? = null
 
     // Activity lifetime
 
@@ -780,6 +791,9 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
         // take the background service with us
         stopServiceRunnable.run()
 
+        toastHandler.removeCallbacksAndMessages(null)
+        toast?.cancel()
+
         player.removeObserver(this)
         player.destroy()
         super.onDestroy()
@@ -1023,6 +1037,7 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
     private fun savePosition() {
         if (!shouldSavePosition)
             return
+        saveCurrentPlaylistItemPosition(completed = false)
         if (MPVLib.getPropertyBoolean("eof-reached") ?: true) {
             Log.d(TAG, "player indicates EOF, not saving watch-later config")
             return
@@ -1825,15 +1840,37 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
         }
     }
 
-    private fun playlistPrev() = MPVLib.command(arrayOf("playlist-prev"))
-    private fun playlistNext() = MPVLib.command(arrayOf("playlist-next"))
+    private fun playlistPrev() {
+        savePosition()
+        MPVLib.command(arrayOf("playlist-prev"))
+    }
 
-    private fun showToast(msg: String, cancel: Boolean = false) {
+    private fun playlistNext() {
+        savePosition()
+        MPVLib.command(arrayOf("playlist-next"))
+    }
+
+    private fun showToast(msg: String, cancel: Boolean = false, durationMs: Long? = null) {
+        toastCancelRunnable?.let { toastHandler.removeCallbacks(it) }
+        toastCancelRunnable = null
         if (cancel)
             toast?.cancel()
-        toast = Toast.makeText(this, msg, Toast.LENGTH_SHORT).apply {
+        val shownToast = Toast.makeText(this, msg, Toast.LENGTH_SHORT).apply {
             setGravity(Gravity.TOP or Gravity.CENTER_HORIZONTAL, 0, 0)
             show()
+        }
+        toast = shownToast
+
+        if (durationMs != null) {
+            val cancelRunnable = Runnable {
+                if (toast === shownToast) {
+                    shownToast.cancel()
+                    toast = null
+                }
+                toastCancelRunnable = null
+            }
+            toastCancelRunnable = cancelRunnable
+            toastHandler.postDelayed(cancelRunnable, durationMs)
         }
     }
 
@@ -1937,6 +1974,79 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
     }
 
     private fun perFileKey(suffix: String, path: String): String = "perfile_${suffix}_${sha1Hex(path)}"
+
+    private fun playlistOptionKey(option: String, path: String): String =
+        perFileKey("${PREF_PLAYLIST_OPTION}_$option", path)
+
+    private fun isPlaylistActive(): Boolean {
+        val count = MPVLib.getPropertyInt("playlist-count") ?: activePlaylistCount
+        return count > 1
+    }
+
+    /**
+     * Change an mpv option for the current media item only. mpv restores the previous
+     * value when the file ends, so the setting cannot leak into the next playlist item.
+     * For playlists, also remember the value by media path so returning to the item
+     * restores its own settings.
+     */
+    private fun setPerFileRuntimeOption(option: String, value: String) {
+        MPVLib.setPropertyString("file-local-options/$option", value)
+
+        val mediaPath = MPVLib.getPropertyString("path") ?: return
+        if (!isPlaylistActive())
+            return
+
+        getDefaultSharedPreferences(applicationContext)
+            .edit()
+            .putString(playlistOptionKey(option, mediaPath), value)
+            .apply()
+    }
+
+    private fun restorePlaylistOptionsForPath(mediaPath: String) {
+        if (!isPlaylistActive())
+            return
+
+        val prefs = getDefaultSharedPreferences(applicationContext)
+        for (option in PLAYLIST_FILE_LOCAL_OPTIONS) {
+            val value = prefs.getString(playlistOptionKey(option, mediaPath), null) ?: continue
+            MPVLib.setPropertyString("file-local-options/$option", value)
+        }
+    }
+
+    private fun saveCurrentPlaylistItemPosition(completed: Boolean) {
+        if (!shouldSavePosition || activePlaylistCount <= 1)
+            return
+
+        val mediaPath = activePlaylistMediaPath ?: return
+        val prefs = getDefaultSharedPreferences(applicationContext)
+        val key = perFileKey(PREF_PLAYLIST_POSITION, mediaPath)
+        val position = MPVLib.getPropertyDouble("time-pos/full")
+            ?: lastKnownPlaylistPositionSec
+            ?: psc.positionSec.toDouble()
+        val duration = psc.durationSec.toDouble()
+        val reachedEnd = completed ||
+            (duration > 0.0 && position >= (duration - PLAYLIST_COMPLETION_MARGIN_SEC).coerceAtLeast(0.0))
+
+        with(prefs.edit()) {
+            if (reachedEnd || position < PLAYLIST_MIN_RESUME_POSITION_SEC)
+                remove(key)
+            else
+                putString(key, position.toString())
+            apply()
+        }
+    }
+
+    private fun loadPlaylistPositionForPath(mediaPath: String): Double? {
+        if (!shouldSavePosition || !isPlaylistActive())
+            return null
+
+        val value = getDefaultSharedPreferences(applicationContext)
+            .getString(perFileKey(PREF_PLAYLIST_POSITION, mediaPath), null)
+            ?.toDoubleOrNull()
+            ?: return null
+        return value.takeIf { it >= PLAYLIST_MIN_RESUME_POSITION_SEC }
+    }
+
 private fun rememberSubtitleSelectionForCurrentFile(secondary: Boolean = false) {
     val mediaPath = MPVLib.getPropertyString("path") ?: return
     val prefs = getDefaultSharedPreferences(applicationContext)
@@ -2219,7 +2329,7 @@ private fun restoreSubtitleSelectionForCurrentFile() {
             val trackName = player.tracks[track_type]?.firstOrNull{ it.mpvId == track_id }?.name ?: "???"
             "$trackPrefix $trackName"
         }
-        showToast(msg, true)
+        showToast(msg, cancel = true, durationMs = TRACK_TOAST_DURATION_MS)
     }
 
     private fun cycleAudio() = trackSwitchNotification {
@@ -2344,6 +2454,7 @@ private fun openPlaylistMenu(restore: StateRestoreCallback, onBack: (() -> Unit)
         }
 
         override fun onItemPicked(item: MPVView.PlaylistItem) {
+            savePosition()
             MPVLib.setPropertyInt("playlist-pos", item.index)
             impl.refresh()
             // Keep dialog open (apply-in-place).
@@ -2400,7 +2511,7 @@ private fun pickDecoder() {
     var handled = false
     val dialog = with(AlertDialog.Builder(this)) {
         setSingleChoiceItems(items.map { it.first }.toTypedArray(), selectedIndex) { _, idx ->
-            MPVLib.setPropertyString("hwdec", items[idx].second)
+            setPerFileRuntimeOption("hwdec", items[idx].second)
             // Keep dialog open (apply-in-place).
         }
         setNegativeButton(R.string.dialog_cancel) { d, _ -> d.cancel() }
@@ -2417,8 +2528,18 @@ private fun pickDecoder() {
     showImmersiveDialog(dialog)
 }
 
-private fun cycleSpeed() {
-        player.cycleSpeed()
+    private fun cycleDecoder() {
+        val current = MPVLib.getPropertyString("hwdec") ?: "no"
+        val next = if (current == "no") PLAYLIST_HWDEC_DEFAULT else "no"
+        setPerFileRuntimeOption("hwdec", next)
+    }
+
+    private fun cycleSpeed() {
+        val speeds = arrayOf(0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0)
+        val currentSpeed = player.playbackSpeed ?: 1.0
+        val index = speeds.indexOfFirst { it > currentSpeed }
+        val next = speeds[if (index == -1) 0 else index]
+        setPerFileRuntimeOption("speed", next.toString())
     }
 
     private fun pickSpeed() {
@@ -2703,7 +2824,10 @@ private fun openTopMenu(existingRestoreState: StateRestoreCallback? = null) {
         applyImmersiveToDialog(dialog)
         dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener {
             picker.number?.let {
-                if (picker.isInteger())
+                val value = if (picker.isInteger()) it.toInt().toString() else it.toString()
+                if (property in PLAYLIST_FILE_LOCAL_OPTIONS)
+                    setPerFileRuntimeOption(property, value)
+                else if (picker.isInteger())
                     MPVLib.setPropertyInt(property, it.toInt())
                 else
                     MPVLib.setPropertyDouble(property, it)
@@ -2792,11 +2916,11 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
                 }, ASPECT_MENU_PREDICTIVE_SYNC_GRACE_MS + 20L)
 
                 if (ratio == "panscan") {
-                    MPVLib.setPropertyString("video-aspect-override", "-1")
-                    MPVLib.setPropertyDouble("panscan", 1.0)
+                    setPerFileRuntimeOption("video-aspect-override", "-1")
+                    setPerFileRuntimeOption("panscan", "1.0")
                 } else {
-                    MPVLib.setPropertyString("video-aspect-override", ratio)
-                    MPVLib.setPropertyDouble("panscan", 0.0)
+                    setPerFileRuntimeOption("video-aspect-override", ratio)
+                    setPerFileRuntimeOption("panscan", "0.0")
                 }
                 // Keep dialog open (apply-in-place).
             }
@@ -2884,8 +3008,8 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
 
             applyImmersiveToDialog(dialog)
             dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener {
-                picker.delay1?.let { player.subDelay = it }
-                picker.delay2?.let { player.secondarySubDelay = it }
+                picker.delay1?.let { setPerFileRuntimeOption("sub-delay", it.toString()) }
+                picker.delay2?.let { setPerFileRuntimeOption("secondary-sub-delay", it.toString()) }
                 // Keep dialog open (apply-in-place).
             }
         }
@@ -3461,6 +3585,14 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
         if (psc.update(property, value))
             updateMediaSession()
 
+        when (property) {
+            "time-pos" -> {
+                if (activePlaylistCount > 1)
+                    lastKnownPlaylistPositionSec = value.toDouble()
+            }
+            "playlist-count" -> activePlaylistCount = value.toInt()
+        }
+
         if (!activityIsForeground) return
         eventUiHandler.post { eventPropertyUi(property, value) }
     }
@@ -3484,6 +3616,8 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
 
     override fun event(eventId: Int) {
         if (eventId == MpvEvent.MPV_EVENT_END_FILE) {
+            val completed = MPVLib.getPropertyBoolean("eof-reached") == true
+            saveCurrentPlaylistItemPosition(completed)
             psc.eof()
             updateMediaSession()
         }
@@ -3502,6 +3636,16 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
         }
 
         if (eventId == MpvEvent.MPV_EVENT_FILE_LOADED) {
+            pendingPlaylistResumePositionSec?.let { position ->
+                try {
+                    MPVLib.setPropertyDouble("time-pos", position)
+                    lastKnownPlaylistPositionSec = position
+                } catch (_: Throwable) {
+                    // Ignore invalid/unsupported seeks (for example live streams).
+                }
+            }
+            pendingPlaylistResumePositionSec = null
+
             eventUiHandler.post {
                 videoGeometryBlackoutFileLoadedSeen = true
                 prepareZoomSurfaceAndRevealWhenReady()
@@ -3515,11 +3659,18 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
         if (eventId == MpvEvent.MPV_EVENT_START_FILE) {
             // Reset any view-level zoom/pan when a new file starts.
 
+            val mediaPath = MPVLib.getPropertyString("path")
+            activePlaylistCount = MPVLib.getPropertyInt("playlist-count") ?: 1
+            activePlaylistMediaPath = mediaPath
+            lastKnownPlaylistPositionSec = null
+            pendingPlaylistResumePositionSec = mediaPath?.let { loadPlaylistPositionForPath(it) }
+
             // Apply orientation as early as possible for playlist items, so we don't show the wrong orientation first.
             // Must run on the UI thread.
             if (autoRotationMode == "auto") {
-                val p = MPVLib.getPropertyString("path")
-                if (p != null) eventUiHandler.post { try { applyOrientationFromMetadata(p) } catch (_: Throwable) {} }
+                if (mediaPath != null) eventUiHandler.post {
+                    try { applyOrientationFromMetadata(mediaPath) } catch (_: Throwable) {}
+                }
             }
 
             eventUiHandler.postAtFrontOfQueue { beginVideoGeometryBlackout() }
@@ -3530,6 +3681,10 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
                 MPVLib.setPropertyDouble("panscan", 0.0)
             } catch (_: Throwable) {
                 // ignore
+            }
+
+            if (mediaPath != null) {
+                try { restorePlaylistOptionsForPath(mediaPath) } catch (_: Throwable) {}
             }
 
             val cmds = onloadCommands.toTypedArray()
@@ -3815,6 +3970,30 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
 
         // When scrubbing, wait briefly for the finger to stop moving before doing an exact seek.
         private const val SCRUB_IDLE_SEEK_DELAY_MS = 140L
+
+        // Android's short text toast is roughly two seconds. Track changes use half
+        // that time; all other toasts keep their existing platform duration.
+        private const val TRACK_TOAST_DURATION_MS = 1000L
+
+        private const val PLAYLIST_HWDEC_DEFAULT = "mediacodec,mediacodec-copy"
+        private const val PREF_PLAYLIST_OPTION = "playlist_option"
+        private const val PREF_PLAYLIST_POSITION = "playlist_position"
+        private const val PLAYLIST_MIN_RESUME_POSITION_SEC = 1.0
+        private const val PLAYLIST_COMPLETION_MARGIN_SEC = 2.0
+
+        private val PLAYLIST_FILE_LOCAL_OPTIONS = setOf(
+            "video-aspect-override",
+            "panscan",
+            "sub-delay",
+            "secondary-sub-delay",
+            "audio-delay",
+            "contrast",
+            "brightness",
+            "gamma",
+            "saturation",
+            "speed",
+            "hwdec",
+        )
 
         // Per-file subtitle persistence keys
         private const val PREF_SUB_KIND = "sub_kind"

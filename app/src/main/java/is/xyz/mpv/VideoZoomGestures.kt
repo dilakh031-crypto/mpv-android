@@ -18,20 +18,16 @@ import kotlin.math.sqrt
  * Pinch-to-zoom + pan for mpv output.
  *
  * Important quality detail:
- *  - Unzoomed view uses a display-sized mpv-rendered compact surface, so mpv,
- *    not Android's TextureView compositor, performs the huge downscale. This
- *    avoids moire / false-color artifacts on high-frequency scans at 720p.
- *  - After the first mpv frame is ready, the unzoomed view is prepared with the
- *    same media-aspect fit that will be used while zoomed. At normal size it
- *    uses only a display-sized compact buffer; when the user starts zooming it
- *    upgrades the same geometry to an original-detail buffer.
+ *  - The mpv output surface always keeps the phone/view aspect. This makes mpv's
+ *    OSD use the full display dimensions and display resolution instead of being
+ *    constrained to a low-resolution or narrow media-aspect buffer.
+ *  - At normal size the surface uses the display resolution; while zoomed it
+ *    keeps the same view aspect and upgrades to an original-detail buffer.
  *  - New-file and window-exit transitions are forced back to the plain mpv/base
  *    surface so Android never animates a transformed TextureView while entering
  *    or leaving the player.
- *  - Because the geometry does not switch at zoom start/end, Android never shows
- *    the one-frame shrink/stretch tear. Because the zoom buffer has no oversized
- *    black bars, it keeps full source detail in both matching and opposite
- *    phone/media orientations.
+ *  - Because the surface aspect does not switch at zoom start/end, Android never
+ *    shows the one-frame shrink/stretch tear.
  *
  * We do not use mpv video-pan/video-zoom for finger movement.
  */
@@ -644,26 +640,12 @@ internal class VideoZoomGestures(
     private fun updateRenderSurfaceForCurrentState(force: Boolean) {
         val zooming = isZoomed() || scaleDetector.isInProgress
 
-        if (isPanscanActive()) {
-            // panscan needs a view-shaped mpv output window. A media-aspect surface
-            // has no letterbox area for mpv to crop into, so panscan would appear
-            // identical to the original aspect. While zoomed, keep source detail by
-            // using the same high-resolution sizing strategy on the view-shaped window.
-            if (zooming)
-                requestViewAspectOriginalRenderSurfaceSize(force)
-            else
-                requestBaseRenderSurfaceSize(force)
-            return
-        }
-
-        // Keep the same effective-aspect fit in every orientation. The only thing
-        // that changes at zoom start/end is the backing buffer resolution, not
-        // the on-screen rectangle, so there is no transient aspect jump. The aspect
-        // can come from mpv.conf / video-aspect-override, not only from the file.
+        // Keep mpv's output window phone-shaped at all times. Besides avoiding an
+        // aspect switch during zoom, this makes osd-width/osd-height correspond to
+        // the actual player view and keeps stats/OSD readable for low-resolution or
+        // non-screen-aspect media.
         if (zooming)
-            requestMediaAspectOriginalRenderSurfaceSize(force)
-        else if (normalCompactSurfacePrepared)
-            requestMediaAspectBaseRenderSurfaceSize(force)
+            requestViewAspectOriginalRenderSurfaceSize(force)
         else
             requestBaseRenderSurfaceSize(force)
     }
