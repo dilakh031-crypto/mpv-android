@@ -45,39 +45,6 @@ static void sendEventToJava(JNIEnv *env, int event)
     env->CallStaticVoidMethod(mpv_MPVLib, mpv_MPVLib_event, event);
 }
 
-static void sendHookToJava(JNIEnv *env, mpv_event_hook *hook)
-{
-    // A hook blocks the mpv core until it is continued. Treat any JNI failure as
-    // an unhandled hook and continue it natively, otherwise an exceptional Java
-    // path could freeze playback forever.
-    if (!hook || !hook->name) {
-        ALOGE("received invalid mpv hook event");
-        if (hook)
-            mpv_hook_continue(g_mpv, hook->id);
-        return;
-    }
-
-    jstring jname = env->NewStringUTF(hook->name);
-    if (!jname) {
-        if (env->ExceptionCheck())
-            env->ExceptionClear();
-        ALOGE("failed to allocate Java hook name");
-        mpv_hook_continue(g_mpv, hook->id);
-        return;
-    }
-
-    env->CallStaticVoidMethod(mpv_MPVLib, mpv_MPVLib_eventHook_Sl,
-        jname, (jlong) hook->id);
-    env->DeleteLocalRef(jname);
-
-    if (env->ExceptionCheck()) {
-        env->ExceptionDescribe();
-        env->ExceptionClear();
-        ALOGE("Java hook dispatcher failed; continuing hook natively");
-        mpv_hook_continue(g_mpv, hook->id);
-    }
-}
-
 static void sendLogMessageToJava(JNIEnv *env, mpv_event_log_message *msg)
 {
     // filter the most obvious cases of invalid utf-8, since Java would choke on it
@@ -130,9 +97,6 @@ void *event_thread(void *arg)
         case MPV_EVENT_PROPERTY_CHANGE:
             mp_property = (mpv_event_property*)mp_event->data;
             sendPropertyUpdateToJava(env, mp_property);
-            break;
-        case MPV_EVENT_HOOK:
-            sendHookToJava(env, (mpv_event_hook*)mp_event->data);
             break;
         default:
             ALOGV("event: %s\n", mpv_event_name(mp_event->event_id));
