@@ -28,6 +28,7 @@ extern "C" {
     jni_func(void, command, jobjectArray jarray);
     jni_func(jint, commandAsync, jobjectArray jarray, jlong userdata);
     jni_func(void, abortAsyncCommand, jlong userdata);
+    jni_func(void, hookContinue, jlong id);
 };
 
 JavaVM *g_vm;
@@ -71,6 +72,13 @@ jni_func(void, init) {
 
     if (mpv_initialize(g_mpv) < 0)
         die("mpv init failed");
+
+    // This hook runs for every way a file can leave the player: UI buttons,
+    // notification/media-session controls, playlist selection, automatic
+    // advance, loadfile replacement, errors, and shutdown. Java persists the
+    // outgoing playlist item's state and then continues the hook.
+    if (mpv_hook_add(g_mpv, 0, "on_unload", 50) < 0)
+        die("failed to add on_unload hook");
 
     g_event_thread_request_exit = false;
     if (pthread_create(&event_thread_id, NULL, event_thread, NULL) != 0)
@@ -137,5 +145,10 @@ jni_func(jint, commandAsync, jobjectArray jarray, jlong userdata) {
 jni_func(void, abortAsyncCommand, jlong userdata) {
     CHECK_MPV_INIT();
     mpv_abort_async_command(g_mpv, (uint64_t)userdata);
+}
+
+jni_func(void, hookContinue, jlong id) {
+    CHECK_MPV_INIT();
+    mpv_hook_continue(g_mpv, (uint64_t)id);
 }
 
