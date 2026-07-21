@@ -8,7 +8,6 @@ import android.view.Surface
 import android.view.TextureView
 import kotlin.math.abs
 import kotlin.math.min
-import kotlin.math.sqrt
 
 // Contains only the essential code needed to get a picture on the screen
 
@@ -41,15 +40,12 @@ abstract class BaseMPVView(context: Context, attrs: AttributeSet) : TextureView(
         /* set hardcoded options */
         postInitOptions()
 
-        // Keep every mpv OSD/script overlay in real display pixels instead of
-        // letting a tall/narrow render target scale text only from its height.
-        // The configured osd-scale is preserved and multiplied by an adaptive
-        // factor whenever the display/video geometry changes.
+        // Keep the user-configured OSD size as the unmodified baseline. The
+        // adaptive factor below is never larger than 1.0, so normal/wide video
+        // keeps exactly the configured size and only narrow video frames shrink.
         configuredOsdScale = (MPVLib.getPropertyDouble("osd-scale") ?: 1.0)
             .coerceAtLeast(MIN_OSD_SCALE)
-        MPVLib.setPropertyBoolean("osd-scale-by-window", false)
         mpvInitialized = true
-        updateAdaptiveOsdScale(width.toFloat(), height.toFloat(), null)
 
         // could mess up VO init before surfaceCreated() is called
         MPVLib.setOptionString("force-window", "no")
@@ -121,46 +117,21 @@ abstract class BaseMPVView(context: Context, attrs: AttributeSet) : TextureView(
     var onSurfaceTextureFrameAvailable: (() -> Unit)? = null
 
     /**
-     * Size mpv's text overlays from the actual display target, not from a
-     * media-aspect SurfaceTexture. Opposite phone/video orientations reduce the
-     * scale further so wide diagnostics (for example stats.lua) stay readable.
+     * Keep mpv text inside the current mpv render frame without changing its
+     * normal size when the frame is already wide enough.
+     *
+     * mpv's window-scaled OSD uses a 720-unit-high logical canvas. Therefore the
+     * available logical width is 720 * aspect. A normal OSD/stats layout needs a
+     * square 720-unit-wide safe area. Only when the current video frame is
+     * narrower than that do we apply the exact width ratio needed to fit it.
      */
-    fun updateAdaptiveOsdScale(viewWidth: Float, viewHeight: Float, videoAspect: Double?) {
-        if (!mpvInitialized || viewWidth <= 1f || viewHeight <= 1f)
+    private fun updateAdaptiveOsdScale(width: Int, height: Int) {
+        if (!mpvInitialized || width <= 1 || height <= 1)
             return
 
-        val width = viewWidth.toDouble()
-        val height = viewHeight.toDouble()
-
-        // 1280x720 is the neutral OSD design area. Using both dimensions avoids
-        // oversized text on tall portrait displays where height-only scaling is
-        // much too aggressive.
-        val displayFactor = min(width / OSD_REFERENCE_WIDTH, height / OSD_REFERENCE_HEIGHT)
-
-        var contentFactor = 1.0
-        val aspect = videoAspect ?: 0.0
-        if (aspect > 0.001) {
-            val viewAspect = width / height
-            val contentWidth: Double
-            val contentHeight: Double
-            if (aspect > viewAspect) {
-                contentWidth = width
-                contentHeight = width / aspect
-            } else {
-                contentHeight = height
-                contentWidth = height * aspect
-            }
-
-            val occupiedFraction = min(
-                (contentWidth / width).coerceIn(0.0, 1.0),
-                (contentHeight / height).coerceIn(0.0, 1.0),
-            )
-            contentFactor = sqrt(occupiedFraction).coerceIn(MIN_CONTENT_OSD_FACTOR, 1.0)
-        }
-
-        val adaptiveFactor = (displayFactor * contentFactor)
-            .coerceIn(MIN_ADAPTIVE_OSD_FACTOR, MAX_ADAPTIVE_OSD_FACTOR)
-        val requestedScale = configuredOsdScale * adaptiveFactor
+        val logicalWidth = OSD_REFERENCE_HEIGHT * width.toDouble() / height.toDouble()
+        val fitFactor = min(1.0, logicalWidth / OSD_MIN_SAFE_WIDTH)
+        val requestedScale = configuredOsdScale * fitFactor
 
         if (!appliedOsdScale.isNaN() && abs(appliedOsdScale - requestedScale) < 0.001)
             return
@@ -218,6 +189,7 @@ abstract class BaseMPVView(context: Context, attrs: AttributeSet) : TextureView(
 
         texture.setDefaultBufferSize(renderSurfaceWidth, renderSurfaceHeight)
         MPVLib.setPropertyString("android-surface-size", "${renderSurfaceWidth}x${renderSurfaceHeight}")
+        updateAdaptiveOsdScale(renderSurfaceWidth, renderSurfaceHeight)
     }
 
     private fun attachSurfaceTexture(texture: SurfaceTexture, width: Int, height: Int) {
@@ -234,6 +206,7 @@ abstract class BaseMPVView(context: Context, attrs: AttributeSet) : TextureView(
 
         MPVLib.attachSurface(surface)
         MPVLib.setPropertyString("android-surface-size", "${renderSurfaceWidth}x${renderSurfaceHeight}")
+        updateAdaptiveOsdScale(renderSurfaceWidth, renderSurfaceHeight)
         // This forces mpv to render subs/osd/whatever into our surface even if it would ordinarily not
         MPVLib.setOptionString("force-window", "yes")
 
@@ -285,11 +258,8 @@ abstract class BaseMPVView(context: Context, attrs: AttributeSet) : TextureView(
     companion object {
         private const val TAG = "mpv"
 
-        private const val OSD_REFERENCE_WIDTH = 1280.0
         private const val OSD_REFERENCE_HEIGHT = 720.0
+        private const val OSD_MIN_SAFE_WIDTH = 720.0
         private const val MIN_OSD_SCALE = 0.01
-        private const val MIN_CONTENT_OSD_FACTOR = 0.55
-        private const val MIN_ADAPTIVE_OSD_FACTOR = 0.65
-        private const val MAX_ADAPTIVE_OSD_FACTOR = 1.50
     }
 }

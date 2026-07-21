@@ -18,11 +18,21 @@ import kotlin.math.sqrt
  * Pinch-to-zoom + pan for mpv output.
  *
  * Important quality detail:
- *  - mpv always renders into the TextureView's real display-sized surface. This
- *    keeps OSD, stats and every other mpv overlay at the phone's resolution and
- *    prevents media-aspect buffers from stretching/blurring text.
- *  - Zoom and pan are applied only as TextureView transforms; the backing surface
- *    never switches to a video-sized or compact media-aspect buffer.
+ *  - The unzoomed media-aspect surface keeps the OSD inside the video frame,
+ *    but its longest edge is rendered at the phone's longest display edge. This
+ *    gives mpv OSD/script text phone-resolution detail without moving it into
+ *    the surrounding letterbox area.
+ *  - After the first mpv frame is ready, the unzoomed view is prepared with the
+ *    same media-aspect fit that will be used while zoomed. At normal size it
+ *    uses a phone-resolution media-aspect buffer; when the user starts zooming
+ *    it upgrades the same geometry to preserve original source detail as well.
+ *  - New-file and window-exit transitions are forced back to the plain mpv/base
+ *    surface so Android never animates a transformed TextureView while entering
+ *    or leaving the player.
+ *  - Because the geometry does not switch at zoom start/end, Android never shows
+ *    the one-frame shrink/stretch tear. Because the zoom buffer has no oversized
+ *    black bars, it keeps full source detail in both matching and opposite
+ *    phone/media orientations.
  *
  * We do not use mpv video-pan/video-zoom for finger movement.
  */
@@ -169,7 +179,6 @@ internal class VideoZoomGestures(
         viewWidth = width
         viewHeight = height
         refreshMetricsFromTarget()
-        updateAdaptiveOsdScale()
         if (isZoomed() || scaleDetector.isInProgress) {
             clampTranslationToVideoContent()
             updateRenderSurfaceForCurrentState(force = true)
@@ -221,7 +230,6 @@ internal class VideoZoomGestures(
         videoPixelWidth = pixelSize?.first ?: 0
         videoPixelHeight = pixelSize?.second ?: 0
         panscan = panscanValue ?: 0.0
-        updateAdaptiveOsdScale()
 
         if (prepareNormalSurface)
             normalCompactSurfacePrepared = true
@@ -280,7 +288,6 @@ internal class VideoZoomGestures(
         videoPixelHeight = 0
         panscan = 0.0
         normalCompactSurfacePrepared = false
-        updateAdaptiveOsdScale()
         requestBaseRenderSurfaceSize(force = true)
         applyToView()
     }
@@ -636,20 +643,30 @@ internal class VideoZoomGestures(
     }
 
     private fun updateRenderSurfaceForCurrentState(force: Boolean) {
-        // A media/video-sized SurfaceTexture makes mpv overlays inherit that
-        // target's resolution and aspect. Keep the backing buffer equal to the
-        // phone display in every state; only the View transform is zoomed/panned.
-        requestBaseRenderSurfaceSize(force)
-    }
+        val zooming = isZoomed() || scaleDetector.isInProgress
 
-    private fun updateAdaptiveOsdScale() {
-        val player = renderTarget ?: return
-        refreshMetricsFromTarget()
-        player.updateAdaptiveOsdScale(
-            viewWidth = viewWidth,
-            viewHeight = viewHeight,
-            videoAspect = videoAspect.takeIf { it > 0.001 },
-        )
+        if (isPanscanActive()) {
+            // panscan needs a view-shaped mpv output window. A media-aspect surface
+            // has no letterbox area for mpv to crop into, so panscan would appear
+            // identical to the original aspect. While zoomed, keep source detail by
+            // using the same high-resolution sizing strategy on the view-shaped window.
+            if (zooming)
+                requestViewAspectOriginalRenderSurfaceSize(force)
+            else
+                requestBaseRenderSurfaceSize(force)
+            return
+        }
+
+        // Keep the same effective-aspect fit in every orientation. The only thing
+        // that changes at zoom start/end is the backing buffer resolution, not
+        // the on-screen rectangle, so there is no transient aspect jump. The aspect
+        // can come from mpv.conf / video-aspect-override, not only from the file.
+        if (zooming)
+            requestMediaAspectOriginalRenderSurfaceSize(force)
+        else if (normalCompactSurfacePrepared)
+            requestMediaAspectBaseRenderSurfaceSize(force)
+        else
+            requestBaseRenderSurfaceSize(force)
     }
 
     private fun requestBaseRenderSurfaceSize(force: Boolean) {
@@ -748,10 +765,16 @@ internal class VideoZoomGestures(
         }
 
         // Keep the same media-aspect geometry used by the high-quality zoom
-        // surface, but render only at the on-screen content size while unzoomed.
-        // This avoids the start/end aspect switch that causes the visible tear.
-        val bufferWidth = ceilToIntAtLeastOne(c.w.toDouble())
-        val bufferHeight = ceilToIntAtLeastOne(c.h.toDouble())
+        // surface, but render it with at least the phone's longest display edge.
+        // The OSD therefore remains inside the video rectangle while retaining
+        // phone-resolution glyph detail even in opposite orientations.
+        val bufferScale = limitedRenderSurfaceScale(
+            baseWidth = c.w.toDouble(),
+            baseHeight = c.h.toDouble(),
+            desiredScale = phoneResolutionBufferScale(c.w.toDouble(), c.h.toDouble()),
+        )
+        val bufferWidth = ceilToIntAtLeastOne(c.w.toDouble() * bufferScale)
+        val bufferHeight = ceilToIntAtLeastOne(c.h.toDouble() * bufferScale)
         player.setRenderSurfaceSize(bufferWidth, bufferHeight)
         renderSurfaceMode = RenderSurfaceMode.MEDIA_ASPECT_BASE
     }
@@ -804,7 +827,27 @@ internal class VideoZoomGestures(
         baseHeight: Double,
         content: ContentRect,
     ): Double {
-        val desired = originalDetailBufferScale(content)
+        // Never downgrade from the phone-resolution normal surface when zooming
+        // into low-resolution media. Higher-resolution media can still request its
+        // original detail as before.
+        val desired = max(
+            originalDetailBufferScale(content),
+            phoneResolutionBufferScale(baseWidth, baseHeight),
+        )
+        return limitedRenderSurfaceScale(baseWidth, baseHeight, desired)
+    }
+
+    private fun phoneResolutionBufferScale(baseWidth: Double, baseHeight: Double): Double {
+        val displayLongEdge = max(viewWidth.toDouble(), viewHeight.toDouble()).coerceAtLeast(1.0)
+        val surfaceLongEdge = max(baseWidth, baseHeight).coerceAtLeast(1.0)
+        return (displayLongEdge / surfaceLongEdge).coerceAtLeast(1.0)
+    }
+
+    private fun limitedRenderSurfaceScale(
+        baseWidth: Double,
+        baseHeight: Double,
+        desiredScale: Double,
+    ): Double {
         val maxEdge = max(baseWidth, baseHeight).coerceAtLeast(1.0)
         val maxByEdge = MAX_RENDER_SURFACE_EDGE / maxEdge
         val maxByPixels = sqrt(
@@ -814,7 +857,7 @@ internal class VideoZoomGestures(
         // Avoid requesting oversized SurfaceTexture buffers. Very wide overridden
         // ratios such as 2.35:1 on huge images can otherwise exceed the device
         // texture limit and leave the TextureView black even after resetting zoom.
-        return desired
+        return desiredScale
             .coerceAtMost(maxByEdge)
             .coerceAtMost(maxByPixels)
             .coerceAtLeast(1.0)
