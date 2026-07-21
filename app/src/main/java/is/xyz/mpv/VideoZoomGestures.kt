@@ -18,16 +18,11 @@ import kotlin.math.sqrt
  * Pinch-to-zoom + pan for mpv output.
  *
  * Important quality detail:
- *  - The mpv output surface always keeps the phone/view aspect. This makes mpv's
- *    OSD use the full display dimensions and display resolution instead of being
- *    constrained to a low-resolution or narrow media-aspect buffer.
- *  - At normal size the surface uses the display resolution; while zoomed it
- *    keeps the same view aspect and upgrades to an original-detail buffer.
- *  - New-file and window-exit transitions are forced back to the plain mpv/base
- *    surface so Android never animates a transformed TextureView while entering
- *    or leaving the player.
- *  - Because the surface aspect does not switch at zoom start/end, Android never
- *    shows the one-frame shrink/stretch tear.
+ *  - mpv always renders into the TextureView's real display-sized surface. This
+ *    keeps OSD, stats and every other mpv overlay at the phone's resolution and
+ *    prevents media-aspect buffers from stretching/blurring text.
+ *  - Zoom and pan are applied only as TextureView transforms; the backing surface
+ *    never switches to a video-sized or compact media-aspect buffer.
  *
  * We do not use mpv video-pan/video-zoom for finger movement.
  */
@@ -174,6 +169,7 @@ internal class VideoZoomGestures(
         viewWidth = width
         viewHeight = height
         refreshMetricsFromTarget()
+        updateAdaptiveOsdScale()
         if (isZoomed() || scaleDetector.isInProgress) {
             clampTranslationToVideoContent()
             updateRenderSurfaceForCurrentState(force = true)
@@ -225,6 +221,7 @@ internal class VideoZoomGestures(
         videoPixelWidth = pixelSize?.first ?: 0
         videoPixelHeight = pixelSize?.second ?: 0
         panscan = panscanValue ?: 0.0
+        updateAdaptiveOsdScale()
 
         if (prepareNormalSurface)
             normalCompactSurfacePrepared = true
@@ -283,6 +280,7 @@ internal class VideoZoomGestures(
         videoPixelHeight = 0
         panscan = 0.0
         normalCompactSurfacePrepared = false
+        updateAdaptiveOsdScale()
         requestBaseRenderSurfaceSize(force = true)
         applyToView()
     }
@@ -638,16 +636,20 @@ internal class VideoZoomGestures(
     }
 
     private fun updateRenderSurfaceForCurrentState(force: Boolean) {
-        val zooming = isZoomed() || scaleDetector.isInProgress
+        // A media/video-sized SurfaceTexture makes mpv overlays inherit that
+        // target's resolution and aspect. Keep the backing buffer equal to the
+        // phone display in every state; only the View transform is zoomed/panned.
+        requestBaseRenderSurfaceSize(force)
+    }
 
-        // Keep mpv's output window phone-shaped at all times. Besides avoiding an
-        // aspect switch during zoom, this makes osd-width/osd-height correspond to
-        // the actual player view and keeps stats/OSD readable for low-resolution or
-        // non-screen-aspect media.
-        if (zooming)
-            requestViewAspectOriginalRenderSurfaceSize(force)
-        else
-            requestBaseRenderSurfaceSize(force)
+    private fun updateAdaptiveOsdScale() {
+        val player = renderTarget ?: return
+        refreshMetricsFromTarget()
+        player.updateAdaptiveOsdScale(
+            viewWidth = viewWidth,
+            viewHeight = viewHeight,
+            videoAspect = videoAspect.takeIf { it > 0.001 },
+        )
     }
 
     private fun requestBaseRenderSurfaceSize(force: Boolean) {
