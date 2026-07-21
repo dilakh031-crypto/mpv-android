@@ -117,20 +117,21 @@ abstract class BaseMPVView(context: Context, attrs: AttributeSet) : TextureView(
     var onSurfaceTextureFrameAvailable: (() -> Unit)? = null
 
     /**
-     * Keep mpv text inside the current mpv render frame without changing its
-     * normal size when the frame is already wide enough.
+     * Keep mpv text inside the current media-aspect render frame while preserving
+     * the configured size whenever the frame has enough horizontal room.
      *
-     * mpv's window-scaled OSD uses a 720-unit-high logical canvas. Therefore the
-     * available logical width is 720 * aspect. A normal OSD/stats layout needs a
-     * square 720-unit-wide safe area. Only when the current video frame is
-     * narrower than that do we apply the exact width ratio needed to fit it.
+     * mpv's normal OSD/stats layout already fits at 16:9. For a narrower frame,
+     * every horizontal coordinate is given exactly the ratio of the available
+     * aspect to 16:9. This is the smallest uniform reduction that maps the same
+     * 16:9 text layout into the narrower video rectangle. A 16:9 or wider frame
+     * therefore remains completely unchanged.
      */
     private fun updateAdaptiveOsdScale(width: Int, height: Int) {
         if (!mpvInitialized || width <= 1 || height <= 1)
             return
 
-        val logicalWidth = OSD_REFERENCE_HEIGHT * width.toDouble() / height.toDouble()
-        val fitFactor = min(1.0, logicalWidth / OSD_MIN_SAFE_WIDTH)
+        val frameAspect = width.toDouble() / height.toDouble()
+        val fitFactor = min(1.0, frameAspect / OSD_UNSCALED_FIT_ASPECT)
         val requestedScale = configuredOsdScale * fitFactor
 
         if (!appliedOsdScale.isNaN() && abs(appliedOsdScale - requestedScale) < 0.001)
@@ -258,8 +259,7 @@ abstract class BaseMPVView(context: Context, attrs: AttributeSet) : TextureView(
     companion object {
         private const val TAG = "mpv"
 
-        private const val OSD_REFERENCE_HEIGHT = 720.0
-        private const val OSD_MIN_SAFE_WIDTH = 720.0
+        private const val OSD_UNSCALED_FIT_ASPECT = 16.0 / 9.0
         private const val MIN_OSD_SCALE = 0.01
     }
 }
