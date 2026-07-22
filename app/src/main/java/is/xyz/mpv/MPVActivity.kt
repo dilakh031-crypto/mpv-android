@@ -3538,6 +3538,13 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
 
     override fun event(eventId: Int) {
         if (eventId == MpvEvent.MPV_EVENT_END_FILE) {
+            // Manual watch-later writes can leave a stale resume point behind after normal EOF.
+            // Delete the completed file's config, matching mpv's normal consumed-resume behavior.
+            if (MPVLib.getPropertyBoolean("eof-reached") == true) {
+                MPVLib.getPropertyString("path")?.let { completedPath ->
+                    MPVLib.command(arrayOf("delete-watch-later-config", completedPath))
+                }
+            }
             psc.eof()
             updateMediaSession()
         }
