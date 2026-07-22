@@ -319,6 +319,7 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
     private var noUIPauseMode = ""
 
     private var shouldSavePosition = false
+    private var currentWatchLaterPath: String? = null
 
     private var autoRotationMode = ""
 
@@ -1980,6 +1981,16 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
     }
 
     private fun perFileKey(suffix: String, path: String): String = "perfile_${suffix}_${sha1Hex(path)}"
+
+    private fun clearPerFileSelections(path: String) {
+        val prefs = getDefaultSharedPreferences(applicationContext)
+        with (prefs.edit()) {
+            for (suffix in PER_FILE_SELECTION_KEYS)
+                remove(perFileKey(suffix, path))
+            commit()
+        }
+    }
+
 private fun rememberSubtitleSelectionForCurrentFile(secondary: Boolean = false) {
     val mediaPath = MPVLib.getPropertyString("path") ?: return
     val prefs = getDefaultSharedPreferences(applicationContext)
@@ -3536,15 +3547,24 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
         eventUiHandler.post { eventPropertyUi(property, value, metaUpdated) }
     }
 
+    override fun eventEndFile(reachedEof: Boolean) {
+        val endedPath = currentWatchLaterPath
+        currentWatchLaterPath = null
+
+        if (reachedEof && endedPath != null) {
+            // A normally completed file must not retain an older manual checkpoint or any
+            // other per-file state. Target the completed path explicitly so playlist advance
+            // cannot accidentally delete the next item's state.
+            MPVLib.command(arrayOf("delete-watch-later-config", endedPath))
+            clearPerFileSelections(endedPath)
+            Log.d(TAG, "cleared completed file state: $endedPath")
+        }
+
+        event(MpvEvent.MPV_EVENT_END_FILE)
+    }
+
     override fun event(eventId: Int) {
         if (eventId == MpvEvent.MPV_EVENT_END_FILE) {
-            // Manual watch-later writes can leave a stale resume point behind after normal EOF.
-            // Delete the completed file's config, matching mpv's normal consumed-resume behavior.
-            if (MPVLib.getPropertyBoolean("eof-reached") == true) {
-                MPVLib.getPropertyString("path")?.let { completedPath ->
-                    MPVLib.command(arrayOf("delete-watch-later-config", completedPath))
-                }
-            }
             psc.eof()
             updateMediaSession()
         }
@@ -3563,6 +3583,7 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
         }
 
         if (eventId == MpvEvent.MPV_EVENT_FILE_LOADED) {
+            currentWatchLaterPath = MPVLib.getPropertyString("path")
             eventUiHandler.post {
                 videoGeometryBlackoutFileLoadedSeen = true
                 prepareZoomSurfaceAndRevealWhenReady()
@@ -3574,6 +3595,7 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
         }
 
         if (eventId == MpvEvent.MPV_EVENT_START_FILE) {
+            currentWatchLaterPath = null
             // Reset any view-level zoom/pan when a new file starts.
 
             // Apply orientation as early as possible for playlist items, so we don't show the wrong orientation first.
@@ -3894,5 +3916,17 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
         private const val PREF_AUD_SID = "aud_sid"
         private const val PREF_AUD_KIND_EXTERNAL = "external"
         private const val PREF_AUD_KIND_SID = "sid"
+
+        private val PER_FILE_SELECTION_KEYS = arrayOf(
+            PREF_SUB_KIND,
+            PREF_SUB_EXTERNAL,
+            PREF_SUB_SID,
+            PREF_SUB2_KIND,
+            PREF_SUB2_EXTERNAL,
+            PREF_SUB2_SID,
+            PREF_AUD_KIND,
+            PREF_AUD_EXTERNAL,
+            PREF_AUD_SID,
+        )
     }
 }

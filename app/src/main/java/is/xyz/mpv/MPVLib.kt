@@ -104,6 +104,14 @@ object MPVLib {
         }
     }
 
+    @JvmStatic
+    fun eventEndFile(reachedEof: Boolean) {
+        synchronized(observers) {
+            for (o in observers)
+                o.eventEndFile(reachedEof)
+        }
+    }
+
     private val log_observers = mutableListOf<LogObserver>()
 
     @JvmStatic
@@ -135,6 +143,9 @@ object MPVLib {
         fun eventProperty(property: String, value: String)
         fun eventProperty(property: String, value: Double)
         fun event(eventId: Int)
+        fun eventEndFile(reachedEof: Boolean) {
+            event(MpvEvent.MPV_EVENT_END_FILE)
+        }
     }
 
     interface LogObserver {
