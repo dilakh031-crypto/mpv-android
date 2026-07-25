@@ -3686,6 +3686,12 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
             player.configureFileStatePersistence(persistFileState)
 
             if (persistFileState) {
+                // Restore the chosen audio before any subtitle loading or synchronous preference
+                // writes. Resolving two external subtitles can take a few hundred milliseconds;
+                // doing that first lets mpv briefly start the embedded audio before audio-add
+                // selects the saved external track.
+                try { restoreAudioSelectionForCurrentFile() } catch (_: Throwable) {}
+
                 // These app snapshots survive deletion of watch-later at natural EOF, so only
                 // `start` is reset while gamma, delays and the other controls are restored.
                 try { player.restoreCurrentFilePlaybackOptions() } catch (_: Throwable) {}
@@ -3697,7 +3703,6 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
                 // Restore both subtitle slots now so a previous file or mpv's automatic selection
                 // cannot swap primary and secondary while the new file is still being initialized.
                 try { restoreSubtitleSelectionForCurrentFile() } catch (_: Throwable) {}
-                try { restoreAudioSelectionForCurrentFile() } catch (_: Throwable) {}
                 try { rememberActiveTrackSelectionsForCurrentFile() } catch (_: Throwable) {}
             } else {
                 // resume-playback was disabled before loading, so this removes any old state
