@@ -15,22 +15,19 @@ class NotificationButtonReceiver : BroadcastReceiver() {
         when (intent.action) {
             "$PREFIX.PLAY_PAUSE" -> MPVLib.command(arrayOf("cycle", "pause"))
             "$PREFIX.ACTION_PREV" -> {
-                persistBeforePlaylistJump()
+                persistBeforePlaylistJump(context)
                 MPVLib.command(arrayOf("playlist-prev"))
             }
             "$PREFIX.ACTION_NEXT" -> {
-                persistBeforePlaylistJump()
+                persistBeforePlaylistJump(context)
                 MPVLib.command(arrayOf("playlist-next"))
             }
         }
     }
 
-    private fun persistBeforePlaylistJump() {
-        // Avoid replacing a useful resume point with EOF when auto-advance has already begun.
-        if (MPVLib.getPropertyBoolean("eof-reached") == true)
-            return
-        if (MPVLib.getPropertyString("path") != null)
-            MPVLib.command(arrayOf("write-watch-later-config"))
+    private fun persistBeforePlaylistJump(context: Context?) {
+        if (context != null)
+            MPVActivity.persistCurrentFileCheckpoint(context)
     }
 
     companion object {
