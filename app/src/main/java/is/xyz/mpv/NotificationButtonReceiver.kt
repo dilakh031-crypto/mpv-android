@@ -5,6 +5,7 @@ import android.content.BroadcastReceiver
 import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
+import android.preference.PreferenceManager
 import android.util.Log
 import androidx.core.app.PendingIntentCompat
 
@@ -26,8 +27,16 @@ class NotificationButtonReceiver : BroadcastReceiver() {
     }
 
     private fun persistBeforePlaylistJump(context: Context?) {
-        if (context != null)
-            MPVActivity.persistCurrentFileCheckpoint(context)
+        val appContext = context ?: return
+        if (!PreferenceManager.getDefaultSharedPreferences(appContext)
+                .getBoolean("save_position", false))
+            return
+
+        // Avoid replacing a useful resume point with EOF when auto-advance has already begun.
+        if (MPVLib.getPropertyBoolean("eof-reached") == true)
+            return
+        if (MPVLib.getPropertyString("path") != null)
+            MPVLib.command(arrayOf("write-watch-later-config"))
     }
 
     companion object {
