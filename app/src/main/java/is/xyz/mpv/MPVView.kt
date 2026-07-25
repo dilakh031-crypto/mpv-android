@@ -177,41 +177,39 @@ internal class MPVView(context: Context, attrs: AttributeSet) : BaseMPVView(cont
         MPVLib.setPropertyDouble("file-local-options/$name", value)
     }
 
-    fun persistCurrentFileState() {
+    fun persistCurrentFileState(includePosition: Boolean = false) {
         // During teardown/pathological load failures there may be no writable current file.
-        if (MPVLib.getPropertyString("path") != null)
-            MPVLib.command(arrayOf("write-watch-later-config"))
-    }
-
-    /**
-     * Persist this file's playback options while deliberately omitting `start`.
-     *
-     * This must be called while the completed file is still loaded (the `eof-reached`
-     * property change happens before END_FILE). Rewriting the watch-later file this way
-     * resets only its resume position instead of deleting subtitle, delay and video settings.
-     */
-    fun persistCurrentFileStateWithoutPosition() {
         if (MPVLib.getPropertyString("path") == null)
             return
 
-        val property = "watch-later-options"
-        val original = MPVLib.getPropertyString(property) ?: return
-        val positionless = original
-            .split(',')
-            .map { it.trim() }
-            .filter { it.isNotEmpty() && it != "start" }
-            .toMutableSet()
+        if (includePosition) {
+            MPVLib.command(arrayOf("write-watch-later-config"))
+            return
+        }
 
-        // `all` cannot express "all except start". Replace it with every app-controlled
-        // per-file option, and also ensure those options exist in an ordinary custom list.
-        positionless.remove("all")
-        positionless.addAll(PER_FILE_PLAYBACK_OPTIONS)
+        // Settings and the resume position share the same watch-later file. Most callers here are
+        // persisting an option change, not creating a new resume checkpoint, so temporarily remove
+        // `start` while writing. This is also used at EOF: the completed file keeps all of its
+        // per-file controls while reopening it starts from the beginning.
+        val original = MPVLib.getPropertyString("watch-later-options")
+        val current = original
+            ?.split(',')
+            ?.map { it.trim() }
+            ?.filter { it.isNotEmpty() }
+            ?: emptyList()
+        val settingsOnly = if (current.contains("all")) {
+            // `all` cannot exclude one option. Preserve every app-managed per-file option instead.
+            PER_FILE_PLAYBACK_OPTIONS.toList()
+        } else {
+            current.filterNot { it == "start" }
+        }
 
         try {
-            MPVLib.setPropertyString(property, positionless.joinToString(","))
+            MPVLib.setPropertyString("watch-later-options", settingsOnly.joinToString(","))
             MPVLib.command(arrayOf("write-watch-later-config"))
         } finally {
-            MPVLib.setPropertyString(property, original)
+            if (original != null)
+                MPVLib.setPropertyString("watch-later-options", original)
         }
     }
 
@@ -278,6 +276,7 @@ internal class MPVView(context: Context, attrs: AttributeSet) : BaseMPVView(cont
             Property("duration/full", MPV_FORMAT_DOUBLE),
             Property("pause", MPV_FORMAT_FLAG),
             Property("paused-for-cache", MPV_FORMAT_FLAG),
+            Property("eof-reached", MPV_FORMAT_FLAG),
             Property("speed", MPV_FORMAT_STRING),
             Property("track-list"),
             Property("video-params/aspect", MPV_FORMAT_DOUBLE),
@@ -294,7 +293,6 @@ internal class MPVView(context: Context, attrs: AttributeSet) : BaseMPVView(cont
             Property("loop-playlist"),
             Property("loop-file"),
             Property("shuffle", MPV_FORMAT_FLAG),
-            Property("eof-reached", MPV_FORMAT_FLAG),
             Property("hwdec-current"),
             Property("mute", MPV_FORMAT_FLAG),
             Property("current-tracks/audio/selected")
