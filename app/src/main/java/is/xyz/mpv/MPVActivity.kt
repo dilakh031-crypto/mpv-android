@@ -320,6 +320,7 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
 
     private var shouldSavePosition = false
     private var currentWatchLaterPath: String? = null
+    private var completedWatchLaterPath: String? = null
 
     private var autoRotationMode = ""
 
@@ -1036,6 +1037,13 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
         val mediaPath = MPVLib.getPropertyString("path") ?: return
         if (!fileStatePersistenceEnabled()) {
             discardPersistedFileState(mediaPath)
+            return
+        }
+
+        // END_FILE can reset eof-reached to false while leaving the old path briefly readable.
+        // Never let a later lifecycle callback recreate a resume point for a completed file.
+        if (mediaPath == completedWatchLaterPath) {
+            player.persistCurrentFileStateWithoutPosition(mediaPath)
             return
         }
 
@@ -1856,6 +1864,11 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
             return
         }
 
+        if (mediaPath == completedWatchLaterPath) {
+            player.persistCurrentFileStateWithoutPosition(mediaPath)
+            return
+        }
+
         rememberActiveTrackSelectionsForCurrentFile()
 
         // Do not create a resume point at the physical end of a completed file. Per-file option
@@ -2023,6 +2036,7 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
 
     private fun discardPersistedFileState(path: String) {
         MPVLib.command(arrayOf("delete-watch-later-config", path))
+        player.clearPersistedPlaybackOptions(path)
         clearPerFileSelections(path)
     }
 
@@ -3576,10 +3590,14 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
             try {
                 val mediaPath = MPVLib.getPropertyString("path")
                 if (fileStatePersistenceEnabled()) {
-                    // END_FILE is too late to rewrite the completed file's watch-later data.
-                    // Snapshot active tracks and save every per-file option except start now.
+                    val completedPath = currentWatchLaterPath ?: mediaPath
+                    completedWatchLaterPath = completedPath
+                    // Snapshot what is still available, then remove watch-later rather than
+                    // rewriting it during mpv's asynchronous file-unload window.
                     rememberActiveTrackSelectionsForCurrentFile()
-                    player.persistCurrentFileStateWithoutPosition()
+                    completedPath?.let {
+                        player.persistCurrentFileStateWithoutPosition(it)
+                    }
                 } else if (mediaPath != null) {
                     discardPersistedFileState(mediaPath)
                 }
@@ -3625,9 +3643,12 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
         currentWatchLaterPath = null
 
         if (reachedEof && endedPath != null) {
+            completedWatchLaterPath = endedPath
             if (fileStatePersistenceEnabled()) {
-                // eof-reached already rewrote this entry without `start`. Keep the remaining
-                // watch-later options and only the external tracks active at completion.
+                // Repeat the explicit-path deletion at END_FILE. This is intentionally
+                // idempotent and covers cases where the eof-reached property callback arrived
+                // after the file had already become unavailable.
+                player.persistCurrentFileStateWithoutPosition(endedPath)
                 Log.d(TAG, "reset completed file position and kept its active settings: $endedPath")
             } else {
                 // Fallback in case the short-lived eof-reached property transition was missed.
@@ -3660,15 +3681,24 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
 
         if (eventId == MpvEvent.MPV_EVENT_FILE_LOADED) {
             currentWatchLaterPath = MPVLib.getPropertyString("path")
+            completedWatchLaterPath = null
             val persistFileState = fileStatePersistenceEnabled()
             player.configureFileStatePersistence(persistFileState)
 
             if (persistFileState) {
+                // These app snapshots survive deletion of watch-later at natural EOF, so only
+                // `start` is reset while gamma, delays and the other controls are restored.
+                try { player.restoreCurrentFilePlaybackOptions() } catch (_: Throwable) {}
+                // Capture values that may have come from an older watch-later file. This also
+                // migrates existing installs before that file is removed at natural EOF.
+                try { player.persistCurrentPlaybackOptions() } catch (_: Throwable) {}
+
                 // Track IDs and the external track list are authoritative only after FILE_LOADED.
                 // Restore both subtitle slots now so a previous file or mpv's automatic selection
                 // cannot swap primary and secondary while the new file is still being initialized.
                 try { restoreSubtitleSelectionForCurrentFile() } catch (_: Throwable) {}
                 try { restoreAudioSelectionForCurrentFile() } catch (_: Throwable) {}
+                try { rememberActiveTrackSelectionsForCurrentFile() } catch (_: Throwable) {}
             } else {
                 // resume-playback was disabled before loading, so this removes any old state
                 // without first applying it to the current session.
@@ -3689,6 +3719,7 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
 
         if (eventId == MpvEvent.MPV_EVENT_START_FILE) {
             currentWatchLaterPath = null
+            completedWatchLaterPath = null
             // Reset any view-level zoom/pan when a new file starts.
 
             // Apply orientation as early as possible for playlist items, so we don't show the wrong orientation first.

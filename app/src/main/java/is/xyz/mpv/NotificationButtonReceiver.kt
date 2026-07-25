@@ -32,8 +32,10 @@ class NotificationButtonReceiver : BroadcastReceiver() {
                 .getBoolean("save_position", false))
             return
 
-        // Avoid replacing a useful resume point with EOF when auto-advance has already begun.
-        if (MPVLib.getPropertyBoolean("eof-reached") == true)
+        // Avoid recreating a resume point for a file that has completed but whose old path is
+        // still briefly readable while mpv is entering idle or advancing the playlist.
+        if (MPVLib.getPropertyBoolean("eof-reached") == true ||
+            MPVLib.getPropertyBoolean("idle-active") == true)
             return
         if (MPVLib.getPropertyString("path") != null)
             MPVLib.command(arrayOf("write-watch-later-config"))

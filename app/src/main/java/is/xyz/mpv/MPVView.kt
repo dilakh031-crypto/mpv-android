@@ -13,6 +13,7 @@ import `is`.xyz.mpv.MPVLib.MpvFormat.MPV_FORMAT_FLAG
 import `is`.xyz.mpv.MPVLib.MpvFormat.MPV_FORMAT_INT64
 import `is`.xyz.mpv.MPVLib.MpvFormat.MPV_FORMAT_NONE
 import `is`.xyz.mpv.MPVLib.MpvFormat.MPV_FORMAT_STRING
+import java.security.MessageDigest
 import kotlin.reflect.KProperty
 
 internal class MPVView(context: Context, attrs: AttributeSet) : BaseMPVView(context, attrs) {
@@ -214,43 +215,85 @@ internal class MPVView(context: Context, attrs: AttributeSet) : BaseMPVView(cont
     fun persistCurrentFileState() {
         if (!fileStatePersistenceEnabled())
             return
+        persistCurrentPlaybackOptions()
         // During teardown/pathological load failures there may be no writable current file.
         if (MPVLib.getPropertyString("path") != null)
             MPVLib.command(arrayOf("write-watch-later-config"))
     }
 
     /**
-     * Persist this file's playback options while deliberately omitting `start`.
+     * Keep this file's playback options while removing its resume position.
      *
-     * This must be called while the completed file is still loaded (the `eof-reached`
-     * property change happens before END_FILE). Rewriting the watch-later file this way
-     * resets only its resume position instead of deleting subtitle, delay and video settings.
+     * The Java property callback can run after mpv has started unloading the completed file.
+     * Rewriting watch-later at that point is racy: properties such as gamma may already be
+     * unavailable, while `start` can survive in an older file. App-controlled options are
+     * therefore stored separately as they change, and the watch-later file is deleted outright.
      */
-    fun persistCurrentFileStateWithoutPosition() {
+    fun persistCurrentFileStateWithoutPosition(path: String) {
         if (!fileStatePersistenceEnabled())
             return
-        if (MPVLib.getPropertyString("path") == null)
+
+        // Capture one last snapshot only if the completed file is still current. If it has
+        // already unloaded, the snapshots taken when settings changed remain authoritative.
+        if (MPVLib.getPropertyString("path") == path)
+            persistCurrentPlaybackOptions()
+
+        MPVLib.command(arrayOf("delete-watch-later-config", path))
+    }
+
+    /**
+     * Save options that must survive a completed file independently of watch-later `start`.
+     * Track selections are handled by MPVActivity because external tracks also need filenames.
+     */
+    fun persistCurrentPlaybackOptions() {
+        if (!fileStatePersistenceEnabled())
             return
+        val path = MPVLib.getPropertyString("path") ?: return
+        val preferences = PreferenceManager.getDefaultSharedPreferences(context)
 
-        val property = "watch-later-options"
-        val original = MPVLib.getPropertyString(property) ?: return
-        val positionless = original
-            .split(',')
-            .map { it.trim() }
-            .filter { it.isNotEmpty() && it != "start" }
-            .toMutableSet()
-
-        // `all` cannot express "all except start". Replace it with every app-controlled
-        // per-file option, and also ensure those options exist in an ordinary custom list.
-        positionless.remove("all")
-        positionless.addAll(PER_FILE_PLAYBACK_OPTIONS)
-
-        try {
-            MPVLib.setPropertyString(property, positionless.joinToString(","))
-            MPVLib.command(arrayOf("write-watch-later-config"))
-        } finally {
-            MPVLib.setPropertyString(property, original)
+        with (preferences.edit()) {
+            for (option in APP_PERSISTED_PLAYBACK_OPTIONS) {
+                val key = perFilePlaybackOptionKey(path, option)
+                val value = MPVLib.getPropertyString(option)
+                if (value == null)
+                    remove(key)
+                else
+                    putString(key, value)
+            }
+            commit()
         }
+    }
+
+    fun restoreCurrentFilePlaybackOptions() {
+        if (!fileStatePersistenceEnabled())
+            return
+        val path = MPVLib.getPropertyString("path") ?: return
+        val preferences = PreferenceManager.getDefaultSharedPreferences(context)
+
+        for (option in APP_PERSISTED_PLAYBACK_OPTIONS) {
+            val value = preferences.getString(perFilePlaybackOptionKey(path, option), null)
+                ?: continue
+            setFileLocalString(option, value)
+        }
+    }
+
+    fun clearPersistedPlaybackOptions(path: String) {
+        val preferences = PreferenceManager.getDefaultSharedPreferences(context)
+        with (preferences.edit()) {
+            for (option in APP_PERSISTED_PLAYBACK_OPTIONS)
+                remove(perFilePlaybackOptionKey(path, option))
+            commit()
+        }
+    }
+
+    private fun perFilePlaybackOptionKey(path: String, option: String): String {
+        val digest = MessageDigest.getInstance("SHA-1")
+            .digest(path.toByteArray(Charsets.UTF_8))
+        val pathHash = buildString(digest.size * 2) {
+            for (byte in digest)
+                append(String.format("%02x", byte))
+        }
+        return "perfile_playback_${pathHash}_$option"
     }
 
     private fun fileStatePersistenceEnabled(): Boolean {
@@ -625,6 +668,10 @@ internal class MPVView(context: Context, attrs: AttributeSet) : BaseMPVView(cont
             "secondary-sid",
             "vid",
         )
+
+        // Audio/subtitle IDs are restored together with external filenames by MPVActivity.
+        private val APP_PERSISTED_PLAYBACK_OPTIONS =
+            PER_FILE_PLAYBACK_OPTIONS - setOf("aid", "sid", "secondary-sid")
 
         // mpv option `hwdec` is set to this
         private const val HWDECS = "mediacodec,mediacodec-copy"
