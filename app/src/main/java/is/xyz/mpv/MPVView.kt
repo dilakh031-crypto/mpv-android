@@ -183,6 +183,38 @@ internal class MPVView(context: Context, attrs: AttributeSet) : BaseMPVView(cont
             MPVLib.command(arrayOf("write-watch-later-config"))
     }
 
+    /**
+     * Persist this file's playback options while deliberately omitting `start`.
+     *
+     * This must be called while the completed file is still loaded (the `eof-reached`
+     * property change happens before END_FILE). Rewriting the watch-later file this way
+     * resets only its resume position instead of deleting subtitle, delay and video settings.
+     */
+    fun persistCurrentFileStateWithoutPosition() {
+        if (MPVLib.getPropertyString("path") == null)
+            return
+
+        val property = "watch-later-options"
+        val original = MPVLib.getPropertyString(property) ?: return
+        val positionless = original
+            .split(',')
+            .map { it.trim() }
+            .filter { it.isNotEmpty() && it != "start" }
+            .toMutableSet()
+
+        // `all` cannot express "all except start". Replace it with every app-controlled
+        // per-file option, and also ensure those options exist in an ordinary custom list.
+        positionless.remove("all")
+        positionless.addAll(PER_FILE_PLAYBACK_OPTIONS)
+
+        try {
+            MPVLib.setPropertyString(property, positionless.joinToString(","))
+            MPVLib.command(arrayOf("write-watch-later-config"))
+        } finally {
+            MPVLib.setPropertyString(property, original)
+        }
+    }
+
     fun onPointerEvent(event: MotionEvent): Boolean {
         assert (event.isFromSource(InputDevice.SOURCE_CLASS_POINTER))
         if (event.actionMasked == MotionEvent.ACTION_SCROLL) {
@@ -262,6 +294,7 @@ internal class MPVView(context: Context, attrs: AttributeSet) : BaseMPVView(cont
             Property("loop-playlist"),
             Property("loop-file"),
             Property("shuffle", MPV_FORMAT_FLAG),
+            Property("eof-reached", MPV_FORMAT_FLAG),
             Property("hwdec-current"),
             Property("mute", MPV_FORMAT_FLAG),
             Property("current-tracks/audio/selected")
