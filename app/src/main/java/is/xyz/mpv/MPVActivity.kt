@@ -104,7 +104,10 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
     // This keeps exact seeking while avoiding the massive slowdown caused by spamming seeks.
     private val scrubSeekHandler = Handler(Looper.getMainLooper())
     private var scrubSeekInFlight = false
-    private var resumeAfterScrubSeek = false
+    // The playback state requested by the user while scrub seeking temporarily pauses mpv.
+    // Keeping it separate from mpv's real "pause" property makes play/pause controls symmetric:
+    // the user can change their mind while a slow exact seek is still completing.
+    private var scrubPlaybackPaused: Boolean? = null
     private var scrubAsyncCounter = 1L
     private var lastScrubAsyncUserdata = 0L
 
@@ -115,9 +118,6 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
     private var seekbarScrubActive = false
     private var pendingSeekbarSeekPos: Double? = null
     private var lastIssuedSeekbarSeekPos: Double? = null
-
-    /** 0 = initial, 1 = paused, 2 = was already paused */
-    private var pausedForSeekbar = 0
 
     private val gestureIdleSeekRunnable = Runnable { performGestureIdleSeek() }
     private val seekbarIdleSeekRunnable = Runnable { performSeekbarIdleSeek() }
@@ -220,9 +220,7 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
             pendingSeekbarSeekPos = null
             lastIssuedSeekbarSeekPos = null
 
-            // Pause while scrubbing (keep paused if it already was).
-            pausedForSeekbar = if (psc.pause) 2 else 1
-            if (pausedForSeekbar == 1) player.paused = true
+            beginScrubPlaybackHold()
 
             fadeHandler.removeCallbacks(fadeRunnable3)
             binding.gestureTextView.visibility = View.VISIBLE
@@ -236,19 +234,13 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
             scrubSeekHandler.removeCallbacks(seekbarIdleSeekRunnable)
 
             val target = pendingSeekbarSeekPos
-            val shouldResume = (pausedForSeekbar == 1)
-            if (shouldResume) resumeAfterScrubSeek = true
 
             if (target != null && lastIssuedSeekbarSeekPos != target) {
                 lastIssuedSeekbarSeekPos = target
                 sendScrubSeek(target, exact = true)
             }
 
-            // If nothing is in-flight, resume immediately.
-            if (shouldResume && !scrubSeekInFlight) {
-                resumeAfterScrubSeek = false
-                player.paused = false
-            }
+            finishScrubPlaybackHoldIfReady()
 
             binding.gestureTextView.visibility = View.GONE
             showControls() // re-trigger display timeout
@@ -342,7 +334,7 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
             nextBtn.setOnClickListener { playlistNext() }
             cycleAudioBtn.setOnClickListener { cycleAudio() }
             cycleSubsBtn.setOnClickListener { cycleSub() }
-            playBtn.setOnClickListener { player.cyclePause() }
+            playBtn.setOnClickListener { togglePlaybackPauseFromUi() }
             cycleDecoderBtn.setOnClickListener { player.cycleHwdec() }
             cycleSpeedBtn.setOnClickListener { cycleSpeed() }
             topLockBtn.setOnClickListener { lockUI() }
@@ -3220,11 +3212,14 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
     }
 
     private fun updatePlaybackStatus(paused: Boolean) {
-        val r = if (paused) R.drawable.ic_play_arrow_black_24dp else R.drawable.ic_pause_black_24dp
+        // mpv is deliberately paused while an exact scrub seek is decoding. During that hold,
+        // show the state requested by the user rather than the temporary internal pause.
+        val playbackPaused = scrubPlaybackPaused ?: paused
+        val r = if (playbackPaused) R.drawable.ic_play_arrow_black_24dp else R.drawable.ic_pause_black_24dp
         binding.playBtn.setImageResource(r)
 
         updatePiPParams()
-        if (paused) {
+        if (playbackPaused) {
             window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         } else {
             window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
@@ -3670,13 +3665,12 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
             finishWithResult(if (playbackHasStarted) RESULT_OK else RESULT_CANCELED)
 
         if (eventId == MpvEvent.MPV_EVENT_PLAYBACK_RESTART) {
-            // A seek completed. If the user has released the finger, resume playback now.
+            // A seek completed. If the user has released the finger, apply the latest
+            // play/pause choice they made while the seek was in progress.
             scrubSeekInFlight = false
             lastScrubAsyncUserdata = 0L
-            if (resumeAfterScrubSeek && !gestureScrubActive && !seekbarScrubActive) {
-                resumeAfterScrubSeek = false
-                eventUiHandler.post { player.paused = false }
-            }
+            if (!gestureScrubActive && !seekbarScrubActive)
+                eventUiHandler.post { finishScrubPlaybackHoldIfReady() }
         }
 
         if (eventId == MpvEvent.MPV_EVENT_FILE_LOADED) {
@@ -3762,6 +3756,42 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
 
     // --- Scrub seek helpers ---
     // We keep the frame frozen while the finger is moving, then do a single exact seek on idle/release.
+    private fun beginScrubPlaybackHold() {
+        if (scrubPlaybackPaused != null)
+            return
+
+        val wasPaused = psc.pause
+        scrubPlaybackPaused = wasPaused
+        updatePlaybackStatus(wasPaused)
+        if (!wasPaused)
+            player.paused = true
+    }
+
+    private fun finishScrubPlaybackHoldIfReady() {
+        if (scrubSeekInFlight || gestureScrubActive || seekbarScrubActive)
+            return
+
+        val playbackPaused = scrubPlaybackPaused ?: return
+        scrubPlaybackPaused = null
+        player.paused = playbackPaused
+        // Setting the same mpv value does not necessarily emit a property event.
+        updatePlaybackStatus(playbackPaused)
+    }
+
+    private fun togglePlaybackPauseFromUi() {
+        val playbackPaused = scrubPlaybackPaused
+        if (playbackPaused == null) {
+            player.cyclePause()
+            return
+        }
+
+        val newPlaybackPaused = !playbackPaused
+        scrubPlaybackPaused = newPlaybackPaused
+        player.paused = newPlaybackPaused
+        // Keep the button responsive even when mpv was already temporarily paused.
+        updatePlaybackStatus(newPlaybackPaused)
+    }
+
     private fun abortLastScrubSeek() {
         val ud = lastScrubAsyncUserdata
         if (ud != 0L) {
@@ -3803,8 +3833,6 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
     private var initialBright = 0f
     private var initialVolume = 0
     private var maxVolume = 0
-    /** 0 = initial, 1 = paused, 2 = was already paused */
-    private var pausedForSeek = 0
 
     // Keeps gesture seeking responsive after hitting either edge of the video.
     // Any drag distance beyond 0/duration is folded into this offset, so the
@@ -3839,7 +3867,6 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
                 }
                 if (!isPlayingAudio)
                     maxVolume = 0 // disallow volume gesture if no audio
-                pausedForSeek = 0
                 gestureSeekDeltaOffsetSec = 0
 
                 fadeHandler.removeCallbacks(fadeRunnable3)
@@ -3852,18 +3879,14 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
                 if (duration == 0f || initialSeek < 0)
                     return
 
-                // Pause while seeking (finger still on screen) and only resume on release.
-                // If playback was already paused, keep it paused.
-                if (pausedForSeek == 0) {
-                    pausedForSeek = if (psc.pause) 2 else 1
-                    if (pausedForSeek == 1)
-                        player.paused = true
-
+                // Hold playback while seeking, then restore the latest state chosen by the user.
+                if (!gestureScrubActive) {
                     // Start of a scrub gesture.
                     gestureScrubActive = true
                     pendingGestureSeekSec = null
                     lastIssuedGestureSeekSec = null
                     scrubSeekHandler.removeCallbacks(gestureIdleSeekRunnable)
+                    beginScrubPlaybackHold()
                 }
 
                 // Quantize to 1 second steps. When the gesture reaches the
@@ -3929,20 +3952,13 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
                 gestureScrubActive = false
                 scrubSeekHandler.removeCallbacks(gestureIdleSeekRunnable)
 
-                val shouldResume = (pausedForSeek == 1)
-                if (shouldResume) resumeAfterScrubSeek = true
-
                 val target = pendingGestureSeekSec
                 if (target != null && lastIssuedGestureSeekSec != target) {
                     lastIssuedGestureSeekSec = target
                     sendScrubSeek(target.toDouble(), exact = smoothSeekGesture)
                 }
 
-                // If nothing is in-flight, resume immediately.
-                if (shouldResume && !scrubSeekInFlight) {
-                    resumeAfterScrubSeek = false
-                    player.paused = false
-                }
+                finishScrubPlaybackHoldIfReady()
 
                 pendingGestureSeekSec = null
                 gestureSeekDeltaOffsetSec = 0
@@ -3967,7 +3983,7 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
                 // Double-tap play/pause should not trigger control UI.
                 cancelPendingTapToggle()
                 mightWantToToggleControls = false
-                player.cyclePause()
+                togglePlaybackPauseFromUi()
             }
             PropertyChange.Custom -> {
                 // Double-tap custom action should not toggle the control UI.
