@@ -49,14 +49,6 @@ internal class TouchGestures(private val observer: TouchGesturesObserver) {
     // last non-throttled processed position
     private var lastPos = PointF()
 
-    // Seek movement is accumulated separately so equal distances can produce
-    // different offsets depending on how quickly the finger moves.
-    private var seekLastX = 0f
-    private var seekLastEventTime = 0L
-    private var seekVelocityScreensPerSec = 0f
-    private var seekAccumulatedSec = 0f
-    private var seekDirection = 0
-
     private var width = 0f
     private var height = 0f
     // minimum movement which triggers a Control state
@@ -113,20 +105,6 @@ internal class TouchGestures(private val observer: TouchGesturesObserver) {
         // We achieve this by sending seek updates more frequently than volume/brightness.
         private const val SEEK_THROTTLE_DIV = 24
 
-        // Keep the original 150-second full-sweep scale as the reference, but vary its gain
-        // with horizontal finger velocity. Speed is measured in screen widths per second,
-        // which keeps the response consistent across resolutions.
-        private const val SEEK_MIN_GAIN = 0.25f
-        private const val SEEK_MAX_GAIN = 5.00f
-        private const val SEEK_ACCELERATION_START = 0.15f
-        private const val SEEK_ACCELERATION_END = 1.00f
-        private const val SEEK_MAX_TRACKED_SPEED = 4.00f
-        private const val SEEK_VELOCITY_SMOOTHING_MS = 80f
-
-        // Keep +00:00 easy to select even after the 2.5x gain increase. In physical movement
-        // this window is twice as wide as before; movement beyond it starts at +/-00:01.
-        private const val SEEK_ZERO_DEADZONE_SEC = 0.40f
-
         // Require gestures to be clearly horizontal/vertical before locking to that axis.
         // This prevents accidental seeks when the user swipes mostly vertically.
         private const val DIRECTION_LOCK_RATIO = 1.25f
@@ -138,7 +116,6 @@ internal class TouchGestures(private val observer: TouchGesturesObserver) {
             sendPropertyChange(PropertyChange.Finalize, 0f)
         state = State.Up
         lastTapTime = 0L
-        resetSeekAcceleration()
     }
 
     private fun processTap(p: PointF): Boolean {
@@ -173,68 +150,7 @@ internal class TouchGestures(private val observer: TouchGesturesObserver) {
         return false
     }
 
-    private fun resetSeekAcceleration() {
-        seekLastX = 0f
-        seekLastEventTime = 0L
-        seekVelocityScreensPerSec = 0f
-        seekAccumulatedSec = 0f
-        seekDirection = 0
-    }
-
-    private fun beginSeekAcceleration(p: PointF, eventTime: Long) {
-        seekLastX = p.x
-        seekLastEventTime = eventTime
-        seekVelocityScreensPerSec = 0f
-        seekAccumulatedSec = 0f
-        seekDirection = 0
-    }
-
-    private fun acceleratedSeekDiff(p: PointF, eventTime: Long): Float {
-        val segmentPx = p.x - seekLastX
-        val elapsedMs = (eventTime - seekLastEventTime).coerceAtLeast(1L)
-        seekLastX = p.x
-        seekLastEventTime = eventTime
-
-        val direction = when {
-            segmentPx < 0f -> -1
-            segmentPx > 0f -> 1
-            else -> 0
-        }
-        if (direction != 0 && direction != seekDirection) {
-            // Restart the velocity ramp when reversing. This makes an equal-speed trip back
-            // to the origin cancel the outward movement instead of inheriting its high gain.
-            seekDirection = direction
-            seekVelocityScreensPerSec = 0f
-        }
-
-        val instantSpeed = (
-            abs(segmentPx) * 1000f / elapsedMs.toFloat() / width
-        ).coerceAtMost(SEEK_MAX_TRACKED_SPEED)
-        val smoothing = elapsedMs.toFloat() / (SEEK_VELOCITY_SMOOTHING_MS + elapsedMs)
-        seekVelocityScreensPerSec +=
-            (instantSpeed - seekVelocityScreensPerSec) * smoothing
-
-        val accelerationProgress = (
-            (seekVelocityScreensPerSec - SEEK_ACCELERATION_START) /
-                (SEEK_ACCELERATION_END - SEEK_ACCELERATION_START)
-        ).coerceIn(0f, 1f)
-        val smoothProgress =
-            accelerationProgress * accelerationProgress * (3f - 2f * accelerationProgress)
-        val gain = SEEK_MIN_GAIN + (SEEK_MAX_GAIN - SEEK_MIN_GAIN) * smoothProgress
-
-        seekAccumulatedSec = (
-            seekAccumulatedSec + segmentPx / width * CONTROL_SEEK_MAX * gain
-        ).coerceIn(-CONTROL_SEEK_MAX, CONTROL_SEEK_MAX)
-
-        val magnitude = abs(seekAccumulatedSec)
-        return when {
-            magnitude < SEEK_ZERO_DEADZONE_SEC -> 0f
-            magnitude < 1f -> if (seekAccumulatedSec < 0f) -1f else 1f
-            else -> seekAccumulatedSec
-        }
-    }
-
-    private fun processMovement(p: PointF, eventTime: Long): Boolean {
+    private fun processMovement(p: PointF): Boolean {
         // throttle events: only send updates when there's some movement compared to last update
         // 3 here is arbitrary.
         // For seeking we want finer updates so the step size becomes ~1s on slow drag.
@@ -299,12 +215,11 @@ internal class TouchGestures(private val observer: TouchGesturesObserver) {
                     if (state == State.ControlSeek) {
                         initialPos.set(p)
                         lastPos.set(p)
-                        beginSeekAcceleration(p, eventTime)
                     }
                 }
             }
             State.ControlSeek ->
-                sendPropertyChange(PropertyChange.Seek, acceleratedSeekDiff(p, eventTime))
+                sendPropertyChange(PropertyChange.Seek, CONTROL_SEEK_MAX * dr)
             State.ControlVolume ->
                 sendPropertyChange(PropertyChange.Volume, CONTROL_VOLUME_MAX * dr)
             State.ControlBright ->
@@ -354,11 +269,10 @@ internal class TouchGestures(private val observer: TouchGesturesObserver) {
         val point = PointF(e.x, e.y)
         when (e.actionMasked) {
             MotionEvent.ACTION_UP -> {
-                gestureHandled = processMovement(point, e.eventTime) or processTap(point)
+                gestureHandled = processMovement(point) or processTap(point)
                 if (state != State.Down)
                     sendPropertyChange(PropertyChange.Finalize, 0f)
                 state = State.Up
-                resetSeekAcceleration()
             }
             MotionEvent.ACTION_DOWN -> {
                 // deadzone on top/bottom
@@ -372,7 +286,7 @@ internal class TouchGestures(private val observer: TouchGesturesObserver) {
                 gestureHandled = true
             }
             MotionEvent.ACTION_MOVE -> {
-                gestureHandled = processMovement(point, e.eventTime)
+                gestureHandled = processMovement(point)
             }
             MotionEvent.ACTION_CANCEL, MotionEvent.ACTION_POINTER_DOWN -> {
                 cancel()
