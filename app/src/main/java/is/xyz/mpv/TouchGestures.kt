@@ -116,16 +116,16 @@ internal class TouchGestures(private val observer: TouchGesturesObserver) {
         // Keep the original 150-second full-sweep scale as the reference, but vary its gain
         // with horizontal finger velocity. Speed is measured in screen widths per second,
         // which keeps the response consistent across resolutions.
-        private const val SEEK_MIN_GAIN = 0.10f
-        private const val SEEK_MAX_GAIN = 2.00f
+        private const val SEEK_MIN_GAIN = 0.25f
+        private const val SEEK_MAX_GAIN = 5.00f
         private const val SEEK_ACCELERATION_START = 0.15f
         private const val SEEK_ACCELERATION_END = 1.00f
         private const val SEEK_MAX_TRACKED_SPEED = 4.00f
         private const val SEEK_VELOCITY_SMOOTHING_MS = 80f
 
-        // Only an extremely small movement remains at +00:00. Every meaningful movement
-        // below one accumulated second is exposed as +/-00:01 instead of a broad zero step.
-        private const val SEEK_ZERO_DEADZONE_SEC = 0.08f
+        // Keep +00:00 easy to select even after the 2.5x gain increase. In physical movement
+        // this window is twice as wide as before; movement beyond it starts at +/-00:01.
+        private const val SEEK_ZERO_DEADZONE_SEC = 0.40f
 
         // Require gestures to be clearly horizontal/vertical before locking to that axis.
         // This prevents accidental seeks when the user swipes mostly vertically.
