@@ -3889,19 +3889,14 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
                     beginScrubPlaybackHold()
                 }
 
-                // Quantize to full 1-second bands measured outward from zero.
-                // Truncating toward zero gives the initial 00:00 band the same
-                // width as later steps, so a normal drag enters +/-00:01 before
-                // it can advance to +/-00:02.
-                //
-                // When the gesture reaches the start/end of the video, absorb
-                // any extra drag into an offset.
+                // Quantize to 1 second steps. When the gesture reaches the
+                // start/end of the video, absorb any extra drag into an offset.
                 // This prevents "overscroll debt": moving 1 second back from
                 // the edge should require the same small reverse movement as it
                 // does anywhere else in the video.
                 val startPos = initialSeek.roundToInt()
                 val durationSec = duration.roundToInt()
-                val rawDeltaSec = diff.toInt()
+                val rawDeltaSec = diff.roundToInt()
                 val minDeltaSec = -startPos
                 val maxDeltaSec = durationSec - startPos
                 var deltaSec = rawDeltaSec - gestureSeekDeltaOffsetSec
