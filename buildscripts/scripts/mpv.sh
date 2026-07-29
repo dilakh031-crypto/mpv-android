@@ -146,6 +146,122 @@ diff --git a/audio/out/ao_audiotrack.c b/audio/out/ao_audiotrack.c
 PATCH
 fi
 
+# Make subtitle seeking treat the primary and secondary tracks as one timeline.
+# mpv exposes per-track seeking, so add a "both" mode which asks both tracks for
+# their target and performs one seek to the closest result in the requested
+# direction.
+if ! grep -Eq '\{"both",[[:space:]]*2\}' player/command.c; then
+	patch -p1 --forward --batch <<'PATCH'
+diff --git a/player/command.c b/player/command.c
+--- a/player/command.c
++++ b/player/command.c
+@@ -6260,6 +6260,27 @@ static void cmd_playlist_play_index(void *p)
+         mpctx->add_osd_seek_info |= OSD_SEEK_INFO_CURRENT_FILE;
+ }
+ 
++static void queue_sub_seek(struct MPContext *mpctx, struct mp_cmd_ctx *cmd,
++                           double refpts, double target)
++{
++    // We can easily seek/step to the wrong subtitle line (because
++    // video frame PTS and sub PTS rarely match exactly).
++    // sub/sd_ass.c adds SUB_SEEK_OFFSET as a workaround, and we
++    // need an even bigger offset without a video.
++    if (!mpctx->current_track[0][STREAM_VIDEO] ||
++        mpctx->current_track[0][STREAM_VIDEO]->image) {
++        target += SUB_SEEK_WITHOUT_VIDEO_OFFSET - SUB_SEEK_OFFSET;
++    }
++    mark_seek(mpctx);
++    queue_seek(mpctx, MPSEEK_ABSOLUTE, target, MPSEEK_EXACT,
++               MPSEEK_FLAG_DELAY);
++    set_osd_function(mpctx, (target > refpts) ? OSD_FFW : OSD_REW);
++    if (cmd->seek_bar_osd)
++        mpctx->add_osd_seek_info |= OSD_SEEK_INFO_BAR;
++    if (cmd->seek_msg_osd)
++        mpctx->add_osd_seek_info |= OSD_SEEK_INFO_TEXT;
++}
++
+ static void cmd_sub_step_seek(void *p)
+ {
+     struct mp_cmd_ctx *cmd = p;
+@@ -6272,9 +6293,40 @@ static void cmd_sub_step_seek(void *p)
+         return;
+     }
+ 
++    double refpts = get_current_time(mpctx);
++    if (!step && track_ind == 2) {
++        if (refpts == MP_NOPTS_VALUE)
++            return;
++
++        int skip = cmd->args[0].v.i;
++        if (skip != -1 && skip != 1) {
++            cmd->success = false;
++            return;
++        }
++
++        double target = MP_NOPTS_VALUE;
++        for (int n = 0; n < 2; n++) {
++            struct track *track = mpctx->current_track[n][STREAM_SUB];
++            struct dec_sub *sub = track ? track->d_sub : NULL;
++            if (!sub)
++                continue;
++
++            double candidate[2] = {refpts, skip};
++            if (sub_control(sub, SD_CTRL_SUB_STEP, candidate) <= 0)
++                continue;
++
++            if (target == MP_NOPTS_VALUE ||
++                (skip > 0 ? candidate[0] < target : candidate[0] > target))
++                target = candidate[0];
++        }
++
++        if (target != MP_NOPTS_VALUE)
++            queue_sub_seek(mpctx, cmd, refpts, target);
++        return;
++    }
++
+     struct track *track = mpctx->current_track[track_ind][STREAM_SUB];
+     struct dec_sub *sub = track ? track->d_sub : NULL;
+-    double refpts = get_current_time(mpctx);
+     if (sub && refpts != MP_NOPTS_VALUE) {
+         double a[2];
+         a[0] = refpts;
+@@ -6289,22 +6341,7 @@ static void cmd_sub_step_seek(void *p)
+                     track_ind == 0 ? "sub-delay" : "secondary-sub-delay",
+                     cmd->on_osd);
+             } else {
+-                // We can easily seek/step to the wrong subtitle line (because
+-                // video frame PTS and sub PTS rarely match exactly).
+-                // sub/sd_ass.c adds SUB_SEEK_OFFSET as a workaround, and we
+-                // need an even bigger offset without a video.
+-                if (!mpctx->current_track[0][STREAM_VIDEO] ||
+-                    mpctx->current_track[0][STREAM_VIDEO]->image) {
+-                    a[0] += SUB_SEEK_WITHOUT_VIDEO_OFFSET - SUB_SEEK_OFFSET;
+-                }
+-                mark_seek(mpctx);
+-                queue_seek(mpctx, MPSEEK_ABSOLUTE, a[0], MPSEEK_EXACT,
+-                           MPSEEK_FLAG_DELAY);
+-                set_osd_function(mpctx, (a[0] > refpts) ? OSD_FFW : OSD_REW);
+-                if (cmd->seek_bar_osd)
+-                    mpctx->add_osd_seek_info |= OSD_SEEK_INFO_BAR;
+-                if (cmd->seek_msg_osd)
+-                    mpctx->add_osd_seek_info |= OSD_SEEK_INFO_TEXT;
++                queue_sub_seek(mpctx, cmd, refpts, a[0]);
+             }
+         }
+     }
+@@ -7554,7 +7591,8 @@ const struct mp_cmd_def mp_cmds[] = {
+             {"skip", OPT_INT(v.i)},
+             {"flags", OPT_CHOICE(v.i,
+                 {"primary", 0},
+-                {"secondary", 1}),
++                {"secondary", 1},
++                {"both", 2}),
+                 OPTDEF_INT(0)},
+         },
+         .allow_auto_repeat = true,
+PATCH
+fi
+
 unset CC CXX # meson wants these unset
 
 meson setup $build --cross-file "$prefix_dir"/crossfile.txt \
