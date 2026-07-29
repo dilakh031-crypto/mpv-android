@@ -111,9 +111,6 @@ internal class TouchGestures(private val observer: TouchGesturesObserver) {
         // We achieve this by sending seek updates more frequently than volume/brightness.
         private const val SEEK_THROTTLE_DIV = 24
 
-        // Start showing seek feedback after 90% of the original movement distance.
-        private const val SEEK_FEEDBACK_DISTANCE_SCALE = 0.9f
-
         // Require gestures to be clearly horizontal/vertical before locking to that axis.
         // This prevents accidental seeks when the user swipes mostly vertically.
         private const val DIRECTION_LOCK_RATIO = 1.25f
@@ -134,10 +131,7 @@ internal class TouchGestures(private val observer: TouchGesturesObserver) {
     }
 
     private fun activationThreshold(gesture: State): Float {
-        return if (gesture == State.ControlSeek)
-            trigger * SEEK_FEEDBACK_DISTANCE_SCALE / 4
-        else
-            trigger
+        return if (gesture == State.ControlSeek) trigger / 4 else trigger
     }
 
     private fun activateGesture(
@@ -250,22 +244,10 @@ internal class TouchGestures(private val observer: TouchGesturesObserver) {
             maxAbsDy = max(maxAbsDy, abs(dy))
         }
 
-        // Throttle events: only send updates when there's some movement compared to the last
-        // update. Seek feedback, including its initial activation, needs 10% less movement;
-        // volume and brightness keep their original thresholds.
-        val pendingSeek = state == State.Down && when {
-            maxAbsDx >= maxAbsDy -> gestureHoriz == State.ControlSeek
-            initialPos.x > width / 2 -> gestureVertRight == State.ControlSeek
-            else -> gestureVertLeft == State.ControlSeek
-        }
-        val throttle = when {
-            state == State.ControlSeek ->
-                trigger * SEEK_FEEDBACK_DISTANCE_SCALE / SEEK_THROTTLE_DIV
-            pendingSeek ->
-                trigger * SEEK_FEEDBACK_DISTANCE_SCALE / 3
-            else ->
-                trigger / 3
-        }
+        // throttle events: only send updates when there's some movement compared to last update
+        // 3 here is arbitrary.
+        // For seeking we want finer updates so the step size becomes ~1s on slow drag.
+        val throttle = if (state == State.ControlSeek) trigger / SEEK_THROTTLE_DIV else trigger / 3
         if (PointF(lastPos.x - p.x, lastPos.y - p.y).length() < throttle)
             return false
         lastPos.set(p)
