@@ -28,7 +28,7 @@ extern "C" {
     jni_func(void, command, jobjectArray jarray);
     jni_func(jint, commandAsync, jobjectArray jarray, jlong userdata);
     jni_func(void, abortAsyncCommand, jlong userdata);
-    jni_func(jint, setAspectAndPanscan, jstring jaspect, jdouble panscan);
+    jni_func(jlong, setAspectAndPanscan, jstring jaspect, jdouble panscan);
 };
 
 JavaVM *g_vm;
@@ -140,7 +140,7 @@ jni_func(void, abortAsyncCommand, jlong userdata) {
     mpv_abort_async_command(g_mpv, (uint64_t)userdata);
 }
 
-jni_func(jint, setAspectAndPanscan, jstring jaspect, jdouble panscan) {
+jni_func(jlong, setAspectAndPanscan, jstring jaspect, jdouble panscan) {
     CHECK_MPV_INIT();
 
     if (!jaspect)
@@ -150,37 +150,39 @@ jni_func(jint, setAspectAndPanscan, jstring jaspect, jdouble panscan) {
     if (!aspect)
         return MPV_ERROR_NOMEM;
 
-    // Aspect values used by the menu are deliberately restricted to mpv's
-    // numeric aspect syntax. This keeps the command-list argument unambiguous
-    // without relying on string escaping.
-    bool valid = aspect[0] != '\0';
-    size_t aspect_len = 0;
-    for (const char *p = aspect; valid && *p; ++p, ++aspect_len) {
-        valid = (*p >= '0' && *p <= '9') ||
-                *p == ':' || *p == '.' || *p == '-';
-        if (aspect_len >= 63)
-            valid = false;
+    char panscan_value[64];
+    int written = snprintf(
+        panscan_value,
+        sizeof(panscan_value),
+        "%.17g",
+        (double)panscan);
+    if (written < 0 || written >= (int)sizeof(panscan_value)) {
+        env->ReleaseStringUTFChars(jaspect, aspect);
+        return MPV_ERROR_INVALID_PARAMETER;
     }
 
-    char command[256];
-    int written = valid
-        ? snprintf(
-            command,
-            sizeof(command),
-            "no-osd set file-local-options/video-aspect-override %s ; "
-            "no-osd set file-local-options/panscan %.17g",
-            aspect,
-            (double)panscan)
-        : -1;
-
-    env->ReleaseStringUTFChars(jaspect, aspect);
-    if (written < 0 || written >= (int)sizeof(command))
-        return MPV_ERROR_INVALID_PARAMETER;
-
     /*
-     * A parsed command list runs both synchronous setters under one core
-     * dispatch lock. mpv therefore coalesces the associated video update and
-     * cannot render the otherwise-visible intermediate aspect/panscan state.
+     * This app-specific command is added to the bundled, release-matched mpv by
+     * buildscripts/scripts/mpv.sh. It does not return until the VO has presented
+     * a marked frame using both final values; the returned EGL presentation time
+     * identifies the same buffer when TextureView consumes it.
      */
-    return mpv_command_string(g_mpv, command);
+    const char *arguments[] = {
+        "mpv-android-set-aspect-panscan",
+        aspect,
+        panscan_value,
+        NULL,
+    };
+    mpv_node command_result = {0};
+    int result = mpv_command_ret(g_mpv, arguments, &command_result);
+    env->ReleaseStringUTFChars(jaspect, aspect);
+    if (result < 0)
+        return result;
+
+    int64_t presentation_time =
+        command_result.format == MPV_FORMAT_INT64
+            ? command_result.u.int64
+            : 0;
+    mpv_free_node_contents(&command_result);
+    return presentation_time;
 }
