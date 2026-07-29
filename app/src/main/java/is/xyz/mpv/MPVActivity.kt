@@ -3034,10 +3034,10 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
     val hiddenButtons = mutableSetOf<Int>()
     val buttons: MutableList<MenuItem> = mutableListOf(
         MenuItem(R.id.subSeekPrev) {
-            MPVLib.command(arrayOf("sub-seek", "-1"))
+            MPVLib.command(arrayOf("sub-seek", "-1", "both"))
         },
         MenuItem(R.id.subSeekNext) {
-            MPVLib.command(arrayOf("sub-seek", "1"))
+            MPVLib.command(arrayOf("sub-seek", "1", "both"))
         },
         MenuItem(R.id.statsBtn) {
             MPVLib.command(arrayOf("script-binding", "stats/display-stats-toggle"))
