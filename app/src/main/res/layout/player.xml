@@ -30,8 +30,8 @@
         Gesture layer.
 
         IMPORTANT: This view must not be transformed.
-        We transform the TextureView content matrix while zooming.
-        If we attached gesture handling directly to that transformed content,
+        We transform the player View while zooming.
+        If we attached gesture handling directly to that transformed View,
         Android would deliver touch coordinates that are continuously re-mapped
         by the inverse transform matrix, causing feedback/jitter while zooming/panning.
     -->
