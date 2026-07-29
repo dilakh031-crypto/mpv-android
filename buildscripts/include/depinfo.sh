@@ -17,6 +17,7 @@ v_freetype=2.14.3
 v_mbedtls=3.6.6
 v_libxml2=2.15.3
 v_fontconfig=2.17.1
+v_mpv=9ce79bcaa0132660a2e45b6bfc1fb0c199665277
 
 
 ## Dependency tree
