@@ -174,11 +174,10 @@ internal class TouchGestures(private val observer: TouchGesturesObserver) {
             if (p.x > width / 2) gestureVertRight else gestureVertLeft
         }
 
-        // Switching axes needs the normal movement threshold even when the target is Seek.
-        // The larger threshold separates a deliberate turn from the small sideways drift of
-        // a fast up/down swipe; once switched, Seek keeps its usual fine-grained updates.
+        // Use the target gesture's normal activation threshold. In particular, changing to
+        // Seek must feel just as responsive as beginning with a horizontal Seek directly.
         val changedDirection =
-            nextDelta > trigger &&
+            nextDelta > activationThreshold(nextGesture) &&
             (currentDelta == 0f || nextDelta / currentDelta >= DIRECTION_LOCK_RATIO)
 
         if (changedDirection) {
