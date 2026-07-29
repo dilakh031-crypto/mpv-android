@@ -15,12 +15,10 @@ abstract class BaseMPVView(context: Context, attrs: AttributeSet) : TextureView(
         // scale/translation much smoother than transforming a SurfaceView layer,
         // especially on older Android devices where SurfaceView composition is
         // quantized by SurfaceFlinger/HWC.
-        //
-        // The texture transform can intentionally leave letterbox space outside
-        // the media rectangle. Marking the view translucent lets the black player
-        // background fill that space instead of asking TextureView to treat stale
-        // texture pixels as opaque.
-        isOpaque = false
+        // Zoom uses the original outer View transform and mpv always supplies an
+        // opaque frame. Retaining the edited build's opaque TextureView avoids an
+        // unnecessary full-screen blending pass while pinching and panning.
+        isOpaque = true
     }
 
     /**

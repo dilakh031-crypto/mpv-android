@@ -26,9 +26,9 @@ import kotlin.math.sqrt
  *    rotation just like the release renderer; Android does not minify an already
  *    downscaled hardware layer a second time.
  *  - While zoomed, mpv renders a source-detail, media-aspect buffer and Android's
- *    TextureView matrix performs only zoom/pan.
+ *    View properties perform zoom/pan exactly as in the original edited build.
  *
- * SurfaceTexture cannot atomically change both buffer geometry and consumer
+ * SurfaceTexture cannot atomically change both buffer geometry and the View
  * transform. A frame-serial handoff keeps the last valid frame in a lightweight
  * overlay while ownership changes, then removes it on the first real frame from
  * the destination mode. This is event-driven: there is no delay, blackout, or
@@ -85,7 +85,6 @@ internal class VideoZoomGestures(
     private var customSurfaceWidth = 0
     private var customSurfaceHeight = 0
 
-    private val textureTransform = Matrix()
     private val handoffTransform = Matrix()
     private var handoffBitmap: Bitmap? = null
     private var handoffTracksBaseSurface = false
@@ -614,20 +613,24 @@ internal class VideoZoomGestures(
     }
 
     private fun applyToView() {
-        // View-level transforms cause TextureView to be sampled as an already
-        // rendered hardware layer. Apply the matrix to the underlying texture
-        // instead, so mpv's display-sized normal output reaches the screen in a
-        // single sampling pass.
+        // Preserve the original zoom implementation: scaling and translation are
+        // View properties, not a TextureView content matrix. Besides retaining the
+        // established gesture feel, this leaves TextureView's internal sampling
+        // path unchanged while the user pinches and pans.
+        //
+        // In BASE mode scale=1 and fit is identity, so normal playback is still
+        // passed through untouched and mpv remains the sole scaling/aspect owner.
+        val fit = renderSurfaceFitTransform(renderSurfaceMode)
+
         target.pivotX = 0f
         target.pivotY = 0f
-        target.scaleX = 1f
-        target.scaleY = 1f
-        target.translationX = 0f
-        target.translationY = 0f
-        target.setTransform(matrixForMode(renderSurfaceMode, textureTransform))
+        target.scaleX = scale * fit.scaleX
+        target.scaleY = scale * fit.scaleY
+        target.translationX = (tx + scale * fit.translationX).toFloat()
+        target.translationY = (ty + scale * fit.translationY).toFloat()
 
         if (handoffOverlay.visibility == View.VISIBLE && handoffTracksBaseSurface) {
-            handoffTransform.set(matrixForMode(RenderSurfaceMode.BASE, Matrix()))
+            matrixForMode(RenderSurfaceMode.BASE, handoffTransform)
             handoffOverlay.imageMatrix = handoffTransform
         }
     }
@@ -795,27 +798,14 @@ internal class VideoZoomGestures(
         if (bitmap == null)
             return
 
-        // TextureView.getBitmap() includes the TextureView content transform.
-        // Copy with an identity transform, then restore it before Android draws,
-        // so the overlay owns exactly one copy of sourceMatrix instead of
-        // accidentally applying the zoom/aspect transform twice.
-        val previousTransform = target.getTransform(Matrix())
+        // TextureView.getBitmap() captures its content but not the outer View
+        // scale/translation used by the original zoom path. The content transform
+        // remains at TextureView's default identity throughout playback, so the
+        // overlay applies sourceMatrix exactly once.
         try {
-            target.setTransform(Matrix())
             target.getBitmap(bitmap)
         } catch (_: Throwable) {
             return
-        } finally {
-            target.setTransform(previousTransform)
-            if (!previousTransform.isIdentity) {
-                // getBitmap() applied the temporary identity matrix directly
-                // to TextureView's hardware layer. Force the restored matrix
-                // back onto that layer before returning to the UI loop, so an
-                // unlucky vsync cannot expose the capture-only transform.
-                try {
-                    target.getBitmap(1, 1)?.recycle()
-                } catch (_: Throwable) {}
-            }
         }
 
         handoffTransform.set(sourceMatrix)

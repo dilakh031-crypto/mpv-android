@@ -353,7 +353,7 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
         }
 
         // NOTE: touch events come from the fixed gestureLayer. Keeping input
-        // independent from the TextureView content matrix prevents zoom/pan
+        // independent from the transformed player View prevents zoom/pan
         // updates from feeding back into MotionEvent coordinates.
         binding.gestureLayer.setOnTouchListener { _, e ->
             if (lockedUI)
