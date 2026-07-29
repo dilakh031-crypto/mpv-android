@@ -22,6 +22,8 @@ import kotlin.math.max
 import kotlin.math.min
 import kotlin.math.sqrt
 
+private typealias PanscanTransitionAction = ((Long?) -> Unit) -> Unit
+
 /**
  * Pinch-to-zoom + pan for mpv output.
  *
@@ -110,13 +112,14 @@ internal class VideoZoomGestures(
     private var pendingCaptureNeedsQueueDrain = false
     private var pendingCaptureSourceTransform: Matrix? = null
     private var pendingCaptureTracksBaseSurface = false
-    private var pendingPanscanAction: (() -> Unit)? = null
-    private var deferredPanscanAction: (() -> Unit)? = null
+    private var pendingPanscanAction: PanscanTransitionAction? = null
+    private var deferredPanscanAction: PanscanTransitionAction? = null
     private var panscanMutationInProgress = false
     private var handoffTracksBaseSurface = false
     private var handoffWaitingForFrame = 0L
     private var handoffExpectedSurfaceWidth = 0
     private var handoffExpectedSurfaceHeight = 0
+    private var handoffExpectedPresentationTime = 0L
     private var handoffToken = 0L
     private var pendingSurfaceTransition: ResolvedSurface? = null
     private var pendingTransitionNeedsQueueDrain = false
@@ -135,6 +138,7 @@ internal class VideoZoomGestures(
     // which keeps the original-detail Android surface selected for that frame.
     private var pendingPinchDoubleTapReset = false
     private var pinchSurfacePrepared = false
+    private var pinchCapturePrimed = false
 
     // Coalesce view property updates to vsync. We do not animate here; we only avoid
     // writing View properties multiple times in one display frame.
@@ -162,6 +166,7 @@ internal class VideoZoomGestures(
                  * devices that synthesize a different pointer sequence.
                  */
                 pinchSurfacePrepared = true
+                pinchCapturePrimed = false
                 updateRenderSurfaceForCurrentState(
                     force = true,
                     prepareForPinch = true,
@@ -214,6 +219,7 @@ internal class VideoZoomGestures(
 
             override fun onScaleEnd(detector: ScaleGestureDetector) {
                 pinchSurfacePrepared = false
+                pinchCapturePrimed = false
                 if (pendingPinchDoubleTapReset || scale <= PINCH_DOUBLE_TAP_RESET_SCALE) {
                     pendingPinchDoubleTapReset = true
                     resetLikeDoubleTapAfterPinch()
@@ -335,14 +341,19 @@ internal class VideoZoomGestures(
     /**
      * Run an aspect change that enters or leaves panscan as a visual transaction.
      *
-     * [changeAndSyncGeometry] must synchronously change mpv's aspect+panscan pair
-     * and then call setVideoGeometry() with the resulting values. The old frame is
-     * already visible in the overlay when it runs; the overlay is released only
-     * after frames from the final geometry have reached TextureView.
+     * [changeAndSyncGeometry] starts mpv's aspect+panscan transaction and calls
+     * its completion with the final buffer timestamp only after VO has presented
+     * the explicitly marked frame. The old frame remains visible in the overlay
+     * while the asynchronous pipeline crosses that boundary.
      */
-    fun performPanscanTransition(changeAndSyncGeometry: () -> Unit) {
+    fun performPanscanTransition(changeAndSyncGeometry: PanscanTransitionAction) {
         if (handoffReleased) {
-            changeAndSyncGeometry()
+            changeAndSyncGeometry {}
+            return
+        }
+
+        if (panscanMutationInProgress) {
+            deferredPanscanAction = changeAndSyncGeometry
             return
         }
 
@@ -434,6 +445,7 @@ internal class VideoZoomGestures(
         lastTapTime = 0L
         pendingPinchDoubleTapReset = false
         pinchSurfacePrepared = false
+        pinchCapturePrimed = false
         resetPanFilters(0f, 0f, SystemClock.uptimeMillis())
     }
 
@@ -463,12 +475,21 @@ internal class VideoZoomGestures(
         refreshMetricsFromTarget()
 
         /*
-         * ScaleGestureDetector waits until the two-finger span has moved beyond
-         * its slop before onScaleBegin(). Start only the asynchronous snapshot in
-         * that otherwise-idle interval. The mpv surface itself remains untouched,
-         * so the very first scale samples can transform the current frame without
-         * waiting for a SurfaceTexture resize.
+         * Prime the asynchronous snapshot on the first finger, before a pinch
+         * exists. On large Android 9 surfaces PixelCopy can occupy part of a GPU
+         * frame; moving it ahead of ACTION_POINTER_DOWN keeps that work out of
+         * the first scale samples. A normal one-finger tap simply discards the
+         * prepared frame. The mpv surface itself is not changed here.
          */
+        if (e.actionMasked == MotionEvent.ACTION_DOWN &&
+            !isZoomed() &&
+            !scaleDetector.isInProgress &&
+            !pendingPinchDoubleTapReset
+        ) {
+            pinchCapturePrimed = true
+            prewarmHandoffCapture()
+        }
+
         if (e.actionMasked == MotionEvent.ACTION_POINTER_DOWN &&
             e.pointerCount == 2 &&
             !isZoomed() &&
@@ -476,6 +497,7 @@ internal class VideoZoomGestures(
             !pendingPinchDoubleTapReset
         ) {
             pinchSurfacePrepared = true
+            pinchCapturePrimed = false
             prewarmHandoffCapture()
         }
 
@@ -491,10 +513,23 @@ internal class VideoZoomGestures(
                 e.actionMasked == MotionEvent.ACTION_CANCEL)
         if (unusedPinchPreparationEnded) {
             pinchSurfacePrepared = false
+            pinchCapturePrimed = false
             discardUnusedHandoffCapture()
             updateRenderSurfaceForCurrentState(force = true)
             applyToView()
             return true
+        }
+
+        val unusedCapturePrimeEnded =
+            pinchCapturePrimed &&
+                !pinchSurfacePrepared &&
+                !scaleDetector.isInProgress &&
+                !isZoomed() &&
+                (e.actionMasked == MotionEvent.ACTION_UP ||
+                    e.actionMasked == MotionEvent.ACTION_CANCEL)
+        if (unusedCapturePrimeEnded) {
+            pinchCapturePrimed = false
+            discardUnusedHandoffCapture()
         }
 
         // Pointer transitions during pinch:
@@ -1145,6 +1180,7 @@ internal class VideoZoomGestures(
             val captureStillWanted =
                 pendingCaptureSurfaceTransition != null ||
                     pendingPanscanAction != null ||
+                    pinchCapturePrimed ||
                     pinchSurfacePrepared ||
                     scaleDetector.isInProgress
             handoffCaptureReady = captureStillWanted
@@ -1240,18 +1276,28 @@ internal class VideoZoomGestures(
         }
     }
 
-    private fun applyPanscanWithoutSnapshot(action: () -> Unit) {
+    private fun applyPanscanWithoutSnapshot(action: PanscanTransitionAction) {
+        val token = ++handoffToken
         panscanMutationInProgress = true
         try {
-            action()
-        } finally {
+            action {
+                target.post {
+                    if (token != handoffToken || handoffReleased)
+                        return@post
+
+                    panscanMutationInProgress = false
+                    val fallback = resolveRenderSurface(
+                        isZoomed() || scaleDetector.isInProgress,
+                    )
+                    applyResolvedSurface(fallback)
+                    applyToView()
+                    completeHandoff()
+                }
+            }
+        } catch (_: Throwable) {
             panscanMutationInProgress = false
+            completeHandoff()
         }
-        val fallback = resolveRenderSurface(
-            isZoomed() || scaleDetector.isInProgress,
-        )
-        applyResolvedSurface(fallback)
-        applyToView()
     }
 
     private fun clearPendingCaptureTransition() {
@@ -1300,6 +1346,7 @@ internal class VideoZoomGestures(
         handoffWaitingForFrame = 0L
         handoffExpectedSurfaceWidth = 0
         handoffExpectedSurfaceHeight = 0
+        handoffExpectedPresentationTime = 0L
         handoffMatchingFramesRequired = 1
         handoffMatchingFramesSeen = 0
         handoffLastMatchingFrameSerial = 0L
@@ -1380,48 +1427,35 @@ internal class VideoZoomGestures(
             pendingSurfaceTransition = null
             pendingTransitionNeedsQueueDrain = false
 
-            /*
-             * The overlay's source frame is now committed. Apply both mpv
-             * properties and synchronously cache their final zoom geometry while
-             * the TextureView is covered, then expose only frames from that final
-             * configuration.
-             */
-            var actionSucceeded = false
+            // The source overlay is committed. Keep it visible while mpv carries
+            // the transaction marker through decoding and into a presented VO
+            // frame. The UI thread stays free to drain TextureView's BufferQueue.
             panscanMutationInProgress = true
             try {
-                panscanAction()
-                actionSucceeded = true
+                panscanAction { finalPresentationTime ->
+                    target.post {
+                        finishPanscanMutation(
+                            token = token,
+                            sourceMode = sourceMode,
+                            sourceCustomSize = sourceCustomSize,
+                            sourceWidth = sourceWidth,
+                            sourceHeight = sourceHeight,
+                            finalPresentationTime = finalPresentationTime,
+                            actionSucceeded = true,
+                        )
+                    }
+                }
             } catch (_: Throwable) {
-                // Keep the renderer alive even if a stale dialog callback arrives
-                // while the file is unloading.
-            } finally {
-                panscanMutationInProgress = false
+                finishPanscanMutation(
+                    token = token,
+                    sourceMode = sourceMode,
+                    sourceCustomSize = sourceCustomSize,
+                    sourceWidth = sourceWidth,
+                    sourceHeight = sourceHeight,
+                    finalPresentationTime = null,
+                    actionSucceeded = false,
+                )
             }
-            if (!actionSucceeded) {
-                completeHandoff()
-                return
-            }
-
-            val desired = resolveRenderSurface(
-                isZoomed() || scaleDetector.isInProgress,
-            )
-            val bufferGeometryChanges =
-                desired.customSize != sourceCustomSize ||
-                    (desired.customSize &&
-                        (desired.width != sourceWidth ||
-                            desired.height != sourceHeight))
-            val needsQueueDrain =
-                bufferGeometryChanges ||
-                    transitionNeedsOldBufferQueueDrain(
-                        source = sourceMode,
-                        destination = desired.mode,
-                    )
-            applyResolvedSurface(desired)
-            applyToView()
-            armHandoffForDestinationFrame(
-                desired = desired,
-                needsQueueDrain = needsQueueDrain,
-            )
             return
         }
 
@@ -1438,9 +1472,55 @@ internal class VideoZoomGestures(
         )
     }
 
+    private fun finishPanscanMutation(
+        token: Long,
+        sourceMode: RenderSurfaceMode,
+        sourceCustomSize: Boolean,
+        sourceWidth: Int,
+        sourceHeight: Int,
+        finalPresentationTime: Long?,
+        actionSucceeded: Boolean,
+    ) {
+        if (token != handoffToken || handoffReleased)
+            return
+
+        panscanMutationInProgress = false
+        if (!actionSucceeded) {
+            completeHandoff()
+            return
+        }
+
+        val desired = resolveRenderSurface(
+            isZoomed() || scaleDetector.isInProgress,
+        )
+        val bufferGeometryChanges =
+            desired.customSize != sourceCustomSize ||
+                (desired.customSize &&
+                    (desired.width != sourceWidth ||
+                        desired.height != sourceHeight))
+        val finalFrameIdentified = (finalPresentationTime ?: 0L) > 0L
+        val needsQueueDrain =
+            bufferGeometryChanges ||
+                (!finalFrameIdentified &&
+                    transitionNeedsOldBufferQueueDrain(
+                        source = sourceMode,
+                        destination = desired.mode,
+                    ))
+        applyResolvedSurface(desired)
+        applyToView()
+        armHandoffForDestinationFrame(
+            desired = desired,
+            needsQueueDrain = needsQueueDrain,
+            expectedPresentationTime =
+                if (bufferGeometryChanges) 0L
+                else finalPresentationTime ?: 0L,
+        )
+    }
+
     private fun armHandoffForDestinationFrame(
         desired: ResolvedSurface,
         needsQueueDrain: Boolean,
+        expectedPresentationTime: Long = 0L,
     ) {
         if (desired.customSize) {
             handoffExpectedSurfaceWidth = desired.width
@@ -1453,7 +1533,18 @@ internal class VideoZoomGestures(
             if (needsQueueDrain && isContinuouslyRenderingVideo()) 2 else 1
         handoffMatchingFramesSeen = 0
         handoffLastMatchingFrameSerial = 0L
+        handoffExpectedPresentationTime = expectedPresentationTime
         handoffWaitingForFrame = target.surfaceTextureFrameSerial + 1L
+
+        // The marked frame can be consumed before the command-completion post
+        // reaches the UI thread. SurfaceTexture preserves EGL's presentation
+        // timestamp, so an already-latched matching frame can be revealed now.
+        if (expectedPresentationTime > 0L &&
+            target.surfaceTexturePresentationTime >= expectedPresentationTime &&
+            destinationSurfaceGeometryIsCurrent()
+        ) {
+            completeHandoff()
+        }
     }
 
     fun onSurfaceFrameAvailable(frameSerial: Long) {
@@ -1473,6 +1564,10 @@ internal class VideoZoomGestures(
             handoffLastMatchingFrameSerial = 0L
             return
         }
+        if (handoffExpectedPresentationTime > 0L &&
+            target.surfaceTexturePresentationTime <
+                handoffExpectedPresentationTime
+        ) return
 
         if (frameSerial > handoffLastMatchingFrameSerial) {
             handoffLastMatchingFrameSerial = frameSerial
@@ -1505,9 +1600,9 @@ internal class VideoZoomGestures(
         // onSurfaceTextureUpdated only says that updateTexImage() ran; an old
         // BufferQueue entry can still produce that callback after a resize.
         // mpv's OSD dimensions identify the producer geometry, but not the
-        // individual BufferQueue entry consumed by this callback. Ownership
-        // and panscan surface changes therefore drain one additional advancing
-        // video entry before this method is allowed to reveal the TextureView.
+        // individual BufferQueue entry consumed by this callback. Resize
+        // handoffs therefore drain one additional advancing video entry. A
+        // same-size panscan transaction instead uses the exact EGL timestamp.
         val voWidth = MPVLib.getPropertyInt("osd-width") ?: return false
         val voHeight = MPVLib.getPropertyInt("osd-height") ?: return false
         return voWidth == expectedWidth && voHeight == expectedHeight
@@ -1578,6 +1673,8 @@ internal class VideoZoomGestures(
         pendingTransitionNeedsQueueDrain = false
         pendingPanscanAction = null
         deferredPanscanAction = null
+        panscanMutationInProgress = false
+        pinchCapturePrimed = false
         handoffCaptureRequested = false
         handoffCaptureRetryOnNextFrame = false
         handoffCaptureReady = false
@@ -1587,6 +1684,7 @@ internal class VideoZoomGestures(
         handoffWaitingForFrame = 0L
         handoffExpectedSurfaceWidth = 0
         handoffExpectedSurfaceHeight = 0
+        handoffExpectedPresentationTime = 0L
         handoffMatchingFramesRequired = 1
         handoffMatchingFramesSeen = 0
         handoffLastMatchingFrameSerial = 0L
