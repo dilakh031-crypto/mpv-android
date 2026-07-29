@@ -501,11 +501,7 @@ internal class MPVView(context: Context, attrs: AttributeSet) : BaseMPVView(cont
         return MPVLib.getPropertyDouble("video-params/aspect")?.let {
             if (it < 0.001)
                 return 0.0
-            val rot = MPVLib.getPropertyInt("video-params/rotate") ?: 0
-            if (rot % 180 == 90)
-                1.0 / it
-            else
-                it
+            orientAspectForVideoRotation(it)
         }
     }
 
@@ -516,9 +512,21 @@ internal class MPVView(context: Context, attrs: AttributeSet) : BaseMPVView(cont
      */
     fun getEffectiveVideoAspect(): Double? {
         parseAspectRatio(MPVLib.getPropertyString("video-aspect-override"))?.let {
-            return it
+            // video-aspect-override describes the unrotated frame. mpv applies
+            // display rotation afterwards, so a rotated 4:3 frame is shown as
+            // 3:4. Keeping that order here makes the Android zoom rectangle
+            // identical to mpv in both device orientations.
+            return orientAspectForVideoRotation(it)
         }
         return getVideoAspect()
+    }
+
+    private fun orientAspectForVideoRotation(aspect: Double): Double {
+        val rotation = ((MPVLib.getPropertyInt("video-params/rotate") ?: 0) % 360 + 360) % 360
+        return if (rotation == 90 || rotation == 270)
+            1.0 / aspect
+        else
+            aspect
     }
 
     fun getPanscan(): Double {
@@ -549,8 +557,8 @@ internal class MPVView(context: Context, attrs: AttributeSet) : BaseMPVView(cont
         val h = MPVLib.getPropertyInt("video-params/h") ?: return null
         if (w <= 0 || h <= 0)
             return null
-        val rot = MPVLib.getPropertyInt("video-params/rotate") ?: 0
-        return if (rot % 180 == 90) h to w else w to h
+        val rotation = ((MPVLib.getPropertyInt("video-params/rotate") ?: 0) % 360 + 360) % 360
+        return if (rotation == 90 || rotation == 270) h to w else w to h
     }
 
     fun setAudioSessionId(id: Int) {

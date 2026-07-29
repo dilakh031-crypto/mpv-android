@@ -15,7 +15,12 @@ abstract class BaseMPVView(context: Context, attrs: AttributeSet) : TextureView(
         // scale/translation much smoother than transforming a SurfaceView layer,
         // especially on older Android devices where SurfaceView composition is
         // quantized by SurfaceFlinger/HWC.
-        isOpaque = true
+        //
+        // The texture transform can intentionally leave letterbox space outside
+        // the media rectangle. Marking the view translucent lets the black player
+        // background fill that space instead of asking TextureView to treat stale
+        // texture pixels as opaque.
+        isOpaque = false
     }
 
     /**
@@ -99,7 +104,9 @@ abstract class BaseMPVView(context: Context, attrs: AttributeSet) : TextureView(
     private var renderSurfaceHeight = 0
     private var customRenderSurfaceSize = false
 
-    var onSurfaceTextureFrameAvailable: (() -> Unit)? = null
+    var onSurfaceTextureFrameAvailable: ((Long) -> Unit)? = null
+    var surfaceTextureFrameSerial: Long = 0L
+        private set
 
     /**
      * Set the real SurfaceTexture buffer size used by mpv without changing the
@@ -211,7 +218,8 @@ abstract class BaseMPVView(context: Context, attrs: AttributeSet) : TextureView(
     }
 
     override fun onSurfaceTextureUpdated(surface: SurfaceTexture) {
-        onSurfaceTextureFrameAvailable?.invoke()
+        surfaceTextureFrameSerial++
+        onSurfaceTextureFrameAvailable?.invoke(surfaceTextureFrameSerial)
     }
 
     companion object {
