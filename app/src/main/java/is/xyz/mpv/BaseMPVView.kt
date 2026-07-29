@@ -154,17 +154,6 @@ abstract class BaseMPVView(context: Context, attrs: AttributeSet) : TextureView(
             return
 
         texture.setDefaultBufferSize(renderSurfaceWidth, renderSurfaceHeight)
-        // Keep BufferQueue's producer geometry synchronized with mpv's logical
-        // output size. setDefaultBufferSize() controls the consumer default only;
-        // an active EGL producer can otherwise retain its previous buffer size
-        // for the first frame of a zoom transition.
-        if (!MPVLib.setSurfaceBufferSize(renderSurfaceWidth, renderSurfaceHeight)) {
-            Log.e(
-                TAG,
-                "failed to resize native surface to " +
-                    "${renderSurfaceWidth}x${renderSurfaceHeight}",
-            )
-        }
         MPVLib.setPropertyString("android-surface-size", "${renderSurfaceWidth}x${renderSurfaceHeight}")
     }
 
@@ -181,7 +170,7 @@ abstract class BaseMPVView(context: Context, attrs: AttributeSet) : TextureView(
         attachedSurface = surface
 
         MPVLib.attachSurface(surface)
-        applyRenderSurfaceSize()
+        MPVLib.setPropertyString("android-surface-size", "${renderSurfaceWidth}x${renderSurfaceHeight}")
         // This forces mpv to render subs/osd/whatever into our surface even if it would ordinarily not
         MPVLib.setOptionString("force-window", "yes")
 
