@@ -3011,7 +3011,10 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
         }
 
         picker.delay1 = player.subDelay ?: 0.0
-        picker.delay2 = if (player.secondarySid != -1) (player.secondarySubDelay ?: 0.0) else null
+        picker.delay2 = if (player.sid != -1 || player.secondarySid != -1)
+            (player.secondarySubDelay ?: 0.0)
+        else
+            null
 
         dialog.setOnShowListener {
 
