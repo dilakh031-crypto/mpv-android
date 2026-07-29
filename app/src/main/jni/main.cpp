@@ -28,6 +28,7 @@ extern "C" {
     jni_func(void, command, jobjectArray jarray);
     jni_func(jint, commandAsync, jobjectArray jarray, jlong userdata);
     jni_func(void, abortAsyncCommand, jlong userdata);
+    jni_func(jint, setAspectAndPanscan, jstring jaspect, jdouble panscan);
 };
 
 JavaVM *g_vm;
@@ -139,3 +140,47 @@ jni_func(void, abortAsyncCommand, jlong userdata) {
     mpv_abort_async_command(g_mpv, (uint64_t)userdata);
 }
 
+jni_func(jint, setAspectAndPanscan, jstring jaspect, jdouble panscan) {
+    CHECK_MPV_INIT();
+
+    if (!jaspect)
+        return MPV_ERROR_INVALID_PARAMETER;
+
+    const char *aspect = env->GetStringUTFChars(jaspect, NULL);
+    if (!aspect)
+        return MPV_ERROR_NOMEM;
+
+    // Aspect values used by the menu are deliberately restricted to mpv's
+    // numeric aspect syntax. This keeps the command-list argument unambiguous
+    // without relying on string escaping.
+    bool valid = aspect[0] != '\0';
+    size_t aspect_len = 0;
+    for (const char *p = aspect; valid && *p; ++p, ++aspect_len) {
+        valid = (*p >= '0' && *p <= '9') ||
+                *p == ':' || *p == '.' || *p == '-';
+        if (aspect_len >= 63)
+            valid = false;
+    }
+
+    char command[256];
+    int written = valid
+        ? snprintf(
+            command,
+            sizeof(command),
+            "no-osd set file-local-options/video-aspect-override %s ; "
+            "no-osd set file-local-options/panscan %.17g",
+            aspect,
+            (double)panscan)
+        : -1;
+
+    env->ReleaseStringUTFChars(jaspect, aspect);
+    if (written < 0 || written >= (int)sizeof(command))
+        return MPV_ERROR_INVALID_PARAMETER;
+
+    /*
+     * A parsed command list runs both synchronous setters under one core
+     * dispatch lock. mpv therefore coalesces the associated video update and
+     * cannot render the otherwise-visible intermediate aspect/panscan state.
+     */
+    return mpv_command_string(g_mpv, command);
+}
