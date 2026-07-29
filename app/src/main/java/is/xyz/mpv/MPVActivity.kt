@@ -2811,14 +2811,34 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
         val dialog = with(AlertDialog.Builder(this)) {
             setSingleChoiceItems(names, selectedIndex) { _, item ->
                 val ratio = ratios[item]
-                if (ratio == "panscan") {
-                    player.setFileLocalString("video-aspect-override", "-1")
-                    player.setFileLocalDouble("panscan", 1.0)
-                } else {
-                    player.setFileLocalString("video-aspect-override", ratio)
-                    player.setFileLocalDouble("panscan", 0.0)
+                val targetOverride = if (ratio == "panscan") "-1" else ratio
+                val targetPanscan = if (ratio == "panscan") 1.0 else 0.0
+                val targetAspect = try {
+                    player.getEffectiveVideoAspectForOverride(targetOverride)
+                } catch (_: Throwable) {
+                    null
                 }
-                player.persistCurrentFileState()
+                val targetPixelSize = try {
+                    player.getVideoPixelSize()
+                } catch (_: Throwable) {
+                    null
+                }
+                val applyMpvProperties = {
+                    player.setFileLocalString("video-aspect-override", targetOverride)
+                    player.setFileLocalDouble("panscan", targetPanscan)
+                    player.persistCurrentFileState()
+                }
+
+                if (::zoomGestures.isInitialized) {
+                    zoomGestures.applyAspectRatioTransition(
+                        aspect = targetAspect,
+                        pixelSize = targetPixelSize,
+                        panscanValue = targetPanscan,
+                        applyMpvProperties = applyMpvProperties,
+                    )
+                } else {
+                    applyMpvProperties()
+                }
                 // Keep dialog open (apply-in-place).
             }
             // "Cancel" behaves like Back (up to the advanced menu).

@@ -511,7 +511,17 @@ internal class MPVView(context: Context, attrs: AttributeSet) : BaseMPVView(cont
      * from mpv.conf, so the zoom render surface can keep the same geometry as mpv.
      */
     fun getEffectiveVideoAspect(): Double? {
-        parseAspectRatio(MPVLib.getPropertyString("video-aspect-override"))?.let {
+        return getEffectiveVideoAspectForOverride(
+            MPVLib.getPropertyString("video-aspect-override"),
+        )
+    }
+
+    /**
+     * Predict mpv's displayed aspect for a proposed unrotated override without
+     * changing mpv. Used to prepare an atomic aspect-menu render handoff.
+     */
+    fun getEffectiveVideoAspectForOverride(override: String?): Double? {
+        parseAspectRatio(override)?.let {
             // video-aspect-override describes the unrotated frame. mpv applies
             // display rotation afterwards, so a rotated 4:3 frame is shown as
             // 3:4. Keeping that order here makes the Android zoom rectangle
