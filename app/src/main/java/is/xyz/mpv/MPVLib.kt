@@ -20,6 +20,7 @@ object MPVLib {
     external fun destroy()
     external fun attachSurface(surface: Surface)
     external fun detachSurface()
+    external fun setSurfaceBufferSize(width: Int, height: Int): Boolean
 
     external fun command(cmd: Array<out String>)
     external fun commandAsync(cmd: Array<out String>, userdata: Long): Int
