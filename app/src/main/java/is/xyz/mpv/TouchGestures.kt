@@ -52,6 +52,8 @@ internal class TouchGestures(private val observer: TouchGesturesObserver) {
     // largest displacement seen before the gesture direction is locked
     private var maxAbsDx = 0f
     private var maxAbsDy = 0f
+    // latest point that still belonged clearly to the active movement axis
+    private var directionAnchor = PointF()
 
     private var width = 0f
     private var height = 0f
@@ -128,6 +130,75 @@ internal class TouchGestures(private val observer: TouchGesturesObserver) {
                 this == State.ControlBright
     }
 
+    private fun activationThreshold(gesture: State): Float {
+        return if (gesture == State.ControlSeek) trigger / 4 else trigger
+    }
+
+    private fun activateGesture(
+        gesture: State,
+        direction: Int,
+        p: PointF,
+        rebaseOrigin: Boolean,
+    ) {
+        stateDirection = direction
+        state = if (gesture == State.Down) State.Ignored else gesture
+        directionAnchor.set(p)
+
+        if (state == State.Ignored)
+            return
+
+        if (!state.isControl())
+            return
+
+        // Give the observer a chance to cache values before modifying them.
+        sendPropertyChange(PropertyChange.Init, 0f)
+
+        // Seeking always starts at zero delta to avoid an activation jump. When changing
+        // axes, every control starts from the turning point as though the new direction
+        // had begun there.
+        if (state == State.ControlSeek || rebaseOrigin) {
+            initialPos.set(p)
+            lastPos.set(p)
+        }
+    }
+
+    private fun processDirectionChange(p: PointF): Boolean {
+        val dx = p.x - directionAnchor.x
+        val dy = p.y - directionAnchor.y
+        val currentDelta = if (stateDirection == 0) abs(dx) else abs(dy)
+        val nextDelta = if (stateDirection == 0) abs(dy) else abs(dx)
+        val nextDirection = 1 - stateDirection
+        val nextGesture = if (nextDirection == 0) {
+            gestureHoriz
+        } else {
+            if (p.x > width / 2) gestureVertRight else gestureVertLeft
+        }
+
+        // Switching axes needs the normal movement threshold even when the target is Seek.
+        // The larger threshold separates a deliberate turn from the small sideways drift of
+        // a fast up/down swipe; once switched, Seek keeps its usual fine-grained updates.
+        val changedDirection =
+            nextDelta > trigger &&
+            (currentDelta == 0f || nextDelta / currentDelta >= DIRECTION_LOCK_RATIO)
+
+        if (changedDirection) {
+            if (state.isControl())
+                sendPropertyChange(PropertyChange.Finalize, 0f)
+            activateGesture(nextGesture, nextDirection, p, rebaseOrigin = true)
+            return true
+        }
+
+        // Keep following the current axis. Rebasing here prevents vertical up/down motion
+        // and its small sideways drift from later looking like a horizontal direction change.
+        val continuesCurrentDirection =
+            currentDelta > 0f &&
+            (nextDelta == 0f || currentDelta / nextDelta >= DIRECTION_LOCK_RATIO)
+        if (continuesCurrentDirection)
+            directionAnchor.set(p)
+
+        return false
+    }
+
     private fun processTap(p: PointF): Boolean {
         if (state == State.Up) {
             lastDownTime = SystemClock.uptimeMillis()
@@ -161,6 +232,11 @@ internal class TouchGestures(private val observer: TouchGesturesObserver) {
     }
 
     private fun processMovement(p: PointF): Boolean {
+        if (state != State.Up && state != State.Down && processDirectionChange(p))
+            return true
+        if (state == State.Ignored)
+            return true
+
         assertFloat(initialPos.x, initialPos.y)
         val dx = p.x - initialPos.x
         val dy = p.y - initialPos.y
@@ -190,40 +266,22 @@ internal class TouchGestures(private val observer: TouchGesturesObserver) {
                 // Direction is decided from the largest displacement seen during this touch,
                 // not only from the latest point. This makes a fast vertical up/down swipe stay
                 // vertical after returning near its starting Y coordinate.
-                val seekTrigger = trigger / 4
-
-                val horizThreshold = if (gestureHoriz == State.ControlSeek) seekTrigger else trigger
                 val vertGesture = if (initialPos.x > width / 2) gestureVertRight else gestureVertLeft
-                val vertThreshold = if (vertGesture == State.ControlSeek) seekTrigger else trigger
 
                 // Horizontal activation: require the gesture to be clearly horizontal.
                 val horizontalIntent =
-                    maxAbsDx > horizThreshold &&
+                    maxAbsDx > activationThreshold(gestureHoriz) &&
                     (maxAbsDy == 0f || maxAbsDx / maxAbsDy >= DIRECTION_LOCK_RATIO)
 
                 // Vertical activation: require the gesture to be clearly vertical.
                 val verticalIntent =
-                    maxAbsDy > vertThreshold &&
+                    maxAbsDy > activationThreshold(vertGesture) &&
                     (maxAbsDx == 0f || maxAbsDy / maxAbsDx >= DIRECTION_LOCK_RATIO)
 
                 if (horizontalIntent) {
-                    stateDirection = 0
-                    state = if (gestureHoriz == State.Down) State.Ignored else gestureHoriz
+                    activateGesture(gestureHoriz, 0, p, rebaseOrigin = false)
                 } else if (verticalIntent) {
-                    stateDirection = 1
-                    state = if (vertGesture == State.Down) State.Ignored else vertGesture
-                }
-
-                // Send Init so that it has a chance to cache values before we start modifying them.
-                if (state.isControl()) {
-                    sendPropertyChange(PropertyChange.Init, 0f)
-
-                    // Avoid a "jump" on activation: once we commit to seek, treat the current
-                    // point as the new origin so the first delta starts near 0.
-                    if (state == State.ControlSeek) {
-                        initialPos.set(p)
-                        lastPos.set(p)
-                    }
+                    activateGesture(vertGesture, 1, p, rebaseOrigin = false)
                 }
             }
             State.ControlSeek ->
