@@ -14,11 +14,18 @@ import `is`.xyz.mpv.MPVLib.MpvFormat.MPV_FORMAT_INT64
 import `is`.xyz.mpv.MPVLib.MpvFormat.MPV_FORMAT_NONE
 import `is`.xyz.mpv.MPVLib.MpvFormat.MPV_FORMAT_STRING
 import java.security.MessageDigest
+import java.util.concurrent.Executors
 import kotlin.reflect.KProperty
 
 internal class MPVView(context: Context, attrs: AttributeSet) : BaseMPVView(context, attrs) {
     private var watchLaterOptionsBeforeDisable: String? = null
     private var watchLaterOptionsSuppressed = false
+    private val geometryCommandExecutor =
+        Executors.newSingleThreadExecutor { task ->
+            Thread(task, "mpv-geometry-command").apply { isDaemon = true }
+        }
+    @Volatile
+    private var geometryCommandsReleased = false
 
     override fun initOptions() {
         val sharedPreferences = PreferenceManager.getDefaultSharedPreferences(context)
@@ -213,15 +220,42 @@ internal class MPVView(context: Context, attrs: AttributeSet) : BaseMPVView(cont
     }
 
     /**
-     * Change the two properties that define a panscan presentation in one mpv
-     * command-list transaction. Sending two independent client calls lets the
-     * renderer expose their intermediate combination for one frame.
+     * Change the two properties that define a panscan presentation. The patched
+     * mpv command completes only after VO has presented an explicitly marked
+     * frame from the final aspect+panscan state. Run it away from the UI thread:
+     * Android 9 must remain free to consume TextureView buffers while VO swaps.
      */
-    fun setFileLocalAspectAndPanscan(aspectOverride: String, panscan: Double): Boolean {
-        val result = MPVLib.setAspectAndPanscan(aspectOverride, panscan)
-        if (result < 0)
-            Log.e(TAG, "Atomic aspect/panscan command failed with mpv error $result")
-        return result >= 0
+    fun setFileLocalAspectAndPanscan(
+        aspectOverride: String,
+        panscan: Double,
+        onComplete: (Long?) -> Unit,
+    ) {
+        if (geometryCommandsReleased) {
+            post { onComplete(null) }
+            return
+        }
+
+        try {
+            geometryCommandExecutor.execute {
+                val result = MPVLib.setAspectAndPanscan(aspectOverride, panscan)
+                if (result < 0)
+                    Log.e(TAG, "Synchronized aspect/panscan command failed with mpv error $result")
+                post {
+                    if (!geometryCommandsReleased)
+                        onComplete(result.takeIf { it >= 0 })
+                }
+            }
+        } catch (_: Throwable) {
+            post {
+                if (!geometryCommandsReleased)
+                    onComplete(null)
+            }
+        }
+    }
+
+    fun releaseGeometryCommands() {
+        geometryCommandsReleased = true
+        geometryCommandExecutor.shutdownNow()
     }
 
     fun persistCurrentFileState() {

@@ -697,6 +697,7 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
             binding.player.onSurfaceTextureFrameAvailable = null
             zoomGestures.release()
         }
+        player.releaseGeometryCommands()
         player.destroy()
         super.onDestroy()
     }
@@ -2819,24 +2820,25 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
                     zoomGestures.hasPendingPanscanTransition()
 
                 if (transitionTouchesPanscan) {
-                    zoomGestures.performPanscanTransition {
-                        if (!player.setFileLocalAspectAndPanscan(
-                                targetOverride,
-                                targetPanscan,
-                            )
-                        ) {
-                            player.setFileLocalString(
-                                "video-aspect-override",
-                                targetOverride,
-                            )
-                            player.setFileLocalDouble("panscan", targetPanscan)
-                        }
-                        // The native command above is synchronous. Feed the final
-                        // combined geometry to the zoom renderer while the stable
-                        // source frame still covers TextureView.
-                        syncZoomSurfaceGeometryWhenReady()
-                        binding.player.post {
-                            player.persistCurrentFileState()
+                    zoomGestures.performPanscanTransition { transitionComplete ->
+                        player.setFileLocalAspectAndPanscan(
+                            targetOverride,
+                            targetPanscan,
+                        ) { finalPresentationTime ->
+                            if (finalPresentationTime == null) {
+                                player.setFileLocalString(
+                                    "video-aspect-override",
+                                    targetOverride,
+                                )
+                                player.setFileLocalDouble("panscan", targetPanscan)
+                            }
+                            // Feed the final combined geometry to the zoom renderer
+                            // while the stable source frame still covers TextureView.
+                            syncZoomSurfaceGeometryWhenReady()
+                            binding.player.post {
+                                player.persistCurrentFileState()
+                            }
+                            transitionComplete(finalPresentationTime)
                         }
                     }
                 } else {

@@ -24,7 +24,7 @@ object MPVLib {
     external fun command(cmd: Array<out String>)
     external fun commandAsync(cmd: Array<out String>, userdata: Long): Int
     external fun abortAsyncCommand(userdata: Long)
-    external fun setAspectAndPanscan(aspectOverride: String, panscan: Double): Int
+    external fun setAspectAndPanscan(aspectOverride: String, panscan: Double): Long
 
     external fun setOptionString(name: String, value: String): Int
 

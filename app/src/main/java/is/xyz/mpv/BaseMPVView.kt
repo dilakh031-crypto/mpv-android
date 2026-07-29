@@ -111,6 +111,8 @@ abstract class BaseMPVView(context: Context, attrs: AttributeSet) : TextureView(
     var onSurfaceTextureFrameAvailable: ((Long) -> Unit)? = null
     var surfaceTextureFrameSerial: Long = 0L
         private set
+    var surfaceTexturePresentationTime: Long = 0L
+        private set
 
     /**
      * Copy the latest producer buffer without synchronously reading TextureView
@@ -203,6 +205,7 @@ abstract class BaseMPVView(context: Context, attrs: AttributeSet) : TextureView(
             return
 
         attachedTexture = texture
+        surfaceTexturePresentationTime = 0L
         ensureRenderSurfaceSize(width, height)
         texture.setDefaultBufferSize(renderSurfaceWidth, renderSurfaceHeight)
 
@@ -238,6 +241,7 @@ abstract class BaseMPVView(context: Context, attrs: AttributeSet) : TextureView(
         surface.release()
         attachedSurface = null
         attachedTexture = null
+        surfaceTexturePresentationTime = 0L
     }
 
     // Texture callbacks
@@ -258,6 +262,7 @@ abstract class BaseMPVView(context: Context, attrs: AttributeSet) : TextureView(
 
     override fun onSurfaceTextureUpdated(surface: SurfaceTexture) {
         surfaceTextureFrameSerial++
+        surfaceTexturePresentationTime = surface.timestamp
         onSurfaceTextureFrameAvailable?.invoke(surfaceTextureFrameSerial)
     }
 
