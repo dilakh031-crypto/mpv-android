@@ -1,10 +1,19 @@
 package `is`.xyz.mpv
 
+import android.graphics.Bitmap
+import android.graphics.Matrix
+import android.os.Build
 import android.os.SystemClock
 import android.view.Choreographer
 import android.view.MotionEvent
+import android.view.PixelCopy
 import android.view.ScaleGestureDetector
+import android.view.View
 import android.view.ViewConfiguration
+import android.view.ViewTreeObserver
+import android.widget.ImageView
+import java.util.concurrent.ExecutorService
+import java.util.concurrent.Executors
 import kotlin.math.PI
 import kotlin.math.abs
 import kotlin.math.ceil
@@ -17,20 +26,25 @@ import kotlin.math.sqrt
  * Pinch-to-zoom + pan for mpv output.
  *
  * Rendering has two explicit owners:
- *  - At scale 1 mpv renders into a window-sized FBO and remains the sole owner
- *    of scaling, aspect ratio, panscan and rotation.
- *  - While zoomed, mpv renders a source-detail FBO and the final GPU pass
- *    applies the original edited build's zoom/pan transform.
+ *  - At scale 1 the TextureView buffer is exactly the Android window size and its
+ *    texture matrix is identity. mpv therefore owns scaling, aspect ratio and
+ *    rotation just like the release renderer; Android does not minify an already
+ *    downscaled hardware layer a second time.
+ *  - While zoomed, mpv renders a source-detail, media-aspect buffer and Android's
+ *    View properties perform zoom/pan exactly as in the original edited build.
  *
- * The TextureView BufferQueue itself never changes size during either operation.
- * The native renderer keeps the old FBO visible until a complete replacement is
- * ready, so neither TextureView.getBitmap() nor a UI-thread surface resize is
- * needed at the first pinch frame.
+ * SurfaceTexture cannot atomically change both buffer geometry and the View
+ * transform. A two-phase handoff first commits the last valid frame in a
+ * lightweight overlay, then changes ownership behind that already-visible
+ * overlay. It is removed only after confirmed TextureView updates whose mpv
+ * output dimensions match the destination surface. This is event-driven:
+ * there is no delay, blackout, or guessed grace period.
  *
  * We do not use mpv video-pan/video-zoom for finger movement.
  */
 internal class VideoZoomGestures(
     private val target: BaseMPVView,
+    private val handoffOverlay: ImageView,
 ) {
     private var viewWidth = 0f
     private var viewHeight = 0f
@@ -77,10 +91,48 @@ internal class VideoZoomGestures(
     private var customSurfaceWidth = 0
     private var customSurfaceHeight = 0
 
+    private val handoffTransform = Matrix()
+    private var handoffBitmap: Bitmap? = null
+    private val handoffBitmapExecutor: ExecutorService =
+        Executors.newSingleThreadExecutor { task ->
+            Thread(task, "mpv-handoff-bitmap").apply { isDaemon = true }
+        }
+    private var handoffReleased = false
+    private var handoffBitmapGeneration = 0L
+    private var handoffBitmapAllocationInFlight = false
+    private var handoffCaptureGeneration = 0L
+    private var handoffCaptureRequested = false
+    private var handoffCaptureInFlight = false
+    private var handoffCaptureReady = false
+    private var handoffCaptureRetryOnNextFrame = false
+    private var handoffCaptureAttempts = 0
+    private var pendingCaptureSurfaceTransition: ResolvedSurface? = null
+    private var pendingCaptureNeedsQueueDrain = false
+    private var pendingCaptureSourceTransform: Matrix? = null
+    private var pendingCaptureTracksBaseSurface = false
+    private var pendingPanscanAction: (() -> Unit)? = null
+    private var deferredPanscanAction: (() -> Unit)? = null
+    private var panscanMutationInProgress = false
+    private var handoffTracksBaseSurface = false
+    private var handoffWaitingForFrame = 0L
+    private var handoffExpectedSurfaceWidth = 0
+    private var handoffExpectedSurfaceHeight = 0
+    private var handoffToken = 0L
+    private var pendingSurfaceTransition: ResolvedSurface? = null
+    private var pendingTransitionNeedsQueueDrain = false
+    private var handoffMatchingFramesRequired = 1
+    private var handoffMatchingFramesSeen = 0
+    private var handoffLastMatchingFrameSerial = 0L
+    private var handoffPreDrawObserver: ViewTreeObserver? = null
+    private var handoffPreDrawListener: ViewTreeObserver.OnPreDrawListener? = null
+    private var handoffFrameCommitObserver: ViewTreeObserver? = null
+    private var handoffFrameCommitCallback: Runnable? = null
+    private var handoffCommitPostedForToken = 0L
+
     // When a pinch returns close enough to normal size, finish it through the
     // same delayed reset path as double-tap. Calling reset() directly from
     // onScaleEnd still sees ScaleGestureDetector as in-progress on some devices,
-    // which keeps the original-detail FBO selected for that frame.
+    // which keeps the original-detail Android surface selected for that frame.
     private var pendingPinchDoubleTapReset = false
     private var pinchSurfacePrepared = false
 
@@ -177,6 +229,7 @@ internal class VideoZoomGestures(
         viewWidth = width
         viewHeight = height
         refreshMetricsFromTarget()
+        preallocateHandoffBitmap()
         if (isZoomed() || scaleDetector.isInProgress) {
             clampTranslationToVideoContent()
             updateRenderSurfaceForCurrentState(force = true)
@@ -229,6 +282,14 @@ internal class VideoZoomGestures(
             nextPixelWidth != videoPixelWidth ||
             nextPixelHeight != videoPixelHeight ||
             nextPanscan != panscan
+        val sourceTransform = if (geometryChanged &&
+            (isZoomed() || scaleDetector.isInProgress) &&
+            renderSurfaceMode != RenderSurfaceMode.BASE
+        ) {
+            matrixForMode(renderSurfaceMode, Matrix())
+        } else {
+            null
+        }
 
         videoAspect = nextAspect
         videoPixelWidth = nextPixelWidth
@@ -238,8 +299,20 @@ internal class VideoZoomGestures(
         if (isZoomed() || scaleDetector.isInProgress)
             clampTranslationToVideoContent()
 
-        if (geometryChanged)
-            updateRenderSurfaceForCurrentState(force = true)
+        /*
+         * A panscan menu transaction updates mpv only after the old frame overlay
+         * has been committed. Its caller immediately feeds the final, combined
+         * geometry back through this method. Cache that geometry here; the
+         * transaction commits the matching SurfaceTexture size and View transform
+         * together after the callback returns.
+         */
+        if (panscanMutationInProgress)
+            return
+
+        updateRenderSurfaceForCurrentState(
+            force = true,
+            handoffSourceTransform = sourceTransform,
+        )
         if (immediate)
             applyToView()
         else
@@ -254,6 +327,59 @@ internal class VideoZoomGestures(
 
     fun isZoomed(): Boolean = scale > 1f + EPS
 
+    fun hasPendingPanscanTransition(): Boolean =
+        pendingPanscanAction != null ||
+            deferredPanscanAction != null ||
+            panscanMutationInProgress
+
+    /**
+     * Run an aspect change that enters or leaves panscan as a visual transaction.
+     *
+     * [changeAndSyncGeometry] must synchronously change mpv's aspect+panscan pair
+     * and then call setVideoGeometry() with the resulting values. The old frame is
+     * already visible in the overlay when it runs; the overlay is released only
+     * after frames from the final geometry have reached TextureView.
+     */
+    fun performPanscanTransition(changeAndSyncGeometry: () -> Unit) {
+        if (handoffReleased) {
+            changeAndSyncGeometry()
+            return
+        }
+
+        if (handoffOverlay.visibility == View.VISIBLE) {
+            if (pendingPanscanAction != null &&
+                handoffWaitingForFrame == 0L
+            ) {
+                // The source overlay is visible but the property transaction has
+                // not run yet. Replace it in place so rapid menu taps apply only
+                // the user's newest choice.
+                pendingPanscanAction = changeAndSyncGeometry
+                return
+            }
+
+            // A menu choice can race the tail of a zoom ownership handoff. Keep
+            // only the newest choice and start it from the fully committed frame.
+            deferredPanscanAction = changeAndSyncGeometry
+            return
+        }
+        if (pendingSurfaceTransition != null) {
+            deferredPanscanAction = changeAndSyncGeometry
+            return
+        }
+
+        pendingPanscanAction = changeAndSyncGeometry
+        pendingCaptureSurfaceTransition = null
+        pendingCaptureNeedsQueueDrain = false
+        pendingCaptureSourceTransform = matrixForMode(renderSurfaceMode, Matrix())
+        pendingCaptureTracksBaseSurface = false
+
+        if (!requestHandoffCapture()) {
+            pendingPanscanAction = null
+            pendingCaptureSourceTransform = null
+            applyPanscanWithoutSnapshot(changeAndSyncGeometry)
+        }
+    }
+
     fun shouldBlockOtherGestures(e: MotionEvent): Boolean {
         return isZoomed() || pendingPinchDoubleTapReset || scaleDetector.isInProgress || e.pointerCount > 1
     }
@@ -261,8 +387,8 @@ internal class VideoZoomGestures(
     fun reset() {
         resetTransformState()
 
-        // Request mpv's window-sized FBO. The native renderer keeps the complete
-        // zoom frame visible until the complete base frame is ready.
+        // Hand rendering back to mpv's window-sized surface. The last valid zoom
+        // frame covers the buffer-geometry change until mpv posts its base frame.
         updateRenderSurfaceForCurrentState(force = true)
         applyToView()
     }
@@ -273,7 +399,9 @@ internal class VideoZoomGestures(
         videoPixelWidth = 0
         videoPixelHeight = 0
         panscan = 0.0
+        cancelHandoff()
         renderSurfaceMode = RenderSurfaceMode.BASE
+        target.resetRenderSurfaceSize()
         customSurfaceSize = false
         customSurfaceWidth = 0
         customSurfaceHeight = 0
@@ -282,7 +410,9 @@ internal class VideoZoomGestures(
 
     fun prepareForWindowExit() {
         resetTransformState()
+        cancelHandoff()
         renderSurfaceMode = RenderSurfaceMode.BASE
+        target.resetRenderSurfaceSize()
         customSurfaceSize = false
         customSurfaceWidth = 0
         customSurfaceHeight = 0
@@ -318,7 +448,7 @@ internal class VideoZoomGestures(
                 return@post
 
             // This is intentionally the same reset action used by double-tap,
-            // but deferred until the pinch detector has fully ended so FBO
+            // but deferred until the pinch detector has fully ended so surface
             // selection follows the smooth double-tap path.
             reset()
         }
@@ -334,8 +464,10 @@ internal class VideoZoomGestures(
 
         /*
          * ScaleGestureDetector waits until the two-finger span has moved beyond
-         * its slop before onScaleBegin(). Use that otherwise-idle interval to
-         * prepare the high-detail FBO before the first visible scale sample.
+         * its slop before onScaleBegin(). Start only the asynchronous snapshot in
+         * that otherwise-idle interval. The mpv surface itself remains untouched,
+         * so the very first scale samples can transform the current frame without
+         * waiting for a SurfaceTexture resize.
          */
         if (e.actionMasked == MotionEvent.ACTION_POINTER_DOWN &&
             e.pointerCount == 2 &&
@@ -344,11 +476,7 @@ internal class VideoZoomGestures(
             !pendingPinchDoubleTapReset
         ) {
             pinchSurfacePrepared = true
-            updateRenderSurfaceForCurrentState(
-                force = true,
-                prepareForPinch = true,
-            )
-            applyToView()
+            prewarmHandoffCapture()
         }
 
         // Always feed the scale detector first.
@@ -363,6 +491,7 @@ internal class VideoZoomGestures(
                 e.actionMasked == MotionEvent.ACTION_CANCEL)
         if (unusedPinchPreparationEnded) {
             pinchSurfacePrepared = false
+            discardUnusedHandoffCapture()
             updateRenderSurfaceForCurrentState(force = true)
             applyToView()
             return true
@@ -629,36 +758,42 @@ internal class VideoZoomGestures(
     }
 
     private fun applyToView() {
+        // Preserve the original zoom implementation: scaling and translation are
+        // View properties, not a TextureView content matrix. Besides retaining the
+        // established gesture feel, this leaves TextureView's internal sampling
+        // path unchanged while the user pinches and pans.
+        //
+        // In BASE mode scale=1 and fit is identity, so normal playback is still
+        // passed through untouched and mpv remains the sole scaling/aspect owner.
         val fit = renderSurfaceFitTransform(renderSurfaceMode)
-        val safeViewWidth = ceilToIntAtLeastOne(viewWidth.toDouble())
-        val safeViewHeight = ceilToIntAtLeastOne(viewHeight.toDouble())
-        val renderWidth =
-            if (customSurfaceSize) customSurfaceWidth else safeViewWidth
-        val renderHeight =
-            if (customSurfaceSize) customSurfaceHeight else safeViewHeight
 
-        // Keep the TextureView's Android layer fixed. The render thread applies
-        // the exact same scale/translation math while sampling the source-detail
-        // FBO directly, avoiding a screen-resolution intermediate image.
         target.pivotX = 0f
         target.pivotY = 0f
-        target.scaleX = 1f
-        target.scaleY = 1f
-        target.translationX = 0f
-        target.translationY = 0f
-        target.submitRenderState(
-            renderWidth = renderWidth,
-            renderHeight = renderHeight,
-            viewWidth = safeViewWidth,
-            viewHeight = safeViewHeight,
-            scale = scale,
-            translationX = tx.toFloat(),
-            translationY = ty.toFloat(),
-            fitScaleX = fit.scaleX,
-            fitScaleY = fit.scaleY,
-            fitTranslationX = fit.translationX.toFloat(),
-            fitTranslationY = fit.translationY.toFloat(),
+        target.scaleX = scale * fit.scaleX
+        target.scaleY = scale * fit.scaleY
+        target.translationX = (tx + scale * fit.translationX).toFloat()
+        target.translationY = (ty + scale * fit.translationY).toFloat()
+
+        if (handoffOverlay.visibility == View.VISIBLE && handoffTracksBaseSurface) {
+            matrixForMode(RenderSurfaceMode.BASE, handoffTransform)
+            handoffOverlay.imageMatrix = handoffTransform
+        }
+    }
+
+    private fun matrixForMode(mode: RenderSurfaceMode, out: Matrix): Matrix {
+        val fit = renderSurfaceFitTransform(mode)
+        val scaleX = scale * fit.scaleX
+        val scaleY = scale * fit.scaleY
+        val translationX = (tx + scale * fit.translationX).toFloat()
+        val translationY = (ty + scale * fit.translationY).toFloat()
+        out.setValues(
+            floatArrayOf(
+                scaleX, 0f, translationX,
+                0f, scaleY, translationY,
+                0f, 0f, 1f,
+            ),
         )
+        return out
     }
 
     private fun renderSurfaceFitTransform(mode: RenderSurfaceMode): SurfaceFitTransform {
@@ -679,6 +814,7 @@ internal class VideoZoomGestures(
 
     private fun updateRenderSurfaceForCurrentState(
         force: Boolean,
+        handoffSourceTransform: Matrix? = null,
         prepareForPinch: Boolean = false,
     ) {
         val zooming =
@@ -690,10 +826,56 @@ internal class VideoZoomGestures(
         val bufferChanged = desired.customSize != customSurfaceSize ||
             (desired.customSize &&
                 (desired.width != customSurfaceWidth || desired.height != customSurfaceHeight))
-        val needsApply = force || modeChanged || bufferChanged
+        val geometryTransition = handoffSourceTransform != null
+        val needsApply = force || modeChanged || bufferChanged || geometryTransition
         if (!needsApply)
             return
 
+        /*
+         * A transition can be superseded before the overlay's first draw (for
+         * example a very short pinch that immediately returns to scale 1).
+         * If the latest desired surface is still the active one, discard the
+         * queued transition instead of committing its stale destination later.
+         */
+        if (!modeChanged && !bufferChanged && !geometryTransition) {
+            if (pendingSurfaceTransition != null)
+                cancelHandoff()
+            if (pendingPanscanAction == null)
+                clearPendingCaptureTransition()
+            applyResolvedSurface(desired)
+            applyToView()
+            return
+        }
+
+        val shouldHandoff =
+            (modeChanged || bufferChanged || geometryTransition) &&
+            (renderSurfaceMode != RenderSurfaceMode.BASE ||
+                desired.mode != RenderSurfaceMode.BASE)
+        if (shouldHandoff) {
+            val needsQueueDrain =
+                transitionNeedsOldBufferQueueDrain(
+                    source = renderSurfaceMode,
+                    destination = desired.mode,
+                )
+            val sourceMatrix = handoffSourceTransform
+                ?: matrixForMode(renderSurfaceMode, Matrix())
+            val handoffQueued = requestSurfaceHandoff(
+                desired = desired,
+                needsQueueDrain = needsQueueDrain,
+                sourceMatrix = sourceMatrix,
+                trackBaseSurface = renderSurfaceMode == RenderSurfaceMode.BASE &&
+                    desired.mode != RenderSurfaceMode.BASE,
+            )
+            if (handoffQueued)
+                return
+        }
+
+        // PixelCopy is deliberately best-effort. If the producer has no copyable
+        // frame (for example protected content), preserve playback by applying the
+        // destination directly instead of blocking the gesture.
+        clearPendingCaptureTransition()
+        pendingSurfaceTransition = null
+        pendingTransitionNeedsQueueDrain = false
         applyResolvedSurface(desired)
         applyToView()
     }
@@ -701,10 +883,12 @@ internal class VideoZoomGestures(
     private fun applyResolvedSurface(desired: ResolvedSurface) {
         renderSurfaceMode = desired.mode
         if (desired.customSize) {
+            target.setRenderSurfaceSize(desired.width, desired.height)
             customSurfaceSize = true
             customSurfaceWidth = desired.width
             customSurfaceHeight = desired.height
         } else {
+            target.resetRenderSurfaceSize()
             customSurfaceSize = false
             customSurfaceWidth = 0
             customSurfaceHeight = 0
@@ -753,11 +937,677 @@ internal class VideoZoomGestures(
         )
     }
 
+    private fun requestSurfaceHandoff(
+        desired: ResolvedSurface,
+        needsQueueDrain: Boolean,
+        sourceMatrix: Matrix,
+        trackBaseSurface: Boolean,
+    ): Boolean {
+        if (handoffOverlay.visibility == View.VISIBLE) {
+            // Keep the already-visible valid frame when geometry is refined before
+            // the destination frame arrives.
+            handoffTracksBaseSurface =
+                handoffTracksBaseSurface || trackBaseSurface
+            queueSurfaceTransition(desired, needsQueueDrain)
+            return true
+        }
+
+        pendingCaptureSurfaceTransition = desired
+        pendingCaptureNeedsQueueDrain =
+            pendingCaptureNeedsQueueDrain || needsQueueDrain
+        pendingCaptureSourceTransform = Matrix(sourceMatrix)
+        pendingCaptureTracksBaseSurface =
+            pendingCaptureTracksBaseSurface || trackBaseSurface
+
+        if (showCapturedHandoffIfPending())
+            return true
+        if (requestHandoffCapture())
+            return true
+
+        clearPendingCaptureTransition()
+        return false
+    }
+
+    private fun prewarmHandoffCapture() {
+        if (handoffReleased ||
+            handoffOverlay.visibility == View.VISIBLE ||
+            Build.VERSION.SDK_INT < Build.VERSION_CODES.N
+        ) return
+
+        requestHandoffCapture()
+    }
+
+    private fun preallocateHandoffBitmap() {
+        if (handoffReleased || handoffOverlay.visibility == View.VISIBLE)
+            return
+        ensureHandoffBitmapAllocated()
+    }
+
+    private fun ensureHandoffBitmapAllocated(): Boolean {
+        val width = target.width
+        val height = target.height
+        if (handoffReleased || width <= 1 || height <= 1)
+            return false
+
+        val current = handoffBitmap
+        if (current != null && !current.isRecycled &&
+            current.width == width && current.height == height
+        ) return true
+
+        // PixelCopy owns the destination bitmap until its callback. Never recycle
+        // or replace that bitmap during a configuration/layout change.
+        if (handoffCaptureInFlight)
+            return true
+
+        if (handoffBitmapAllocationInFlight)
+            return true
+
+        handoffBitmapAllocationInFlight = true
+        val generation = ++handoffBitmapGeneration
+        return try {
+            handoffBitmapExecutor.execute {
+                val allocated = try {
+                    Bitmap.createBitmap(
+                        target.resources.displayMetrics,
+                        width,
+                        height,
+                        Bitmap.Config.ARGB_8888,
+                    )
+                } catch (_: Throwable) {
+                    null
+                }
+
+                target.post {
+                    if (handoffReleased || generation != handoffBitmapGeneration) {
+                        allocated?.recycle()
+                        return@post
+                    }
+
+                    handoffBitmapAllocationInFlight = false
+                    if (allocated == null ||
+                        target.width != width || target.height != height
+                    ) {
+                        allocated?.recycle()
+                        if (handoffCaptureRequested)
+                            requestHandoffCapture()
+                        return@post
+                    }
+
+                    val old = handoffBitmap
+                    handoffBitmap = allocated
+                    if (old !== allocated && old != null && !old.isRecycled)
+                        old.recycle()
+
+                    if (handoffCaptureRequested)
+                        startHandoffFrameCopy()
+                }
+            }
+            true
+        } catch (_: Throwable) {
+            handoffBitmapAllocationInFlight = false
+            false
+        }
+    }
+
+    private fun requestHandoffCapture(): Boolean {
+        val width = target.width
+        val height = target.height
+        if (handoffReleased ||
+            !target.isAvailable ||
+            target.surfaceTextureFrameSerial <= 0L ||
+            width <= 1 || height <= 1
+        ) return false
+
+        if (handoffCaptureReady) {
+            if (showCapturedHandoffIfPending())
+                return true
+            return true
+        }
+
+        if (!handoffCaptureRequested)
+            handoffCaptureAttempts = 0
+        handoffCaptureRequested = true
+
+        if (handoffCaptureInFlight ||
+            handoffBitmapAllocationInFlight ||
+            handoffCaptureRetryOnNextFrame
+        ) return true
+
+        if (!ensureHandoffBitmapAllocated())
+            return false
+        if (handoffBitmapAllocationInFlight)
+            return true
+
+        return startHandoffFrameCopy()
+    }
+
+    private fun startHandoffFrameCopy(): Boolean {
+        if (handoffReleased || handoffCaptureInFlight)
+            return false
+
+        val bitmap = handoffBitmap
+        if (bitmap == null || bitmap.isRecycled ||
+            bitmap.width != target.width || bitmap.height != target.height
+        ) {
+            return ensureHandoffBitmapAllocated()
+        }
+
+        handoffCaptureRetryOnNextFrame = false
+        handoffCaptureAttempts++
+
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.N) {
+            // PixelCopy does not exist on API 21-23. Retain the release-compatible
+            // fallback there; Android 9 and newer always take the asynchronous path.
+            return try {
+                target.getBitmap(bitmap)
+                handoffCaptureRequested = false
+                handoffCaptureReady = true
+                showCapturedHandoffIfPending()
+                true
+            } catch (_: Throwable) {
+                handoffCaptureRequested = false
+                handoffCaptureReady = false
+                false
+            }
+        }
+
+        handoffCaptureInFlight = true
+        val captureGeneration = ++handoffCaptureGeneration
+        val started = target.requestSurfaceFrameCopy(bitmap) { result ->
+            onHandoffFrameCopyFinished(captureGeneration, result)
+        }
+        if (!started) {
+            handoffCaptureInFlight = false
+            handoffCaptureRequested = false
+            return false
+        }
+        return true
+    }
+
+    private fun onHandoffFrameCopyFinished(generation: Long, result: Int) {
+        handoffCaptureInFlight = false
+        if (handoffReleased)
+            return
+        if (generation != handoffCaptureGeneration) {
+            if (handoffCaptureRequested)
+                requestHandoffCapture()
+            return
+        }
+
+        val bitmap = handoffBitmap
+        val copiedCurrentGeometry =
+            bitmap != null && !bitmap.isRecycled &&
+                bitmap.width == target.width && bitmap.height == target.height
+        if (result == PixelCopy.SUCCESS && copiedCurrentGeometry) {
+            handoffCaptureRetryOnNextFrame = false
+            handoffCaptureRequested = false
+
+            val captureStillWanted =
+                pendingCaptureSurfaceTransition != null ||
+                    pendingPanscanAction != null ||
+                    pinchSurfacePrepared ||
+                    scaleDetector.isInProgress
+            handoffCaptureReady = captureStillWanted
+            if (captureStillWanted)
+                showCapturedHandoffIfPending()
+            return
+        }
+
+        if (result == PixelCopy.SUCCESS) {
+            handoffCaptureReady = false
+            if (handoffCaptureRequested ||
+                pendingCaptureSurfaceTransition != null ||
+                pendingPanscanAction != null
+            ) {
+                handoffCaptureRequested = true
+                requestHandoffCapture()
+            }
+            return
+        }
+
+        handoffCaptureReady = false
+        val retryable =
+            result == PixelCopy.ERROR_SOURCE_NO_DATA ||
+                result == PixelCopy.ERROR_TIMEOUT ||
+                result == PixelCopy.ERROR_UNKNOWN
+        if (retryable &&
+            handoffCaptureAttempts < MAX_HANDOFF_COPY_ATTEMPTS &&
+            handoffCaptureRequested
+        ) {
+            handoffCaptureRetryOnNextFrame = true
+            return
+        }
+
+        handoffCaptureRequested = false
+        handoffCaptureRetryOnNextFrame = false
+        finishPendingHandoffWithoutSnapshot()
+    }
+
+    private fun showCapturedHandoffIfPending(): Boolean {
+        if (!handoffCaptureReady || handoffOverlay.visibility == View.VISIBLE)
+            return false
+        if (pendingCaptureSurfaceTransition == null && pendingPanscanAction == null)
+            return false
+
+        val bitmap = handoffBitmap
+        if (bitmap == null || bitmap.isRecycled)
+            return false
+
+        val sourceTransform = pendingCaptureSourceTransform ?: Matrix()
+        handoffTransform.set(
+            if (pendingCaptureTracksBaseSurface)
+                matrixForMode(RenderSurfaceMode.BASE, Matrix())
+            else
+                sourceTransform,
+        )
+        handoffOverlay.setImageBitmap(bitmap)
+        handoffOverlay.imageMatrix = handoffTransform
+        handoffOverlay.visibility = View.VISIBLE
+        handoffTracksBaseSurface = pendingCaptureTracksBaseSurface
+        handoffCaptureReady = false
+
+        if (pendingPanscanAction != null) {
+            pendingCaptureSourceTransform = null
+            pendingCaptureTracksBaseSurface = false
+            queuePanscanTransition()
+            return true
+        }
+
+        val desired = pendingCaptureSurfaceTransition ?: return false
+        val needsQueueDrain = pendingCaptureNeedsQueueDrain
+        pendingCaptureSurfaceTransition = null
+        pendingCaptureNeedsQueueDrain = false
+        pendingCaptureSourceTransform = null
+        pendingCaptureTracksBaseSurface = false
+        queueSurfaceTransition(desired, needsQueueDrain)
+        return true
+    }
+
+    private fun finishPendingHandoffWithoutSnapshot() {
+        val panscanAction = pendingPanscanAction
+        val desired = pendingCaptureSurfaceTransition
+
+        pendingPanscanAction = null
+        clearPendingCaptureTransition()
+
+        if (panscanAction != null) {
+            applyPanscanWithoutSnapshot(panscanAction)
+            return
+        }
+        if (desired != null) {
+            applyResolvedSurface(desired)
+            applyToView()
+        }
+    }
+
+    private fun applyPanscanWithoutSnapshot(action: () -> Unit) {
+        panscanMutationInProgress = true
+        try {
+            action()
+        } finally {
+            panscanMutationInProgress = false
+        }
+        val fallback = resolveRenderSurface(
+            isZoomed() || scaleDetector.isInProgress,
+        )
+        applyResolvedSurface(fallback)
+        applyToView()
+    }
+
+    private fun clearPendingCaptureTransition() {
+        pendingCaptureSurfaceTransition = null
+        pendingCaptureNeedsQueueDrain = false
+        pendingCaptureSourceTransform = null
+        pendingCaptureTracksBaseSurface = false
+    }
+
+    private fun discardUnusedHandoffCapture() {
+        clearPendingCaptureTransition()
+        if (pendingPanscanAction == null) {
+            handoffCaptureRequested = false
+            handoffCaptureRetryOnNextFrame = false
+            handoffCaptureReady = false
+        }
+    }
+
+    /**
+     * Do not resize the producer in the same UI turn that makes the overlay
+     * visible. With continuously playing video, a queued SurfaceTexture update
+     * can otherwise become visible before Android has drawn the overlay.
+     *
+     * OnPreDraw lets the current pass draw the stable source image. On Android
+     * 10+ the surface mutation waits for that frame's commit callback, which is
+     * the platform's explicit acknowledgement that the overlay was submitted to
+     * the swap chain. Older Android versions use the following animation step.
+     */
+    private fun queueSurfaceTransition(
+        desired: ResolvedSurface,
+        needsQueueDrain: Boolean,
+    ) {
+        pendingSurfaceTransition = desired
+        pendingTransitionNeedsQueueDrain =
+            pendingTransitionNeedsQueueDrain || needsQueueDrain
+        scheduleOverlayCommit()
+    }
+
+    private fun queuePanscanTransition() {
+        pendingSurfaceTransition = null
+        pendingTransitionNeedsQueueDrain = true
+        scheduleOverlayCommit()
+    }
+
+    private fun scheduleOverlayCommit() {
+        handoffWaitingForFrame = 0L
+        handoffExpectedSurfaceWidth = 0
+        handoffExpectedSurfaceHeight = 0
+        handoffMatchingFramesRequired = 1
+        handoffMatchingFramesSeen = 0
+        handoffLastMatchingFrameSerial = 0L
+
+        if (handoffPreDrawListener != null || handoffCommitPostedForToken != 0L)
+            return
+
+        handoffToken++
+        val token = handoffToken
+        val observer = handoffOverlay.viewTreeObserver
+        if (!observer.isAlive) {
+            commitPendingSurfaceTransition(token)
+            return
+        }
+
+        val listener = object : ViewTreeObserver.OnPreDrawListener {
+            override fun onPreDraw(): Boolean {
+                removeHandoffPreDrawListener()
+
+                if (token == handoffToken &&
+                    (pendingSurfaceTransition != null ||
+                        pendingPanscanAction != null) &&
+                    handoffOverlay.visibility == View.VISIBLE
+                ) {
+                    handoffCommitPostedForToken = token
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q &&
+                        target.isHardwareAccelerated &&
+                        observer.isAlive
+                    ) {
+                        lateinit var frameCommit: Runnable
+                        frameCommit = Runnable {
+                            // Frame commit callbacks can run away from the UI
+                            // thread. All state and View mutations stay on it.
+                            handoffOverlay.post {
+                                if (handoffFrameCommitCallback === frameCommit) {
+                                    handoffFrameCommitObserver = null
+                                    handoffFrameCommitCallback = null
+                                }
+                                finishPostedSurfaceTransition(token)
+                            }
+                        }
+                        handoffFrameCommitObserver = observer
+                        handoffFrameCommitCallback = frameCommit
+                        observer.registerFrameCommitCallback(frameCommit)
+                    } else {
+                        handoffOverlay.postOnAnimation {
+                            finishPostedSurfaceTransition(token)
+                        }
+                    }
+                }
+                return true
+            }
+        }
+
+        handoffPreDrawObserver = observer
+        handoffPreDrawListener = listener
+        observer.addOnPreDrawListener(listener)
+        handoffOverlay.postInvalidateOnAnimation()
+    }
+
+    private fun finishPostedSurfaceTransition(token: Long) {
+        if (handoffCommitPostedForToken == token)
+            handoffCommitPostedForToken = 0L
+        commitPendingSurfaceTransition(token)
+    }
+
+    private fun commitPendingSurfaceTransition(token: Long) {
+        if (token != handoffToken)
+            return
+
+        val panscanAction = pendingPanscanAction
+        if (panscanAction != null) {
+            val sourceMode = renderSurfaceMode
+            val sourceCustomSize = customSurfaceSize
+            val sourceWidth = customSurfaceWidth
+            val sourceHeight = customSurfaceHeight
+            pendingPanscanAction = null
+            pendingSurfaceTransition = null
+            pendingTransitionNeedsQueueDrain = false
+
+            /*
+             * The overlay's source frame is now committed. Apply both mpv
+             * properties and synchronously cache their final zoom geometry while
+             * the TextureView is covered, then expose only frames from that final
+             * configuration.
+             */
+            var actionSucceeded = false
+            panscanMutationInProgress = true
+            try {
+                panscanAction()
+                actionSucceeded = true
+            } catch (_: Throwable) {
+                // Keep the renderer alive even if a stale dialog callback arrives
+                // while the file is unloading.
+            } finally {
+                panscanMutationInProgress = false
+            }
+            if (!actionSucceeded) {
+                completeHandoff()
+                return
+            }
+
+            val desired = resolveRenderSurface(
+                isZoomed() || scaleDetector.isInProgress,
+            )
+            val bufferGeometryChanges =
+                desired.customSize != sourceCustomSize ||
+                    (desired.customSize &&
+                        (desired.width != sourceWidth ||
+                            desired.height != sourceHeight))
+            val needsQueueDrain =
+                bufferGeometryChanges ||
+                    transitionNeedsOldBufferQueueDrain(
+                        source = sourceMode,
+                        destination = desired.mode,
+                    )
+            applyResolvedSurface(desired)
+            applyToView()
+            armHandoffForDestinationFrame(
+                desired = desired,
+                needsQueueDrain = needsQueueDrain,
+            )
+            return
+        }
+
+        val desired = pendingSurfaceTransition ?: return
+        val needsQueueDrain = pendingTransitionNeedsQueueDrain
+        pendingSurfaceTransition = null
+        pendingTransitionNeedsQueueDrain = false
+
+        applyResolvedSurface(desired)
+        applyToView()
+        armHandoffForDestinationFrame(
+            desired = desired,
+            needsQueueDrain = needsQueueDrain,
+        )
+    }
+
+    private fun armHandoffForDestinationFrame(
+        desired: ResolvedSurface,
+        needsQueueDrain: Boolean,
+    ) {
+        if (desired.customSize) {
+            handoffExpectedSurfaceWidth = desired.width
+            handoffExpectedSurfaceHeight = desired.height
+        } else {
+            handoffExpectedSurfaceWidth = target.width.coerceAtLeast(1)
+            handoffExpectedSurfaceHeight = target.height.coerceAtLeast(1)
+        }
+        handoffMatchingFramesRequired =
+            if (needsQueueDrain && isContinuouslyRenderingVideo()) 2 else 1
+        handoffMatchingFramesSeen = 0
+        handoffLastMatchingFrameSerial = 0L
+        handoffWaitingForFrame = target.surfaceTextureFrameSerial + 1L
+    }
+
+    fun onSurfaceFrameAvailable(frameSerial: Long) {
+        preallocateHandoffBitmap()
+        if (handoffCaptureRetryOnNextFrame &&
+            handoffCaptureRequested &&
+            !handoffCaptureInFlight
+        ) {
+            startHandoffFrameCopy()
+        }
+
+        val expected = handoffWaitingForFrame
+        if (expected <= 0L || frameSerial < expected)
+            return
+        if (!destinationSurfaceGeometryIsCurrent()) {
+            handoffMatchingFramesSeen = 0
+            handoffLastMatchingFrameSerial = 0L
+            return
+        }
+
+        if (frameSerial > handoffLastMatchingFrameSerial) {
+            handoffLastMatchingFrameSerial = frameSerial
+            handoffMatchingFramesSeen++
+        }
+        if (handoffMatchingFramesSeen < handoffMatchingFramesRequired)
+            return
+
+        /*
+         * TextureView invokes this callback after updateSurfaceTexture() but
+         * before it records the texture layer. The overlay is the next sibling
+         * in player.xml, so removing it here reveals the confirmed destination
+         * in this very draw pass. postOnAnimation() would unnecessarily freeze
+         * the old snapshot for another display frame.
+         */
+        if (handoffWaitingForFrame > 0L &&
+            target.surfaceTextureFrameSerial >= frameSerial &&
+            destinationSurfaceGeometryIsCurrent()
+        ) {
+            completeHandoff()
+        }
+    }
+
+    private fun destinationSurfaceGeometryIsCurrent(): Boolean {
+        val expectedWidth = handoffExpectedSurfaceWidth
+        val expectedHeight = handoffExpectedSurfaceHeight
+        if (expectedWidth <= 0 || expectedHeight <= 0)
+            return false
+
+        // onSurfaceTextureUpdated only says that updateTexImage() ran; an old
+        // BufferQueue entry can still produce that callback after a resize.
+        // mpv's OSD dimensions identify the producer geometry, but not the
+        // individual BufferQueue entry consumed by this callback. Ownership
+        // and panscan surface changes therefore drain one additional advancing
+        // video entry before this method is allowed to reveal the TextureView.
+        val voWidth = MPVLib.getPropertyInt("osd-width") ?: return false
+        val voHeight = MPVLib.getPropertyInt("osd-height") ?: return false
+        return voWidth == expectedWidth && voHeight == expectedHeight
+    }
+
+    private fun transitionNeedsOldBufferQueueDrain(
+        source: RenderSurfaceMode,
+        destination: RenderSurfaceMode,
+    ): Boolean {
+        val changesZoomOwnership =
+            (source == RenderSurfaceMode.BASE) !=
+                (destination == RenderSurfaceMode.BASE)
+        val touchesPanscanSurface =
+            source == RenderSurfaceMode.VIEW_ASPECT_ORIGINAL ||
+                destination == RenderSurfaceMode.VIEW_ASPECT_ORIGINAL
+        return changesZoomOwnership || touchesPanscanSurface
+    }
+
+    private fun isContinuouslyRenderingVideo(): Boolean {
+        if (MPVLib.getPropertyString("current-tracks/video/image") != "no")
+            return false
+        if (MPVLib.getPropertyBoolean("pause") == true ||
+            MPVLib.getPropertyBoolean("paused-for-cache") == true ||
+            MPVLib.getPropertyBoolean("eof-reached") == true
+        ) {
+            return false
+        }
+        return true
+    }
+
+    private fun removeHandoffPreDrawListener() {
+        val listener = handoffPreDrawListener ?: return
+        val observer = handoffPreDrawObserver
+        if (observer != null && observer.isAlive)
+            observer.removeOnPreDrawListener(listener)
+        handoffPreDrawObserver = null
+        handoffPreDrawListener = null
+    }
+
+    private fun removeHandoffFrameCommitCallback() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q)
+            return
+
+        val callback = handoffFrameCommitCallback ?: return
+        val observer = handoffFrameCommitObserver
+        if (observer != null && observer.isAlive)
+            observer.unregisterFrameCommitCallback(callback)
+        handoffFrameCommitObserver = null
+        handoffFrameCommitCallback = null
+    }
+
+    private fun completeHandoff() {
+        val deferred = deferredPanscanAction
+        deferredPanscanAction = null
+        cancelHandoff()
+        if (deferred != null) {
+            target.post {
+                performPanscanTransition(deferred)
+            }
+        }
+    }
+
+    private fun cancelHandoff() {
+        handoffToken++
+        handoffCaptureGeneration++
+        clearPendingCaptureTransition()
+        pendingSurfaceTransition = null
+        pendingTransitionNeedsQueueDrain = false
+        pendingPanscanAction = null
+        deferredPanscanAction = null
+        handoffCaptureRequested = false
+        handoffCaptureRetryOnNextFrame = false
+        handoffCaptureReady = false
+        removeHandoffPreDrawListener()
+        removeHandoffFrameCommitCallback()
+        handoffCommitPostedForToken = 0L
+        handoffWaitingForFrame = 0L
+        handoffExpectedSurfaceWidth = 0
+        handoffExpectedSurfaceHeight = 0
+        handoffMatchingFramesRequired = 1
+        handoffMatchingFramesSeen = 0
+        handoffLastMatchingFrameSerial = 0L
+        handoffTracksBaseSurface = false
+        handoffOverlay.visibility = View.GONE
+        handoffOverlay.setImageDrawable(null)
+    }
+
     fun release() {
         if (applyScheduled) {
             choreographer.removeFrameCallback(frameCallback)
             applyScheduled = false
         }
+        handoffReleased = true
+        handoffBitmapGeneration++
+        handoffBitmapExecutor.shutdownNow()
+        deferredPanscanAction = null
+        cancelHandoff()
+        if (!handoffCaptureInFlight)
+            handoffBitmap?.recycle()
+        handoffBitmap = null
     }
 
     private fun isPanscanActive(): Boolean = panscan > EPS.toDouble()
@@ -774,9 +1624,9 @@ internal class VideoZoomGestures(
             MAX_RENDER_SURFACE_PIXELS / (baseWidth * baseHeight).coerceAtLeast(1.0),
         )
 
-        // Avoid requesting oversized GPU targets. Very wide overridden
+        // Avoid requesting oversized SurfaceTexture buffers. Very wide overridden
         // ratios such as 2.35:1 on huge images can otherwise exceed the device
-        // texture limit.
+        // texture limit and leave the TextureView black even after resetting zoom.
         return desired
             .coerceAtMost(maxByEdge)
             .coerceAtMost(maxByPixels)
@@ -927,6 +1777,7 @@ internal class VideoZoomGestures(
         private const val DOUBLE_TAP_TIMEOUT = 300L
         private const val MAX_RENDER_SURFACE_EDGE = 8192.0
         private const val MAX_RENDER_SURFACE_PIXELS = MAX_RENDER_SURFACE_EDGE * MAX_RENDER_SURFACE_EDGE
+        private const val MAX_HANDOFF_COPY_ATTEMPTS = 3
 
         private const val DEFAULT_FRAME_DT = 1f / 60f
         private const val MIN_FILTER_DT = 1f / 240f

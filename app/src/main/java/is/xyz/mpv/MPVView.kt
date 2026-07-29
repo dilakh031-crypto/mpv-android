@@ -224,14 +224,6 @@ internal class MPVView(context: Context, attrs: AttributeSet) : BaseMPVView(cont
         return result >= 0
     }
 
-    fun beginRenderTransaction() {
-        MPVLib.beginRenderTransaction()
-    }
-
-    fun endRenderTransaction() {
-        MPVLib.endRenderTransaction()
-    }
-
     fun persistCurrentFileState() {
         if (!fileStatePersistenceEnabled())
             return
