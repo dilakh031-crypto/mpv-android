@@ -3842,8 +3842,8 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
     private fun quantizeGestureSeekDelta(diff: Float): Int {
         val magnitude = abs(diff)
 
-        // Make the +/-00:00 range 80% of its original width, then make every
-        // non-zero second step three times as wide as in the original behavior.
+        // Preserve the original +/-00:00 range, then make every non-zero
+        // second step 2.5 times as wide as in the original behavior.
         if (magnitude < GESTURE_SEEK_ZERO_HALF_STEP)
             return 0
 
@@ -4053,10 +4053,10 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
         // precision used by seekbar (1/s)
         private const val SEEK_BAR_PRECISION = 2
 
-        // Use 80% of the original zero-step width and 300% of the original
+        // Use 100% of the original zero-step width and 250% of the original
         // non-zero whole-second step width.
-        private const val GESTURE_SEEK_ZERO_HALF_STEP = 0.4f
-        private const val GESTURE_SEEK_NONZERO_STEP_WIDTH = 3f
+        private const val GESTURE_SEEK_ZERO_HALF_STEP = 0.5f
+        private const val GESTURE_SEEK_NONZERO_STEP_WIDTH = 2.5f
 
         // When scrubbing, wait briefly for the finger to stop moving before doing an exact seek.
         private const val SCRUB_IDLE_SEEK_DELAY_MS = 140L
