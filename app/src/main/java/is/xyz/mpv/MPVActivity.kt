@@ -3839,6 +3839,20 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
     // next 1-second movement in the opposite direction immediately leaves the edge.
     private var gestureSeekDeltaOffsetSec = 0
 
+    private fun quantizeGestureSeekDelta(diff: Float): Int {
+        val magnitude = abs(diff)
+
+        // Preserve the original +/-00:00 movement range, then make every non-zero
+        // second step 50% wider so +/-00:01, +/-00:02, ... remain on screen longer.
+        if (magnitude < GESTURE_SEEK_ZERO_HALF_STEP)
+            return 0
+
+        val seconds = 1 +
+                ((magnitude - GESTURE_SEEK_ZERO_HALF_STEP) /
+                        GESTURE_SEEK_NONZERO_STEP_WIDTH).toInt()
+        return if (diff < 0f) -seconds else seconds
+    }
+
     private fun fadeGestureText() {
         refreshPlayerOverlay()
         fadeHandler.removeCallbacks(fadeRunnable3)
@@ -3896,15 +3910,7 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
                 // does anywhere else in the video.
                 val startPos = initialSeek.roundToInt()
                 val durationSec = duration.roundToInt()
-                val roundedDeltaSec = diff.roundToInt()
-                // Reduce seek sensitivity by one whole-second step while preserving zero:
-                // the movement that previously produced +/-2s now produces +/-1s,
-                // +/-3s becomes +/-2s, and the previous +/-1s remains at zero.
-                val rawDeltaSec = when {
-                    roundedDeltaSec > 0 -> roundedDeltaSec - 1
-                    roundedDeltaSec < 0 -> roundedDeltaSec + 1
-                    else -> 0
-                }
+                val rawDeltaSec = quantizeGestureSeekDelta(diff)
                 val minDeltaSec = -startPos
                 val maxDeltaSec = durationSec - startPos
                 var deltaSec = rawDeltaSec - gestureSeekDeltaOffsetSec
@@ -4046,6 +4052,11 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
         private const val STREAM_TYPE = AudioManager.STREAM_MUSIC
         // precision used by seekbar (1/s)
         private const val SEEK_BAR_PRECISION = 2
+
+        // Keep the original zero step, but require 50% more movement for every
+        // non-zero whole-second step of gesture seeking.
+        private const val GESTURE_SEEK_ZERO_HALF_STEP = 0.5f
+        private const val GESTURE_SEEK_NONZERO_STEP_WIDTH = 1.5f
 
         // When scrubbing, wait briefly for the finger to stop moving before doing an exact seek.
         private const val SCRUB_IDLE_SEEK_DELAY_MS = 140L
