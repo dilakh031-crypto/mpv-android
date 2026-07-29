@@ -212,6 +212,18 @@ internal class MPVView(context: Context, attrs: AttributeSet) : BaseMPVView(cont
         MPVLib.setPropertyDouble("file-local-options/$name", value)
     }
 
+    /**
+     * Change the two properties that define a panscan presentation in one mpv
+     * command-list transaction. Sending two independent client calls lets the
+     * renderer expose their intermediate combination for one frame.
+     */
+    fun setFileLocalAspectAndPanscan(aspectOverride: String, panscan: Double): Boolean {
+        val result = MPVLib.setAspectAndPanscan(aspectOverride, panscan)
+        if (result < 0)
+            Log.e(TAG, "Atomic aspect/panscan command failed with mpv error $result")
+        return result >= 0
+    }
+
     fun persistCurrentFileState() {
         if (!fileStatePersistenceEnabled())
             return
@@ -511,17 +523,7 @@ internal class MPVView(context: Context, attrs: AttributeSet) : BaseMPVView(cont
      * from mpv.conf, so the zoom render surface can keep the same geometry as mpv.
      */
     fun getEffectiveVideoAspect(): Double? {
-        return getEffectiveVideoAspectForOverride(
-            MPVLib.getPropertyString("video-aspect-override"),
-        )
-    }
-
-    /**
-     * Predict mpv's displayed aspect for a proposed unrotated override without
-     * changing mpv. Used to prepare an atomic aspect-menu render handoff.
-     */
-    fun getEffectiveVideoAspectForOverride(override: String?): Double? {
-        parseAspectRatio(override)?.let {
+        parseAspectRatio(MPVLib.getPropertyString("video-aspect-override"))?.let {
             // video-aspect-override describes the unrotated frame. mpv applies
             // display rotation afterwards, so a rotated 4:3 frame is shown as
             // 3:4. Keeping that order here makes the Android zoom rectangle

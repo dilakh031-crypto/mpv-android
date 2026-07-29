@@ -2813,32 +2813,19 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
                 val ratio = ratios[item]
                 val targetOverride = if (ratio == "panscan") "-1" else ratio
                 val targetPanscan = if (ratio == "panscan") 1.0 else 0.0
-                val targetAspect = try {
-                    player.getEffectiveVideoAspectForOverride(targetOverride)
-                } catch (_: Throwable) {
-                    null
-                }
-                val targetPixelSize = try {
-                    player.getVideoPixelSize()
-                } catch (_: Throwable) {
-                    null
-                }
-                val applyMpvProperties = {
-                    player.setFileLocalString("video-aspect-override", targetOverride)
-                    player.setFileLocalDouble("panscan", targetPanscan)
-                    player.persistCurrentFileState()
-                }
+                val transitionTouchesPanscan =
+                    (MPVLib.getPropertyDouble("panscan") ?: 0.0) > 0.0 ||
+                    targetPanscan > 0.0
 
-                if (::zoomGestures.isInitialized) {
-                    zoomGestures.applyAspectRatioTransition(
-                        aspect = targetAspect,
-                        pixelSize = targetPixelSize,
-                        panscanValue = targetPanscan,
-                        applyMpvProperties = applyMpvProperties,
-                    )
+                if (transitionTouchesPanscan) {
+                    player.setFileLocalAspectAndPanscan(targetOverride, targetPanscan)
                 } else {
-                    applyMpvProperties()
+                    // Keep ordinary ratio-to-ratio changes on their established
+                    // path; only panscan needs the two-property transaction.
+                    player.setFileLocalString("video-aspect-override", targetOverride)
+                    player.setFileLocalDouble("panscan", 0.0)
                 }
+                player.persistCurrentFileState()
                 // Keep dialog open (apply-in-place).
             }
             // "Cancel" behaves like Back (up to the advanced menu).
