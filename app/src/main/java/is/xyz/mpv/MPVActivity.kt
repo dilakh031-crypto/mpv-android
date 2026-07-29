@@ -647,7 +647,7 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
 
     private fun hasDisplayableVideoGeometry(): Boolean {
         val aspect = try { player.getEffectiveVideoAspect() ?: 0.0 } catch (_: Throwable) { 0.0 }
-        val size = try { player.getZoomVideoPixelSize() } catch (_: Throwable) { null }
+        val size = try { player.getVideoPixelSize() } catch (_: Throwable) { null }
         return aspect > 0.001 && size != null
     }
 
@@ -664,7 +664,7 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
             return
 
         val aspect = try { player.getEffectiveVideoAspect() } catch (_: Throwable) { null }
-        val size = try { player.getZoomVideoPixelSize() } catch (_: Throwable) { null }
+        val size = try { player.getVideoPixelSize() } catch (_: Throwable) { null }
         val pan = try { player.getPanscan() } catch (_: Throwable) { 0.0 }
 
         try {
@@ -780,8 +780,6 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
         // take the background service with us
         stopServiceRunnable.run()
 
-        if (::zoomGestures.isInitialized)
-            zoomGestures.dispose()
         player.removeObserver(this)
         player.destroy()
         super.onDestroy()
@@ -2899,13 +2897,11 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
                 val ratio = ratios[item]
                 val targetPanscan = if (ratio == "panscan") 1.0 else 0.0
                 val targetAspect = if (ratio == "panscan") {
-                    try { player.getUnmodifiedVideoAspect() } catch (_: Throwable) { null }
+                    try { player.getVideoAspect() } catch (_: Throwable) { null }
                 } else {
-                    parseAspectRatio(ratio)?.let {
-                        try { player.getDisplayedAspectForOverride(it) } catch (_: Throwable) { it }
-                    } ?: try { player.getUnmodifiedVideoAspect() } catch (_: Throwable) { null }
+                    parseAspectRatio(ratio) ?: try { player.getVideoAspect() } catch (_: Throwable) { null }
                 }
-                val targetPixelSize = try { player.getZoomVideoPixelSize() } catch (_: Throwable) { null }
+                val targetPixelSize = try { player.getVideoPixelSize() } catch (_: Throwable) { null }
 
                 // Menu selections are the only transition where we already know the
                 // requested geometry. Apply it before asking mpv to redraw so the
@@ -3517,10 +3513,7 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
         when (property) {
             "time-pos" -> updatePlaybackPos(psc.positionSec)
             "playlist-pos", "playlist-count" -> updatePlaylistButtons()
-            "video-params/w", "video-params/h",
-            "video-out-params/w", "video-out-params/h",
-            "video-out-params/crop-w", "video-out-params/crop-h",
-            "video-out-params/rotate" -> {
+            "video-params/w", "video-params/h" -> {
                 syncZoomVideoGeometry()
                 prepareZoomSurfaceAndRevealWhenReady()
             }
@@ -3531,8 +3524,7 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
         if (!activityIsForeground) return
         when (property) {
             "duration/full" -> updatePlaybackDuration(psc.durationSec)
-            "video-params/aspect", "video-params/rotate",
-            "video-out-params/aspect" -> {
+            "video-params/aspect", "video-params/rotate" -> {
                 updateOrientation()
                 updatePiPParams()
                 syncZoomVideoGeometry()

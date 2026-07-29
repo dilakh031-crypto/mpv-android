@@ -370,12 +370,6 @@ internal class MPVView(context: Context, attrs: AttributeSet) : BaseMPVView(cont
             Property("video-params/rotate", MPV_FORMAT_DOUBLE),
             Property("video-params/w", MPV_FORMAT_INT64),
             Property("video-params/h", MPV_FORMAT_INT64),
-            Property("video-out-params/aspect", MPV_FORMAT_DOUBLE),
-            Property("video-out-params/rotate", MPV_FORMAT_INT64),
-            Property("video-out-params/w", MPV_FORMAT_INT64),
-            Property("video-out-params/h", MPV_FORMAT_INT64),
-            Property("video-out-params/crop-w", MPV_FORMAT_INT64),
-            Property("video-out-params/crop-h", MPV_FORMAT_INT64),
             Property("video-aspect-override", MPV_FORMAT_STRING),
             Property("panscan", MPV_FORMAT_DOUBLE),
             Property("playlist-pos", MPV_FORMAT_INT64),
@@ -500,10 +494,12 @@ internal class MPVView(context: Context, attrs: AttributeSet) : BaseMPVView(cont
     val estimatedVfFps: Double?
         get() = MPVLib.getPropertyDouble("estimated-vf-fps")
 
-    /** Returns the current pre-filter display aspect, including overrides. */
+    /**
+     * Returns the video's native aspect ratio. Rotation is taken into account.
+     */
     fun getVideoAspect(): Double? {
         return MPVLib.getPropertyDouble("video-params/aspect")?.let {
-            if (!it.isFinite() || it < 0.001)
+            if (it < 0.001)
                 return 0.0
             val rot = MPVLib.getPropertyInt("video-params/rotate") ?: 0
             if (rot % 180 == 90)
@@ -513,88 +509,47 @@ internal class MPVView(context: Context, attrs: AttributeSet) : BaseMPVView(cont
         }
     }
 
-    /** Aspect before user overrides, used to predict the "original" menu item. */
-    fun getUnmodifiedVideoAspect(): Double? {
-        return MPVLib.getPropertyDouble("video-dec-params/aspect")?.let {
-            if (!it.isFinite() || it < 0.001)
-                return 0.0
-            val rot = MPVLib.getPropertyInt("video-dec-params/rotate")
-                ?: MPVLib.getPropertyInt("video-params/rotate")
-                ?: 0
-            if (rot % 180 == 90) 1.0 / it else it
-        } ?: getVideoAspect()
-    }
-
     /**
-     * Returns the post-filter aspect ratio that mpv is actually sending to its
-     * video output. video-out-params already includes aspect overrides; applying
-     * video-aspect-override a second time would lose rotation and can swap the
-     * portrait/landscape geometry used by zoom.
+     * Returns the aspect ratio that mpv is currently displaying. This includes
+     * video-aspect-override values coming either from the in-app aspect menu or
+     * from mpv.conf, so the zoom render surface can keep the same geometry as mpv.
      */
     fun getEffectiveVideoAspect(): Double? {
-        val aspect = MPVLib.getPropertyDouble("video-out-params/aspect")
-            ?: return getVideoAspect()
-        if (!aspect.isFinite() || aspect < 0.001)
-            return 0.0
-        val rot = MPVLib.getPropertyInt("video-out-params/rotate")
-            ?: MPVLib.getPropertyInt("video-params/rotate")
-            ?: 0
-        return if (rot % 180 == 90) {
-            1.0 / aspect
-        } else {
-            aspect
+        parseAspectRatio(MPVLib.getPropertyString("video-aspect-override"))?.let {
+            return it
         }
-    }
-
-    /** Convert a raw video-aspect-override value to its displayed orientation. */
-    fun getDisplayedAspectForOverride(aspect: Double): Double {
-        val rot = MPVLib.getPropertyInt("video-out-params/rotate")
-            ?: MPVLib.getPropertyInt("video-params/rotate")
-            ?: 0
-        return if (rot % 180 == 90) 1.0 / aspect else aspect
+        return getVideoAspect()
     }
 
     fun getPanscan(): Double {
         return MPVLib.getPropertyDouble("panscan") ?: 0.0
     }
 
-    /** Native decoded dimensions, used by automatic device orientation. */
+    private fun parseAspectRatio(value: String?): Double? {
+        val trimmed = value?.trim() ?: return null
+        if (trimmed.isEmpty() || trimmed == "-1" || trimmed.equals("no", true))
+            return null
+
+        val parts = trimmed.split(':', limit = 2)
+        val parsed = if (parts.size == 2) {
+            val width = parts[0].toDoubleOrNull()
+            val height = parts[1].toDoubleOrNull()
+            if (width != null && height != null && height != 0.0)
+                width / height
+            else
+                null
+        } else {
+            trimmed.toDoubleOrNull()
+        }
+        return parsed?.takeIf { it > 0.001 }
+    }
+
     fun getVideoPixelSize(): Pair<Int, Int>? {
         val w = MPVLib.getPropertyInt("video-params/w") ?: return null
         val h = MPVLib.getPropertyInt("video-params/h") ?: return null
         if (w <= 0 || h <= 0)
             return null
         val rot = MPVLib.getPropertyInt("video-params/rotate") ?: 0
-        return if (rot % 180 == 90) h to w else w to h
-    }
-
-    /**
-     * Useful post-filter source pixels for adaptive zoom quality.
-     *
-     * Prefer the cropped output dimensions because filters and container crop
-     * can remove pixels that never reach the VO. Falling back to decoder
-     * dimensions keeps startup robust while video-out-params is still forming.
-     */
-    fun getZoomVideoPixelSize(): Pair<Int, Int>? {
-        val outputWidth = MPVLib.getPropertyInt("video-out-params/w")
-        val outputHeight = MPVLib.getPropertyInt("video-out-params/h")
-        val cropWidth = MPVLib.getPropertyInt("video-out-params/crop-w")
-            ?.takeIf { it > 0 && outputWidth != null && it <= outputWidth }
-        val cropHeight = MPVLib.getPropertyInt("video-out-params/crop-h")
-            ?.takeIf { it > 0 && outputHeight != null && it <= outputHeight }
-
-        val w = cropWidth ?: outputWidth
-            ?: MPVLib.getPropertyInt("video-params/w")
-            ?: return null
-        val h = cropHeight ?: outputHeight
-            ?: MPVLib.getPropertyInt("video-params/h")
-            ?: return null
-        if (w <= 0 || h <= 0)
-            return null
-
-        val rot = MPVLib.getPropertyInt("video-out-params/rotate")
-            ?: MPVLib.getPropertyInt("video-params/rotate")
-            ?: 0
         return if (rot % 180 == 90) h to w else w to h
     }
 
