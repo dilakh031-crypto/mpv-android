@@ -116,6 +116,7 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
     private var lastIssuedGestureSeekSec: Int? = null
 
     private var seekbarScrubActive = false
+    private var initialSeekbarPosSec = 0
     private var pendingSeekbarSeekPos: Double? = null
     private var lastIssuedSeekbarSeekPos: Double? = null
 
@@ -202,11 +203,13 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
             }
 
             val posText = Utils.prettyTime(targetSec.toInt())
+            val diffText = Utils.prettyTime(targetSec.toInt() - initialSeekbarPosSec, true)
             if (binding.gestureTextView.visibility != View.VISIBLE)
                 refreshPlayerOverlay()
             fadeHandler.removeCallbacks(fadeRunnable3)
             binding.gestureTextView.visibility = View.VISIBLE
-            binding.gestureTextView.text = posText
+            binding.gestureTextView.text =
+                getString(R.string.ui_seek_distance, posText, diffText)
 
             // Re-schedule idle exact seek.
             scrubSeekHandler.removeCallbacks(seekbarIdleSeekRunnable)
@@ -217,6 +220,7 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
             refreshPlayerOverlay()
             userIsOperatingSeekbar = true
             seekbarScrubActive = true
+            initialSeekbarPosSec = seekBar.progress / SEEK_BAR_PRECISION
             pendingSeekbarSeekPos = null
             lastIssuedSeekbarSeekPos = null
 
@@ -2572,7 +2576,6 @@ private fun cycleSpeed() {
     private fun unlockUI() {
         binding.unlockBtn.visibility = View.GONE
         lockedUI = false
-        showControls()
     }
 
     data class MenuItem(
