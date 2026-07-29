@@ -413,13 +413,7 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
             // Prepare binding/gestures early so onConfigurationChanged is safe even if we change orientation immediately.
             binding = PlayerBinding.inflate(layoutInflater)
             gestures = TouchGestures(this)
-            zoomGestures = VideoZoomGestures(
-                binding.player,
-                binding.renderHandoffOverlay,
-            )
-            binding.player.onSurfaceTextureFrameAvailable = { frameSerial ->
-                zoomGestures.onSurfaceFrameAvailable(frameSerial)
-            }
+            zoomGestures = VideoZoomGestures(binding.player)
 
             // Do these here and not in MainActivity because mpv can be launched from a file browser.
             Utils.copyAssets(this)
@@ -694,7 +688,6 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
 
         player.removeObserver(this)
         if (::zoomGestures.isInitialized) {
-            binding.player.onSurfaceTextureFrameAvailable = null
             zoomGestures.release()
         }
         player.destroy()
@@ -2817,13 +2810,22 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
                     (MPVLib.getPropertyDouble("panscan") ?: 0.0) > 0.0 ||
                     targetPanscan > 0.0
 
-                if (transitionTouchesPanscan) {
-                    player.setFileLocalAspectAndPanscan(targetOverride, targetPanscan)
-                } else {
-                    // Keep ordinary ratio-to-ratio changes on their established
-                    // path; only panscan needs the two-property transaction.
-                    player.setFileLocalString("video-aspect-override", targetOverride)
-                    player.setFileLocalDouble("panscan", 0.0)
+                player.beginRenderTransaction()
+                try {
+                    if (transitionTouchesPanscan) {
+                        player.setFileLocalAspectAndPanscan(targetOverride, targetPanscan)
+                    } else {
+                        // Keep ordinary ratio-to-ratio changes on their established
+                        // path; only panscan needs the two-property transaction.
+                        player.setFileLocalString("video-aspect-override", targetOverride)
+                        player.setFileLocalDouble("panscan", 0.0)
+                    }
+                    // Submit the matching zoom FBO geometry before swaps resume.
+                    // The renderer can then replace the old complete frame with
+                    // the final complete panscan/aspect frame in one publication.
+                    syncZoomSurfaceGeometryWhenReady()
+                } finally {
+                    player.endRenderTransaction()
                 }
                 player.persistCurrentFileState()
                 // Keep dialog open (apply-in-place).
