@@ -10,21 +10,29 @@ import kotlin.math.PI
 import kotlin.math.abs
 import kotlin.math.ceil
 import kotlin.math.hypot
-import kotlin.math.ln
 import kotlin.math.max
 import kotlin.math.min
-import kotlin.math.pow
-import kotlin.math.sqrt
 
 /**
  * Pinch-to-zoom + pan for mpv output.
  *
- * The finger-facing transform is always a cheap TextureView transform, so pinch
- * and pan stay responsive. mpv is only rebased occasionally (at gesture end or
- * before the preview reaches an edge) and then re-renders the visible viewport
- * from the original decoded image. A modest overscan buffer supplies hidden
- * pixels around the screen, avoiding both black edges while panning and the old
- * fixed 8192-pixel full-image surface limit.
+ * Important quality detail:
+ *  - Unzoomed view uses a display-sized mpv-rendered compact surface, so mpv,
+ *    not Android's TextureView compositor, performs the huge downscale. This
+ *    avoids moire / false-color artifacts on high-frequency scans at 720p.
+ *  - After the first mpv frame is ready, the unzoomed view is prepared with the
+ *    same media-aspect fit that will be used while zoomed. At normal size it
+ *    uses only a display-sized compact buffer; when the user starts zooming it
+ *    upgrades the same geometry to an original-detail buffer.
+ *  - New-file and window-exit transitions are forced back to the plain mpv/base
+ *    surface so Android never animates a transformed TextureView while entering
+ *    or leaving the player.
+ *  - Because the geometry does not switch at zoom start/end, Android never shows
+ *    the one-frame shrink/stretch tear. Because the zoom buffer has no oversized
+ *    black bars, it keeps full source detail in both matching and opposite
+ *    phone/media orientations.
+ *
+ * We do not use mpv video-pan/video-zoom for finger movement.
  */
 internal class VideoZoomGestures(
     private val target: View,
@@ -44,7 +52,7 @@ internal class VideoZoomGestures(
     private val panStartSlop = max(1f, min(2.5f, touchSlop * 0.22f))
 
     // Linear scale factor (1.0 = normal). Translation is stored as Double so large
-    // 20x offsets do not lose sub-pixel precision before conversion to mpv pan units.
+    // 20x offsets do not lose sub-pixel precision before being sent to the View.
     private var scale = 1f
     private var tx = 0.0
     private var ty = 0.0
@@ -71,27 +79,21 @@ internal class VideoZoomGestures(
     private val panFilterX = OneEuroFilter()
     private val panFilterY = OneEuroFilter()
 
-    /** Transform represented by the frame currently stored in the TextureView. */
-    private var committedMpvTransform = MpvTransform.IDENTITY
-    private var pendingMpvTransform: MpvTransform? = null
-    private var queuedMpvRebase = false
-    private var resetSurfaceAfterMpvCommit = false
-    private var lastMpvRebaseRequestMs = 0L
+    private var renderSurfaceMode = RenderSurfaceMode.BASE
 
-    private var zoomRenderSurfaceActive = false
-    private var zoomRenderSurfaceScale = 1f
-
-    init {
-        renderTarget?.onVideoZoomSurfaceTextureFrameAvailable = { onMpvFrameAvailable() }
-    }
+    // Keep the startup/exit window transitions on the plain mpv surface. Once
+    // MPVActivity has a stable first frame hidden behind the startup preview, it
+    // enables the compact normal surface so zoom can start/stop without a tear.
+    private var normalCompactSurfacePrepared = false
 
     // When a pinch returns close enough to normal size, finish it through the
     // same delayed reset path as double-tap. Calling reset() directly from
-    // onScaleEnd still sees ScaleGestureDetector as in-progress on some devices.
+    // onScaleEnd still sees ScaleGestureDetector as in-progress on some devices,
+    // which keeps the original-detail Android surface selected for that frame.
     private var pendingPinchDoubleTapReset = false
 
-    // Coalesce cheap TextureView property writes to vsync. mpv rebases are
-    // intentionally handled separately and much less frequently.
+    // Coalesce view property updates to vsync. We do not animate here; we only avoid
+    // writing View properties multiple times in one display frame.
     private val choreographer: Choreographer = Choreographer.getInstance()
     private var applyScheduled = false
     private val frameCallback = Choreographer.FrameCallback {
@@ -109,8 +111,10 @@ internal class VideoZoomGestures(
                 panActive = false
                 canBeTap = false
 
-                // Allocate only a small screen-sized overscan buffer. Finger movement
-                // itself remains a TextureView transform and never waits for mpv.
+                // Switch to the original-detail buffer before the first visible zoom step.
+                // If the first-frame preparation was skipped (for example, a remote file
+                // without startup preview), arm the compact normal geometry now as a fallback.
+                normalCompactSurfacePrepared = true
                 updateRenderSurfaceForCurrentState(force = true)
                 applyToView()
 
@@ -133,6 +137,7 @@ internal class VideoZoomGestures(
                     ty = 0.0
                     pendingPinchDoubleTapReset = true
                     resetPanFilters(detector.focusX, detector.focusY, SystemClock.uptimeMillis())
+                    scheduleApply()
                     return true
                 }
 
@@ -153,7 +158,6 @@ internal class VideoZoomGestures(
                 resetPanFilters(detector.focusX, detector.focusY, SystemClock.uptimeMillis())
                 updateRenderSurfaceForCurrentState(force = false)
                 scheduleApply()
-                maybeRebaseDuringInteraction()
                 return true
             }
 
@@ -164,7 +168,6 @@ internal class VideoZoomGestures(
                 } else {
                     resetPanFilters(detector.focusX, detector.focusY, SystemClock.uptimeMillis())
                     updateRenderSurfaceForCurrentState(force = true)
-                    requestMpvRebase(force = true)
                 }
             }
         }
@@ -177,11 +180,11 @@ internal class VideoZoomGestures(
         if (isZoomed() || scaleDetector.isInProgress) {
             clampTranslationToVideoContent()
             updateRenderSurfaceForCurrentState(force = true)
-            requestMpvRebase(force = true)
+            scheduleApply()
         } else {
             updateRenderSurfaceForCurrentState(force = true)
+            scheduleApply()
         }
-        scheduleApply()
     }
 
     fun setVideoAspect(aspect: Double?) {
@@ -214,7 +217,6 @@ internal class VideoZoomGestures(
         )
     }
 
-    @Suppress("UNUSED_PARAMETER")
     fun setVideoGeometry(
         aspect: Double?,
         pixelSize: Pair<Int, Int>?,
@@ -227,12 +229,13 @@ internal class VideoZoomGestures(
         videoPixelHeight = pixelSize?.second ?: 0
         panscan = panscanValue ?: 0.0
 
+        if (prepareNormalSurface)
+            normalCompactSurfacePrepared = true
+
         if (isZoomed() || scaleDetector.isInProgress)
             clampTranslationToVideoContent()
 
         updateRenderSurfaceForCurrentState(force = true)
-        if (isZoomed() || scaleDetector.isInProgress)
-            requestMpvRebase(force = true)
         if (immediate)
             applyToView()
         else
@@ -268,10 +271,12 @@ internal class VideoZoomGestures(
     fun reset() {
         resetTransformState()
 
-        // Keep the last stable preview visible while mpv returns to identity once.
-        // The overscan surface is released only after that identity frame arrives.
-        resetSurfaceAfterMpvCommit = true
-        requestMpvRebase(force = true, preferOverscan = false)
+        // Critical for scan quality: after returning to normal size, do not keep
+        // the original-resolution texture and let Android minify it. Return to
+        // the prepared compact normal surface so the next zoom starts from the
+        // same geometry, without a start/end tear.
+        updateRenderSurfaceForCurrentState(force = true)
+        applyToView()
     }
 
     fun resetForNewFile() {
@@ -280,22 +285,25 @@ internal class VideoZoomGestures(
         videoPixelWidth = 0
         videoPixelHeight = 0
         panscan = 0.0
-        resetCommittedMpvState()
-        deactivateZoomRenderSurface(force = true)
+        normalCompactSurfacePrepared = false
+        requestBaseRenderSurfaceSize(force = true)
         applyToView()
     }
 
     fun prepareForVisibleMedia() {
-        if (!isZoomed())
-            deactivateZoomRenderSurface(force = true)
+        if (normalCompactSurfacePrepared)
+            return
+
+        normalCompactSurfacePrepared = true
+        updateRenderSurfaceForCurrentState(force = true)
         applyToView()
     }
 
     fun prepareForWindowExit() {
         resetTransformState()
-        resetCommittedMpvState()
+        normalCompactSurfacePrepared = false
         target.alpha = 0f
-        deactivateZoomRenderSurface(force = true)
+        requestBaseRenderSurfaceSize(force = true)
         applyToView()
     }
 
@@ -328,7 +336,8 @@ internal class VideoZoomGestures(
                 return@post
 
             // This is intentionally the same reset action used by double-tap,
-            // but deferred until the pinch detector has fully ended.
+            // but deferred until the pinch detector has fully ended so surface
+            // selection follows the smooth double-tap path.
             reset()
         }
     }
@@ -435,7 +444,6 @@ internal class VideoZoomGestures(
                 if (!wasTap) {
                     lastTapTime = 0L
                     resetPanFilters(lastPointerX, lastPointerY, now)
-                    requestMpvRebase(force = true)
                     return true
                 }
 
@@ -468,8 +476,6 @@ internal class VideoZoomGestures(
                 panActive = false
                 canBeTap = false
                 resetPanFilters(lastPointerX, lastPointerY, SystemClock.uptimeMillis())
-                if (isZoomed())
-                    requestMpvRebase(force = true)
                 return true
             }
         }
@@ -526,7 +532,6 @@ internal class VideoZoomGestures(
         ty += dy.toDouble()
         clampTranslationToVideoContent()
         scheduleApply()
-        maybeRebaseDuringInteraction()
     }
 
     private fun scheduleApply() {
@@ -558,8 +563,6 @@ internal class VideoZoomGestures(
         if (w <= 1f || h <= 1f)
             return ContentRect(0f, 0f, w, h)
 
-        // Preserve the release-based behavior of the modified project: while
-        // panscan is active mpv already fills/crops to the complete output view.
         if (isPanscanActive())
             return ContentRect(0f, 0f, w, h)
 
@@ -578,8 +581,6 @@ internal class VideoZoomGestures(
         val oy = (h - ch) * 0.5f
         return ContentRect(ox, oy, cw, ch)
     }
-
-    private fun isPanscanActive(): Boolean = panscan > EPS.toDouble()
 
     private fun clampTranslationToVideoContent() {
         if (viewWidth <= 1f || viewHeight <= 1f)
@@ -613,254 +614,256 @@ internal class VideoZoomGestures(
     }
 
     private fun applyToView() {
-        val committed = screenTransformFor(committedMpvTransform)
-        val committedScale = committed.scale.coerceAtLeast(MIN_TRANSFORM_SCALE)
-        val residualScale = (scale.toDouble() / committedScale).finiteOrOne()
-        val pivotX = viewWidth.toDouble() * 0.5
-        val pivotY = viewHeight.toDouble() * 0.5
+        val fit = renderSurfaceFitTransform()
 
-        // View transformation around a center pivot:
-        // final = residual * committed + (1 - residual) * pivot + translation
-        val residualTx = tx - residualScale * committed.tx - (1.0 - residualScale) * pivotX
-        val residualTy = ty - residualScale * committed.ty - (1.0 - residualScale) * pivotY
-
-        target.pivotX = pivotX.toFloat()
-        target.pivotY = pivotY.toFloat()
-        target.scaleX = residualScale.toFloat()
-        target.scaleY = residualScale.toFloat()
-        target.translationX = residualTx.finiteOrZero().toFloat()
-        target.translationY = residualTy.finiteOrZero().toFloat()
+        target.pivotX = 0f
+        target.pivotY = 0f
+        target.scaleX = scale * fit.scaleX
+        target.scaleY = scale * fit.scaleY
+        target.translationX = (tx + scale * fit.translationX).toFloat()
+        target.translationY = (ty + scale * fit.translationY).toFloat()
     }
 
-    private fun desiredScreenTransform(): ScreenTransform {
-        return ScreenTransform(scale.toDouble(), tx, ty)
-    }
+    private fun renderSurfaceFitTransform(): SurfaceFitTransform {
+        if (!renderSurfaceMode.usesMediaAspectFit || viewWidth <= 1f || viewHeight <= 1f)
+            return SurfaceFitTransform.IDENTITY
 
-    private fun screenTransformFor(mpv: MpvTransform): ScreenTransform {
-        val screenScale = 2.0.pow(mpv.zoom).finiteOrOne().coerceAtLeast(MIN_TRANSFORM_SCALE)
         val c = contentRect()
-        if (viewWidth <= 1f || viewHeight <= 1f || c.w <= 1f || c.h <= 1f)
-            return ScreenTransform(screenScale, 0.0, 0.0)
+        if (c.w <= 1f || c.h <= 1f)
+            return SurfaceFitTransform.IDENTITY
 
-        val scaledWidth = screenScale * c.w.toDouble()
-        val scaledHeight = screenScale * c.h.toDouble()
-        val centeredLeft = (viewWidth.toDouble() - scaledWidth) * 0.5
-        val centeredTop = (viewHeight.toDouble() - scaledHeight) * 0.5
-        val desiredLeft = centeredLeft + mpv.panX * scaledWidth
-        val desiredTop = centeredTop + mpv.panY * scaledHeight
-
-        return ScreenTransform(
-            scale = screenScale,
-            tx = (desiredLeft - screenScale * c.ox.toDouble()).finiteOrZero(),
-            ty = (desiredTop - screenScale * c.oy.toDouble()).finiteOrZero(),
+        return SurfaceFitTransform(
+            scaleX = c.w / viewWidth,
+            scaleY = c.h / viewHeight,
+            translationX = c.ox.toDouble(),
+            translationY = c.oy.toDouble(),
         )
-    }
-
-    private fun mpvTransformFor(screen: ScreenTransform): MpvTransform {
-        val safeScale = screen.scale.coerceAtLeast(MIN_TRANSFORM_SCALE)
-        val zoom = ln(safeScale) / LN_2
-        val c = contentRect()
-        if (viewWidth <= 1f || viewHeight <= 1f || c.w <= 1f || c.h <= 1f)
-            return MpvTransform(zoom, 0.0, 0.0)
-
-        val scaledWidth = safeScale * c.w.toDouble()
-        val scaledHeight = safeScale * c.h.toDouble()
-        val centeredLeft = (viewWidth.toDouble() - scaledWidth) * 0.5
-        val centeredTop = (viewHeight.toDouble() - scaledHeight) * 0.5
-        val desiredLeft = safeScale * c.ox.toDouble() + screen.tx
-        val desiredTop = safeScale * c.oy.toDouble() + screen.ty
-
-        return MpvTransform(
-            zoom = zoom.finiteOrZero(),
-            panX = ((desiredLeft - centeredLeft) / scaledWidth).finiteOrZero(),
-            panY = ((desiredTop - centeredTop) / scaledHeight).finiteOrZero(),
-        )
-    }
-
-    /**
-     * Choose an mpv transform that leaves a centered TextureView overscan around
-     * the requested final transform. The extra SurfaceTexture pixels exactly
-     * compensate for the small residual Android scale, preserving display-pixel
-     * detail without allocating a texture as large as the source image.
-     */
-    private fun overscannedMpvTransformFor(desired: ScreenTransform): MpvTransform {
-        val previewScale = zoomRenderSurfaceScale.toDouble().coerceAtLeast(1.0)
-        val residualScale = min(previewScale, desired.scale).coerceAtLeast(1.0)
-        val committedScale = desired.scale / residualScale
-        val pivotX = viewWidth.toDouble() * 0.5
-        val pivotY = viewHeight.toDouble() * 0.5
-        val committedTx = (desired.tx - (1.0 - residualScale) * pivotX) / residualScale
-        val committedTy = (desired.ty - (1.0 - residualScale) * pivotY) / residualScale
-
-        return mpvTransformFor(ScreenTransform(committedScale, committedTx, committedTy))
-    }
-
-    private fun requestMpvRebase(
-        force: Boolean,
-        preferOverscan: Boolean = true,
-    ) {
-        val player = renderTarget ?: return
-        if (!player.isRenderSurfaceAttached())
-            return
-
-        refreshMetricsFromTarget()
-        if (viewWidth <= 1f || viewHeight <= 1f)
-            return
-
-        if (isZoomed() || scaleDetector.isInProgress)
-            activateZoomRenderSurface(force = false)
-
-        if (pendingMpvTransform != null) {
-            queuedMpvRebase = true
-            return
-        }
-
-        val desired = desiredScreenTransform()
-        val requested = if (preferOverscan && desired.scale > 1.0 + EPS)
-            overscannedMpvTransformFor(desired)
-        else
-            mpvTransformFor(desired)
-
-        if (approximatelyEqual(committedMpvTransform, requested)) {
-            if (resetSurfaceAfterMpvCommit && requested.isIdentity()) {
-                resetSurfaceAfterMpvCommit = false
-                deactivateZoomRenderSurface(force = true)
-            }
-            applyToView()
-            return
-        }
-        if (!force && SystemClock.uptimeMillis() - lastMpvRebaseRequestMs < MIN_MPV_REBASE_INTERVAL_MS)
-            return
-
-        pendingMpvTransform = requested
-        lastMpvRebaseRequestMs = SystemClock.uptimeMillis()
-        try {
-            MPVLib.setPropertyDouble("video-zoom", requested.zoom)
-            MPVLib.setPropertyDouble("video-pan-x", requested.panX)
-            MPVLib.setPropertyDouble("video-pan-y", requested.panY)
-        } catch (_: Throwable) {
-            pendingMpvTransform = null
-        }
-    }
-
-    private fun maybeRebaseDuringInteraction() {
-        if (!isZoomed() || pendingMpvTransform != null)
-            return
-        val now = SystemClock.uptimeMillis()
-        if (now - lastMpvRebaseRequestMs < MIN_MPV_REBASE_INTERVAL_MS)
-            return
-
-        val committed = screenTransformFor(committedMpvTransform)
-        val residualScale = (scale.toDouble() / committed.scale.coerceAtLeast(MIN_TRANSFORM_SCALE))
-            .finiteOrOne()
-        val pivotX = viewWidth.toDouble() * 0.5
-        val pivotY = viewHeight.toDouble() * 0.5
-        val residualTx = tx - residualScale * committed.tx - (1.0 - residualScale) * pivotX
-        val residualTy = ty - residualScale * committed.ty - (1.0 - residualScale) * pivotY
-
-        val marginX = max(0.0, (residualScale - 1.0) * viewWidth.toDouble() * 0.5)
-        val marginY = max(0.0, (residualScale - 1.0) * viewHeight.toDouble() * 0.5)
-        val translationNearEdge =
-            (marginX <= 1.0 && abs(residualTx) > 1.0) ||
-            (marginY <= 1.0 && abs(residualTy) > 1.0) ||
-            (marginX > 1.0 && abs(residualTx) >= marginX * PREVIEW_REBASE_MARGIN_FRACTION) ||
-            (marginY > 1.0 && abs(residualTy) >= marginY * PREVIEW_REBASE_MARGIN_FRACTION)
-        val scaleOutsidePreview =
-            (committed.scale > 1.0 + EPS && residualScale < MIN_PREVIEW_RESIDUAL_SCALE) ||
-            residualScale > MAX_PREVIEW_RESIDUAL_SCALE
-
-        if (translationNearEdge || scaleOutsidePreview)
-            requestMpvRebase(force = true)
-    }
-
-    private fun onMpvFrameAvailable() {
-        val applied = pendingMpvTransform ?: return
-        pendingMpvTransform = null
-        committedMpvTransform = applied
-
-        // A reset requested while an older rebase was already in flight must not
-        // briefly expose the inverse/shrunk TextureView transform. Keep the last
-        // visible preview unchanged and immediately ask mpv for its identity frame.
-        if (resetSurfaceAfterMpvCommit && !applied.isIdentity()) {
-            queuedMpvRebase = false
-            requestMpvRebase(force = true, preferOverscan = false)
-            return
-        }
-
-        applyToView()
-        if (resetSurfaceAfterMpvCommit && applied.isIdentity()) {
-            resetSurfaceAfterMpvCommit = false
-            deactivateZoomRenderSurface(force = true)
-            applyToView()
-        }
-
-        if (queuedMpvRebase) {
-            queuedMpvRebase = false
-            target.post { requestMpvRebase(force = true) }
-        }
-    }
-
-    private fun resetCommittedMpvState() {
-        committedMpvTransform = MpvTransform.IDENTITY
-        pendingMpvTransform = null
-        queuedMpvRebase = false
-        resetSurfaceAfterMpvCommit = false
-        lastMpvRebaseRequestMs = 0L
     }
 
     private fun updateRenderSurfaceForCurrentState(force: Boolean) {
-        if (isZoomed() || scaleDetector.isInProgress || resetSurfaceAfterMpvCommit)
-            activateZoomRenderSurface(force)
+        val zooming = isZoomed() || scaleDetector.isInProgress
+
+        if (isPanscanActive()) {
+            // panscan needs a view-shaped mpv output window. A media-aspect surface
+            // has no letterbox area for mpv to crop into, so panscan would appear
+            // identical to the original aspect. While zoomed, keep source detail by
+            // using the same high-resolution sizing strategy on the view-shaped window.
+            if (zooming)
+                requestViewAspectOriginalRenderSurfaceSize(force)
+            else
+                requestBaseRenderSurfaceSize(force)
+            return
+        }
+
+        // Keep the same effective-aspect fit in every orientation. The only thing
+        // that changes at zoom start/end is the backing buffer resolution, not
+        // the on-screen rectangle, so there is no transient aspect jump. The aspect
+        // can come from mpv.conf / video-aspect-override, not only from the file.
+        if (zooming)
+            requestMediaAspectOriginalRenderSurfaceSize(force)
+        else if (normalCompactSurfacePrepared)
+            requestMediaAspectBaseRenderSurfaceSize(force)
         else
-            deactivateZoomRenderSurface(force)
+            requestBaseRenderSurfaceSize(force)
     }
 
-    private fun activateZoomRenderSurface(force: Boolean) {
+    private fun requestBaseRenderSurfaceSize(force: Boolean) {
         val player = renderTarget ?: return
-        refreshMetricsFromTarget()
-        if (viewWidth <= 1f || viewHeight <= 1f)
+        if (!force && renderSurfaceMode == RenderSurfaceMode.BASE)
             return
 
-        val baseWidth = viewWidth.toDouble()
-        val baseHeight = viewHeight.toDouble()
-        val maxByEdge = MAX_ZOOM_RENDER_SURFACE_EDGE / max(baseWidth, baseHeight)
-        val maxByPixels = sqrt(
-            MAX_ZOOM_RENDER_SURFACE_PIXELS / (baseWidth * baseHeight).coerceAtLeast(1.0),
-        )
-        val requestedScale = min(
-            ZOOM_RENDER_SURFACE_SCALE.toDouble(),
-            min(maxByEdge, maxByPixels),
-        ).coerceAtLeast(1.0).toFloat()
-
-        if (!force && zoomRenderSurfaceActive &&
-            abs(requestedScale - zoomRenderSurfaceScale) <= SURFACE_SCALE_EPS
-        ) return
-
-        zoomRenderSurfaceActive = true
-        zoomRenderSurfaceScale = requestedScale
-        val bufferWidth = ceil(baseWidth * requestedScale).coerceAtLeast(1.0).toInt()
-        val bufferHeight = ceil(baseHeight * requestedScale).coerceAtLeast(1.0).toInt()
-        player.setRenderSurfaceSize(bufferWidth, bufferHeight)
-    }
-
-    private fun deactivateZoomRenderSurface(force: Boolean) {
-        val player = renderTarget ?: return
-        if (!force && !zoomRenderSurfaceActive)
-            return
-
-        zoomRenderSurfaceActive = false
-        zoomRenderSurfaceScale = 1f
+        renderSurfaceMode = RenderSurfaceMode.BASE
         player.resetRenderSurfaceSize()
     }
 
-    private fun approximatelyEqual(a: MpvTransform, b: MpvTransform): Boolean {
-        return abs(a.zoom - b.zoom) <= MPV_PROPERTY_EPS &&
-            abs(a.panX - b.panX) <= MPV_PROPERTY_EPS &&
-            abs(a.panY - b.panY) <= MPV_PROPERTY_EPS
+    private fun requestViewAspectOriginalRenderSurfaceSize(force: Boolean) {
+        val player = renderTarget ?: return
+        refreshMetricsFromTarget()
+
+        if (!force && renderSurfaceMode == RenderSurfaceMode.VIEW_ASPECT_ORIGINAL)
+            return
+
+        if (viewWidth <= 1f || viewHeight <= 1f || videoPixelWidth <= 1 || videoPixelHeight <= 1) {
+            requestBaseRenderSurfaceSize(force = true)
+            return
+        }
+
+        val c = contentRect()
+        if (c.w <= 1f || c.h <= 1f) {
+            requestBaseRenderSurfaceSize(force = true)
+            return
+        }
+
+        // Same-orientation path: keep the buffer aspect identical to the on-screen
+        // view, but choose its scale so the video content rect inside it is
+        // rendered at the original source resolution.
+        val baseWidth = viewWidth.toDouble()
+        val baseHeight = viewHeight.toDouble()
+        if (!originalDetailRenderSurfaceFitsLimits(baseWidth, baseHeight, c)) {
+            // Do not ask Android for a partially capped oversized buffer. Some
+            // devices silently fall back to a buffer smaller than the display.
+            // For media beyond the safe surface limits, render at the exact
+            // TextureView/screen size instead.
+            requestBaseRenderSurfaceSize(force)
+            return
+        }
+
+        val bufferScale = originalDetailBufferScale(c)
+        val bufferWidth = ceilToIntAtLeastOne(baseWidth * bufferScale)
+        val bufferHeight = ceilToIntAtLeastOne(baseHeight * bufferScale)
+        player.setRenderSurfaceSize(bufferWidth, bufferHeight)
+        renderSurfaceMode = RenderSurfaceMode.VIEW_ASPECT_ORIGINAL
     }
 
-    private fun Double.finiteOrZero(): Double = if (isFinite()) this else 0.0
-    private fun Double.finiteOrOne(): Double = if (isFinite()) this else 1.0
+    private fun requestMediaAspectOriginalRenderSurfaceSize(force: Boolean) {
+        val player = renderTarget ?: return
+        refreshMetricsFromTarget()
+
+        if (!force && renderSurfaceMode == RenderSurfaceMode.MEDIA_ASPECT_ORIGINAL)
+            return
+
+        if (viewWidth <= 1f || viewHeight <= 1f || videoPixelWidth <= 1 || videoPixelHeight <= 1) {
+            requestBaseRenderSurfaceSize(force = true)
+            return
+        }
+
+        val c = contentRect()
+        if (c.w <= 1f || c.h <= 1f) {
+            requestBaseRenderSurfaceSize(force = true)
+            return
+        }
+
+        // Media-aspect path: do not pad the render surface to the phone's
+        // portrait/landscape aspect. A view-aspect buffer can contain mostly
+        // black bars for panoramic/tall images and may lose source detail or hit
+        // GPU limits. applyToView() places this compact buffer into the normal
+        // content rect with View scale/translation.
+        val baseWidth = c.w.toDouble()
+        val baseHeight = c.h.toDouble()
+        if (!originalDetailRenderSurfaceFitsLimits(baseWidth, baseHeight, c)) {
+            // Oversized source: use the full display-sized mpv surface instead
+            // of an intermediate capped surface that a GPU/SurfaceTexture may
+            // reduce below the screen resolution.
+            requestBaseRenderSurfaceSize(force)
+            return
+        }
+
+        val bufferScale = originalDetailBufferScale(c)
+        val bufferWidth = ceilToIntAtLeastOne(baseWidth * bufferScale)
+        val bufferHeight = ceilToIntAtLeastOne(baseHeight * bufferScale)
+        player.setRenderSurfaceSize(bufferWidth, bufferHeight)
+        renderSurfaceMode = RenderSurfaceMode.MEDIA_ASPECT_ORIGINAL
+    }
+
+    private fun requestMediaAspectBaseRenderSurfaceSize(force: Boolean) {
+        val player = renderTarget ?: return
+        refreshMetricsFromTarget()
+
+        if (!force && renderSurfaceMode == RenderSurfaceMode.MEDIA_ASPECT_BASE)
+            return
+
+        if (viewWidth <= 1f || viewHeight <= 1f || videoAspect <= 0.001) {
+            requestBaseRenderSurfaceSize(force = true)
+            return
+        }
+
+        val c = contentRect()
+        if (c.w <= 1f || c.h <= 1f) {
+            requestBaseRenderSurfaceSize(force = true)
+            return
+        }
+
+        val baseWidth = c.w.toDouble()
+        val baseHeight = c.h.toDouble()
+        if (!originalDetailRenderSurfaceFitsLimits(baseWidth, baseHeight, c)) {
+            // The original-detail surface would exceed the safe limits. Keep
+            // this very large image on the full screen-sized base surface so
+            // its fallback resolution can never be lower than the display.
+            requestBaseRenderSurfaceSize(force)
+            return
+        }
+
+        // Keep the same media-aspect geometry used by the high-quality zoom
+        // surface, but render only at the on-screen content size while unzoomed.
+        // This avoids the start/end aspect switch that causes the visible tear.
+        val bufferWidth = ceilToIntAtLeastOne(baseWidth)
+        val bufferHeight = ceilToIntAtLeastOne(baseHeight)
+        player.setRenderSurfaceSize(bufferWidth, bufferHeight)
+        renderSurfaceMode = RenderSurfaceMode.MEDIA_ASPECT_BASE
+    }
+
+    private fun usesOppositeOrientationMediaAspectRenderSurface(): Boolean {
+        if (viewWidth <= 1f || viewHeight <= 1f || videoAspect <= 0.001)
+            return false
+
+        val mediaIsLandscape = videoAspect > MEDIA_ORIENTATION_THRESHOLD
+        val mediaIsPortrait = videoAspect < (1.0 / MEDIA_ORIENTATION_THRESHOLD)
+        if (!mediaIsLandscape && !mediaIsPortrait)
+            return false
+
+        val viewAspect = viewWidth / viewHeight
+        val viewIsLandscape = viewAspect > VIEW_ORIENTATION_THRESHOLD
+        val viewIsPortrait = viewAspect < (1f / VIEW_ORIENTATION_THRESHOLD)
+        if (!viewIsLandscape && !viewIsPortrait)
+            return false
+
+        return (mediaIsLandscape && viewIsPortrait) || (mediaIsPortrait && viewIsLandscape)
+    }
+
+    private fun shouldAvoidViewAspectOriginalRenderSurface(): Boolean {
+        if (viewWidth <= 1f || viewHeight <= 1f || videoPixelWidth <= 1 || videoPixelHeight <= 1)
+            return false
+
+        val c = contentRect()
+        if (c.w <= 1f || c.h <= 1f)
+            return false
+
+        val bufferScale = originalDetailBufferScale(c)
+        val viewAspectWidth = viewWidth.toDouble() * bufferScale
+        val viewAspectHeight = viewHeight.toDouble() * bufferScale
+        val mediaAspectWidth = c.w.toDouble() * bufferScale
+        val mediaAspectHeight = c.h.toDouble() * bufferScale
+
+        val viewAspectPixels = viewAspectWidth * viewAspectHeight
+        val mediaAspectPixels = (mediaAspectWidth * mediaAspectHeight).coerceAtLeast(1.0)
+        val wastedPixelRatio = viewAspectPixels / mediaAspectPixels
+        val longestViewAspectEdge = max(viewAspectWidth, viewAspectHeight)
+
+        return wastedPixelRatio >= MEDIA_ASPECT_FALLBACK_WASTE_RATIO ||
+            longestViewAspectEdge >= MEDIA_ASPECT_FALLBACK_MAX_EDGE
+    }
+
+    private fun isPanscanActive(): Boolean = panscan > EPS.toDouble()
+
+    private fun originalDetailRenderSurfaceFitsLimits(
+        baseWidth: Double,
+        baseHeight: Double,
+        content: ContentRect,
+    ): Boolean {
+        val desiredScale = originalDetailBufferScale(content)
+        val desiredWidth = baseWidth.coerceAtLeast(1.0) * desiredScale
+        val desiredHeight = baseHeight.coerceAtLeast(1.0) * desiredScale
+
+        // Never partially cap an oversized original-detail surface. If it cannot
+        // be requested safely at its intended resolution, callers explicitly
+        // fall back to the full display-sized base surface instead. This avoids
+        // device/driver fallback buffers that can be smaller than the screen.
+        return max(desiredWidth, desiredHeight) <= MAX_RENDER_SURFACE_EDGE &&
+            desiredWidth * desiredHeight <= MAX_RENDER_SURFACE_PIXELS
+    }
+
+    private fun originalDetailBufferScale(c: ContentRect): Double {
+        val scaleX = videoPixelWidth.toDouble() / c.w.toDouble()
+        val scaleY = videoPixelHeight.toDouble() / c.h.toDouble()
+        return max(scaleX, scaleY).coerceAtLeast(1.0)
+    }
+
+    private fun ceilToIntAtLeastOne(value: Double): Int {
+        return ceil(value)
+            .coerceAtLeast(1.0)
+            .coerceAtMost(Int.MAX_VALUE.toDouble())
+            .toInt()
+    }
 
     private fun filterParamsForCurrentScale(): FilterParams {
         if (scale < FILTER_START_SCALE)
@@ -879,17 +882,22 @@ internal class VideoZoomGestures(
     private fun lerp(a: Float, b: Float, t: Float): Float = a + (b - a) * t
 
     private data class ContentRect(val ox: Float, val oy: Float, val w: Float, val h: Float)
-    private data class ScreenTransform(val scale: Double, val tx: Double, val ty: Double)
-    private data class MpvTransform(val zoom: Double, val panX: Double, val panY: Double) {
-        fun isIdentity(): Boolean {
-            return abs(zoom) <= MPV_PROPERTY_EPS &&
-                abs(panX) <= MPV_PROPERTY_EPS &&
-                abs(panY) <= MPV_PROPERTY_EPS
-        }
-
+    private data class SurfaceFitTransform(
+        val scaleX: Float,
+        val scaleY: Float,
+        val translationX: Double,
+        val translationY: Double,
+    ) {
         companion object {
-            val IDENTITY = MpvTransform(0.0, 0.0, 0.0)
+            val IDENTITY = SurfaceFitTransform(1f, 1f, 0.0, 0.0)
         }
+    }
+
+    private enum class RenderSurfaceMode(val usesMediaAspectFit: Boolean) {
+        BASE(false),
+        VIEW_ASPECT_ORIGINAL(false),
+        MEDIA_ASPECT_BASE(true),
+        MEDIA_ASPECT_ORIGINAL(true),
     }
 
     private data class FilterParams(
@@ -971,23 +979,12 @@ internal class VideoZoomGestures(
         private const val MAX_SCALE = 20f
         private const val PINCH_DOUBLE_TAP_RESET_SCALE = 1.001f
         private const val DOUBLE_TAP_TIMEOUT = 300L
-        private const val LN_2 = 0.6931471805599453
-        private const val MPV_PROPERTY_EPS = 0.000001
-        private const val MIN_TRANSFORM_SCALE = 0.000001
-
-        // A screen-sized overscan is enough for smooth local movement. Unlike the
-        // old full-source buffer, its memory use is bounded by the display size.
-        private const val ZOOM_RENDER_SURFACE_SCALE = 1.35f
-        private const val MAX_ZOOM_RENDER_SURFACE_EDGE = 4096.0
-        private const val MAX_ZOOM_RENDER_SURFACE_PIXELS = 12_000_000.0
-        private const val SURFACE_SCALE_EPS = 0.001f
-
-        // mpv is rebased only occasionally; all intermediate finger samples remain
-        // cheap View-property changes on the UI thread.
-        private const val MIN_MPV_REBASE_INTERVAL_MS = 90L
-        private const val PREVIEW_REBASE_MARGIN_FRACTION = 0.72
-        private const val MIN_PREVIEW_RESIDUAL_SCALE = 1.08
-        private const val MAX_PREVIEW_RESIDUAL_SCALE = 1.90
+        private const val MEDIA_ORIENTATION_THRESHOLD = 1.08
+        private const val VIEW_ORIENTATION_THRESHOLD = 1.08f
+        private const val MEDIA_ASPECT_FALLBACK_WASTE_RATIO = 2.0
+        private const val MEDIA_ASPECT_FALLBACK_MAX_EDGE = 8192.0
+        private const val MAX_RENDER_SURFACE_EDGE = 8192.0
+        private const val MAX_RENDER_SURFACE_PIXELS = MAX_RENDER_SURFACE_EDGE * MAX_RENDER_SURFACE_EDGE
 
         private const val DEFAULT_FRAME_DT = 1f / 60f
         private const val MIN_FILTER_DT = 1f / 240f
