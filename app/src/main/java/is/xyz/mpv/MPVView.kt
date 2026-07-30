@@ -26,6 +26,18 @@ internal class MPVView(context: Context, attrs: AttributeSet) : BaseMPVView(cont
 
         // apply phone-optimized defaults
         MPVLib.setOptionString("profile", "fast")
+
+        // The fast profile selects bilinear downscaling. With very large still
+        // images this can look as though mpv rendered below the display's real
+        // resolution even when the SurfaceTexture already matches the visible
+        // output rectangle. Keep the mobile-oriented fast profile, but replace
+        // only its downscaler with a proper convolution filter. Lanczos with
+        // correct downscaling produces the final display-sized image directly in
+        // mpv and does not allocate a larger Android surface.
+        MPVLib.setOptionString("dscale", "lanczos")
+        MPVLib.setOptionString("correct-downscaling", "yes")
+        MPVLib.setOptionString("dscale-antiring", "0")
+
         // When Save position on quit is disabled, old watch-later files must not restore
         // positions or any other per-file option before the activity can discard them.
         MPVLib.setOptionString("resume-playback", if (persistFileState) "yes" else "no")
