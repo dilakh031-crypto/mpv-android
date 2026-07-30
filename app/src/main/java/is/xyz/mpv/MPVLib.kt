@@ -18,27 +18,12 @@ object MPVLib {
     external fun create(appctx: Context)
     external fun init()
     external fun destroy()
-    external fun attachSurface(surface: Surface, width: Int, height: Int): Boolean
+    external fun attachSurface(surface: Surface)
     external fun detachSurface()
-    external fun resizeRenderSurface(width: Int, height: Int)
-    external fun setRenderState(
-        renderWidth: Int,
-        renderHeight: Int,
-        viewWidth: Int,
-        viewHeight: Int,
-        scale: Float,
-        translationX: Float,
-        translationY: Float,
-        fitScaleX: Float,
-        fitScaleY: Float,
-        fitTranslationX: Float,
-        fitTranslationY: Float,
-        geometrySerial: Long,
-    )
-    external fun beginRenderTransaction()
-    external fun endRenderTransaction()
 
     external fun command(cmd: Array<out String>)
+    external fun commandAsync(cmd: Array<out String>, userdata: Long): Int
+    external fun abortAsyncCommand(userdata: Long)
 
     external fun setOptionString(name: String, value: String): Int
 
@@ -119,6 +104,14 @@ object MPVLib {
         }
     }
 
+    @JvmStatic
+    fun eventEndFile(reachedEof: Boolean) {
+        synchronized(observers) {
+            for (o in observers)
+                o.eventEndFile(reachedEof)
+        }
+    }
+
     private val log_observers = mutableListOf<LogObserver>()
 
     @JvmStatic
@@ -150,6 +143,9 @@ object MPVLib {
         fun eventProperty(property: String, value: String)
         fun eventProperty(property: String, value: Double)
         fun event(eventId: Int)
+        fun eventEndFile(reachedEof: Boolean) {
+            event(MpvEvent.MPV_EVENT_END_FILE)
+        }
     }
 
     interface LogObserver {
