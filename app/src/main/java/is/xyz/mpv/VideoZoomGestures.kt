@@ -650,8 +650,19 @@ internal class VideoZoomGestures(
             // using the same high-resolution sizing strategy on the view-shaped window.
             if (zooming)
                 requestViewAspectOriginalRenderSurfaceSize(force)
-            else
-                requestBaseRenderSurfaceSize(force)
+            else {
+                refreshMetricsFromTarget()
+                val c = contentRect()
+                val oversized = viewWidth > 1f && viewHeight > 1f &&
+                    videoPixelWidth > 1 && videoPixelHeight > 1 &&
+                    c.w > 1f && c.h > 1f &&
+                    !originalDetailRenderSurfaceFitsLimits(
+                        viewWidth.toDouble(),
+                        viewHeight.toDouble(),
+                        c,
+                    )
+                requestBaseRenderSurfaceSize(force, highQualityDownscale = oversized)
+            }
             return
         }
 
@@ -667,8 +678,12 @@ internal class VideoZoomGestures(
             requestBaseRenderSurfaceSize(force)
     }
 
-    private fun requestBaseRenderSurfaceSize(force: Boolean) {
+    private fun requestBaseRenderSurfaceSize(
+        force: Boolean,
+        highQualityDownscale: Boolean = false,
+    ) {
         val player = renderTarget ?: return
+        player.setDisplaySizedFallbackQuality(highQualityDownscale)
         if (!force && renderSurfaceMode == RenderSurfaceMode.BASE)
             return
 
@@ -700,17 +715,18 @@ internal class VideoZoomGestures(
         val baseWidth = viewWidth.toDouble()
         val baseHeight = viewHeight.toDouble()
         if (!originalDetailRenderSurfaceFitsLimits(baseWidth, baseHeight, c)) {
-            // Do not ask Android for a partially capped oversized buffer. Some
-            // devices silently fall back to a buffer smaller than the display.
-            // For media beyond the safe surface limits, render at the exact
-            // TextureView/screen size instead.
-            requestBaseRenderSurfaceSize(force)
+            // SurfaceTexture can accept dimensions above the GPU's real render
+            // limit, after which the driver may silently allocate a smaller
+            // buffer. Use the real view-sized surface instead, which guarantees
+            // one output pixel per screen pixel and lets mpv downscale the image.
+            requestBaseRenderSurfaceSize(force, highQualityDownscale = true)
             return
         }
 
         val bufferScale = originalDetailBufferScale(c)
         val bufferWidth = ceilToIntAtLeastOne(baseWidth * bufferScale)
         val bufferHeight = ceilToIntAtLeastOne(baseHeight * bufferScale)
+        player.setDisplaySizedFallbackQuality(false)
         player.setRenderSurfaceSize(bufferWidth, bufferHeight)
         renderSurfaceMode = RenderSurfaceMode.VIEW_ASPECT_ORIGINAL
     }
@@ -741,16 +757,17 @@ internal class VideoZoomGestures(
         val baseWidth = c.w.toDouble()
         val baseHeight = c.h.toDouble()
         if (!originalDetailRenderSurfaceFitsLimits(baseWidth, baseHeight, c)) {
-            // Oversized source: use the full display-sized mpv surface instead
-            // of an intermediate capped surface that a GPU/SurfaceTexture may
-            // reduce below the screen resolution.
-            requestBaseRenderSurfaceSize(force)
+            // Never submit a partially supported oversized SurfaceTexture. A
+            // screen-sized mpv surface is preferable to a driver-selected
+            // fallback that can be lower than the display resolution.
+            requestBaseRenderSurfaceSize(force, highQualityDownscale = true)
             return
         }
 
         val bufferScale = originalDetailBufferScale(c)
         val bufferWidth = ceilToIntAtLeastOne(baseWidth * bufferScale)
         val bufferHeight = ceilToIntAtLeastOne(baseHeight * bufferScale)
+        player.setDisplaySizedFallbackQuality(false)
         player.setRenderSurfaceSize(bufferWidth, bufferHeight)
         renderSurfaceMode = RenderSurfaceMode.MEDIA_ASPECT_ORIGINAL
     }
@@ -773,21 +790,20 @@ internal class VideoZoomGestures(
             return
         }
 
-        val baseWidth = c.w.toDouble()
-        val baseHeight = c.h.toDouble()
-        if (!originalDetailRenderSurfaceFitsLimits(baseWidth, baseHeight, c)) {
-            // The original-detail surface would exceed the safe limits. Keep
-            // this very large image on the full screen-sized base surface so
-            // its fallback resolution can never be lower than the display.
-            requestBaseRenderSurfaceSize(force)
+        if (!originalDetailRenderSurfaceFitsLimits(c.w.toDouble(), c.h.toDouble(), c)) {
+            // For oversized still images keep the normal view on the exact
+            // display-sized surface as well. This avoids briefly switching to
+            // a compact surface before zoom starts.
+            requestBaseRenderSurfaceSize(force, highQualityDownscale = true)
             return
         }
 
         // Keep the same media-aspect geometry used by the high-quality zoom
         // surface, but render only at the on-screen content size while unzoomed.
         // This avoids the start/end aspect switch that causes the visible tear.
-        val bufferWidth = ceilToIntAtLeastOne(baseWidth)
-        val bufferHeight = ceilToIntAtLeastOne(baseHeight)
+        val bufferWidth = ceilToIntAtLeastOne(c.w.toDouble())
+        val bufferHeight = ceilToIntAtLeastOne(c.h.toDouble())
+        player.setDisplaySizedFallbackQuality(false)
         player.setRenderSurfaceSize(bufferWidth, bufferHeight)
         renderSurfaceMode = RenderSurfaceMode.MEDIA_ASPECT_BASE
     }
@@ -844,12 +860,17 @@ internal class VideoZoomGestures(
         val desiredWidth = baseWidth.coerceAtLeast(1.0) * desiredScale
         val desiredHeight = baseHeight.coerceAtLeast(1.0) * desiredScale
 
-        // Never partially cap an oversized original-detail surface. If it cannot
-        // be requested safely at its intended resolution, callers explicitly
-        // fall back to the full display-sized base surface instead. This avoids
-        // device/driver fallback buffers that can be smaller than the screen.
-        return max(desiredWidth, desiredHeight) <= MAX_RENDER_SURFACE_EDGE &&
-            desiredWidth * desiredHeight <= MAX_RENDER_SURFACE_PIXELS
+        // Respect the real GL texture/renderbuffer/viewport limit of the device
+        // instead of assuming that every Android GPU accepts an 8192px surface.
+        // If even the desired display geometry exceeds this limit, the caller
+        // uses the normal window surface rather than requesting a custom buffer.
+        val deviceEdge = renderTarget?.getMaximumRenderSurfaceEdge()?.toDouble()
+            ?: FALLBACK_RENDER_SURFACE_EDGE
+        val maxSafeEdge = min(MAX_RENDER_SURFACE_EDGE, deviceEdge).coerceAtLeast(1.0)
+        val maxSafePixels = min(MAX_RENDER_SURFACE_PIXELS, maxSafeEdge * maxSafeEdge)
+
+        return max(desiredWidth, desiredHeight) <= maxSafeEdge &&
+            desiredWidth * desiredHeight <= maxSafePixels
     }
 
     private fun originalDetailBufferScale(c: ContentRect): Double {
@@ -983,6 +1004,7 @@ internal class VideoZoomGestures(
         private const val VIEW_ORIENTATION_THRESHOLD = 1.08f
         private const val MEDIA_ASPECT_FALLBACK_WASTE_RATIO = 2.0
         private const val MEDIA_ASPECT_FALLBACK_MAX_EDGE = 8192.0
+        private const val FALLBACK_RENDER_SURFACE_EDGE = 2048.0
         private const val MAX_RENDER_SURFACE_EDGE = 8192.0
         private const val MAX_RENDER_SURFACE_PIXELS = MAX_RENDER_SURFACE_EDGE * MAX_RENDER_SURFACE_EDGE
 
