@@ -220,9 +220,9 @@ internal class MPVView(context: Context, attrs: AttributeSet) : BaseMPVView(cont
     }
 
     /**
-     * Change the two properties that define a panscan presentation. The patched
-     * mpv command completes only after VO has presented an explicitly marked
-     * frame from the final aspect+panscan state. Run it away from the UI thread:
+     * Change the two properties that define every aspect/panscan presentation.
+     * The patched mpv command completes only after VO has presented an explicitly
+     * marked frame from the final combined state. Run it away from the UI thread:
      * Android 9 must remain free to consume TextureView buffers while VO swaps.
      */
     fun setFileLocalAspectAndPanscan(

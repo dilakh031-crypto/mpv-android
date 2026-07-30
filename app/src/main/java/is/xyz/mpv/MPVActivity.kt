@@ -596,8 +596,8 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
         if (aspect == null || aspect <= 0.001 || size == null)
             return
 
-        // Cache one consistent geometry snapshot for the Android zoom surface.
-        // Normal playback stays on mpv's window-sized surface.
+        // Cache one consistent geometry snapshot for the persistent Android
+        // presentation surface used by both normal playback and zoom.
         try {
             zoomGestures.setVideoGeometry(
                 aspect = aspect,
@@ -2814,39 +2814,31 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
                 val ratio = ratios[item]
                 val targetOverride = if (ratio == "panscan") "-1" else ratio
                 val targetPanscan = if (ratio == "panscan") 1.0 else 0.0
-                val transitionTouchesPanscan =
-                    (MPVLib.getPropertyDouble("panscan") ?: 0.0) > 0.0 ||
-                    targetPanscan > 0.0 ||
-                    zoomGestures.hasPendingPanscanTransition()
 
-                if (transitionTouchesPanscan) {
-                    zoomGestures.performPanscanTransition { transitionComplete ->
-                        player.setFileLocalAspectAndPanscan(
-                            targetOverride,
-                            targetPanscan,
-                        ) { finalPresentationTime ->
-                            if (finalPresentationTime == null) {
-                                player.setFileLocalString(
-                                    "video-aspect-override",
-                                    targetOverride,
-                                )
-                                player.setFileLocalDouble("panscan", targetPanscan)
-                            }
-                            // Feed the final combined geometry to the zoom renderer
-                            // while the stable source frame still covers TextureView.
-                            syncZoomSurfaceGeometryWhenReady()
-                            binding.player.post {
-                                player.persistCurrentFileState()
-                            }
-                            transitionComplete(finalPresentationTime)
+                // Android owns the normal fit as well as zoom in this experiment,
+                // so every aspect choice can change its persistent producer
+                // geometry. Commit all choices through the same marked-frame
+                // transaction instead of exposing an intermediate surface.
+                zoomGestures.performAspectTransition { transitionComplete ->
+                    player.setFileLocalAspectAndPanscan(
+                        targetOverride,
+                        targetPanscan,
+                    ) { finalPresentationTime ->
+                        if (finalPresentationTime == null) {
+                            player.setFileLocalString(
+                                "video-aspect-override",
+                                targetOverride,
+                            )
+                            player.setFileLocalDouble("panscan", targetPanscan)
                         }
+                        // Feed the final combined geometry to the Android renderer
+                        // while the stable source frame still covers TextureView.
+                        syncZoomSurfaceGeometryWhenReady()
+                        binding.player.post {
+                            player.persistCurrentFileState()
+                        }
+                        transitionComplete(finalPresentationTime)
                     }
-                } else {
-                    // Keep ordinary ratio-to-ratio changes on their established
-                    // path; only panscan needs the two-property transaction.
-                    player.setFileLocalString("video-aspect-override", targetOverride)
-                    player.setFileLocalDouble("panscan", 0.0)
-                    player.persistCurrentFileState()
                 }
                 // Keep dialog open (apply-in-place).
             }

@@ -20,10 +20,12 @@ abstract class BaseMPVView(context: Context, attrs: AttributeSet) : TextureView(
         // scale/translation much smoother than transforming a SurfaceView layer,
         // especially on older Android devices where SurfaceView composition is
         // quantized by SurfaceFlinger/HWC.
-        // Zoom uses the original outer View transform and mpv always supplies an
-        // opaque frame. Retaining the edited build's opaque TextureView avoids an
-        // unnecessary full-screen blending pass while pinching and panning.
-        isOpaque = true
+        //
+        // The Android-owned presentation path uses TextureView.setTransform() to
+        // letterbox a media-aspect producer inside this full-screen View. Android's
+        // TextureView contract requires a non-opaque view when that transform does
+        // not cover every pixel; the black parent supplies the bars.
+        isOpaque = false
     }
 
     /**
@@ -120,8 +122,9 @@ abstract class BaseMPVView(context: Context, attrs: AttributeSet) : TextureView(
      * and scales the producer buffer to [destination], matching TextureView's
      * full-view presentation.
      *
-     * The method is deliberately a small capability exposed to the zoom handoff;
-     * mpv remains attached to this same Surface for the entire player lifetime.
+     * The method is deliberately a small capability exposed to real geometry
+     * handoffs; pinch zoom itself never calls it. mpv remains attached to this
+     * same Surface for the entire player lifetime.
      */
     fun requestSurfaceFrameCopy(
         destination: Bitmap,
