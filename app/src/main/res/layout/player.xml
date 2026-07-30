@@ -11,44 +11,18 @@
         android:layout_width="match_parent"
         android:layout_height="match_parent" />
 
-    <!--
-        Frame-synchronized render handoff used only for real producer-geometry
-        changes (file, rotation, aspect or panscan). Normal playback and pinch
-        share one persistent source-detail buffer, so zoom never touches this
-        overlay. A captured valid frame remains until confirmed destination
-        geometry is visible, never until a guessed timeout.
-    -->
-    <ImageView
-        android:id="@+id/renderHandoffOverlay"
-        android:layout_width="match_parent"
-        android:layout_height="match_parent"
-        android:background="@android:color/black"
-        android:importantForAccessibility="no"
-        android:scaleType="matrix"
-        android:visibility="gone" />
-
-    <!--
-        Gesture layer.
-
-        IMPORTANT: This view must not be transformed.
-        We transform the player View while zooming.
-        If we attached gesture handling directly to that transformed View,
-        Android would deliver touch coordinates that are continuously re-mapped
-        by the inverse transform matrix, causing feedback/jitter while zooming/panning.
-    -->
+    <!-- Touch coordinates stay independent from the app-owned GL surface. -->
     <View
         android:id="@+id/gestureLayer"
         android:layout_width="match_parent"
         android:layout_height="match_parent"
-        android:background="@android:color/transparent"
-        android:elevation="1dp" />
+        android:background="@android:color/transparent" />
 
     <!-- so that insets can be applied as margins -->
     <RelativeLayout
         android:id="@+id/outside"
         android:layout_width="match_parent"
-        android:layout_height="match_parent"
-        android:elevation="2dp">
+        android:layout_height="match_parent">
 
         <LinearLayout
             android:id="@+id/controls"
