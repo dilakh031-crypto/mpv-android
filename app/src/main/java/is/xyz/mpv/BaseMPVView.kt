@@ -2,12 +2,6 @@ package `is`.xyz.mpv
 
 import android.content.Context
 import android.graphics.SurfaceTexture
-import android.opengl.EGL14
-import android.opengl.EGLConfig
-import android.opengl.EGLContext
-import android.opengl.EGLDisplay
-import android.opengl.EGLSurface
-import android.opengl.GLES20
 import android.util.AttributeSet
 import android.util.Log
 import android.view.Surface
@@ -105,115 +99,7 @@ abstract class BaseMPVView(context: Context, attrs: AttributeSet) : TextureView(
     private var renderSurfaceHeight = 0
     private var customRenderSurfaceSize = false
 
-    private val cachedMaximumGpuTextureSize: Int by lazy(LazyThreadSafetyMode.SYNCHRONIZED) {
-        queryMaximumGpuTextureSize()
-    }
-
     var onSurfaceTextureFrameAvailable: (() -> Unit)? = null
-
-    /**
-     * Return the maximum 2D texture edge accepted by the device's OpenGL ES driver.
-     * Very large still images must be reduced before they reach the GPU when either
-     * source edge exceeds this value; changing only the output SurfaceTexture size
-     * cannot make an oversized source texture uploadable.
-     */
-    fun getMaximumGpuTextureSize(): Int = cachedMaximumGpuTextureSize
-
-    private fun queryMaximumGpuTextureSize(): Int {
-        val display = EGL14.eglGetDisplay(EGL14.EGL_DEFAULT_DISPLAY)
-        if (display == EGL14.EGL_NO_DISPLAY)
-            return FALLBACK_MAX_TEXTURE_SIZE
-
-        val version = IntArray(2)
-        if (!EGL14.eglInitialize(display, version, 0, version, 1))
-            return FALLBACK_MAX_TEXTURE_SIZE
-
-        val previousApi = EGL14.eglQueryAPI()
-        if (!EGL14.eglBindAPI(EGL14.EGL_OPENGL_ES_API))
-            return FALLBACK_MAX_TEXTURE_SIZE
-
-        val configs = arrayOfNulls<EGLConfig>(1)
-        val configCount = IntArray(1)
-        val configAttributes = intArrayOf(
-            EGL14.EGL_RENDERABLE_TYPE, EGL14.EGL_OPENGL_ES2_BIT,
-            EGL14.EGL_SURFACE_TYPE, EGL14.EGL_PBUFFER_BIT,
-            EGL14.EGL_RED_SIZE, 8,
-            EGL14.EGL_GREEN_SIZE, 8,
-            EGL14.EGL_BLUE_SIZE, 8,
-            EGL14.EGL_ALPHA_SIZE, 8,
-            EGL14.EGL_NONE,
-        )
-        if (!EGL14.eglChooseConfig(
-                display, configAttributes, 0, configs, 0, configs.size, configCount, 0
-            ) || configCount[0] <= 0) {
-            return FALLBACK_MAX_TEXTURE_SIZE
-        }
-
-        val config = configs[0] ?: return FALLBACK_MAX_TEXTURE_SIZE
-        val contextAttributes = intArrayOf(
-            EGL14.EGL_CONTEXT_CLIENT_VERSION, 2,
-            EGL14.EGL_NONE,
-        )
-        val pbufferAttributes = intArrayOf(
-            EGL14.EGL_WIDTH, 1,
-            EGL14.EGL_HEIGHT, 1,
-            EGL14.EGL_NONE,
-        )
-
-        var context: EGLContext = EGL14.EGL_NO_CONTEXT
-        var surface: EGLSurface = EGL14.EGL_NO_SURFACE
-        var madeCurrent = false
-        val previousDisplay: EGLDisplay = EGL14.eglGetCurrentDisplay()
-        val previousContext: EGLContext = EGL14.eglGetCurrentContext()
-        val previousDrawSurface: EGLSurface = EGL14.eglGetCurrentSurface(EGL14.EGL_DRAW)
-        val previousReadSurface: EGLSurface = EGL14.eglGetCurrentSurface(EGL14.EGL_READ)
-
-        return try {
-            context = EGL14.eglCreateContext(
-                display, config, EGL14.EGL_NO_CONTEXT, contextAttributes, 0
-            )
-            if (context == EGL14.EGL_NO_CONTEXT)
-                return FALLBACK_MAX_TEXTURE_SIZE
-
-            surface = EGL14.eglCreatePbufferSurface(display, config, pbufferAttributes, 0)
-            if (surface == EGL14.EGL_NO_SURFACE)
-                return FALLBACK_MAX_TEXTURE_SIZE
-
-            madeCurrent = EGL14.eglMakeCurrent(display, surface, surface, context)
-            if (!madeCurrent)
-                return FALLBACK_MAX_TEXTURE_SIZE
-
-            val value = IntArray(1)
-            GLES20.glGetIntegerv(GLES20.GL_MAX_TEXTURE_SIZE, value, 0)
-            val detected = value[0]
-            Log.i(TAG, "OpenGL ES maximum 2D texture edge: $detected")
-            detected.takeIf { it >= MIN_REASONABLE_TEXTURE_SIZE }
-                ?: FALLBACK_MAX_TEXTURE_SIZE
-        } catch (e: Throwable) {
-            Log.w(TAG, "Unable to query OpenGL ES maximum texture size", e)
-            FALLBACK_MAX_TEXTURE_SIZE
-        } finally {
-            if (madeCurrent) {
-                if (previousDisplay != EGL14.EGL_NO_DISPLAY &&
-                    previousContext != EGL14.EGL_NO_CONTEXT) {
-                    EGL14.eglMakeCurrent(
-                        previousDisplay, previousDrawSurface, previousReadSurface, previousContext
-                    )
-                } else {
-                    EGL14.eglMakeCurrent(
-                        display, EGL14.EGL_NO_SURFACE, EGL14.EGL_NO_SURFACE, EGL14.EGL_NO_CONTEXT
-                    )
-                }
-            }
-            if (surface != EGL14.EGL_NO_SURFACE)
-                EGL14.eglDestroySurface(display, surface)
-            if (context != EGL14.EGL_NO_CONTEXT)
-                EGL14.eglDestroyContext(display, context)
-            if (previousApi != EGL14.EGL_OPENGL_ES_API)
-                EGL14.eglBindAPI(previousApi)
-            // Do not call eglTerminate(): mpv may use the same process-wide EGLDisplay.
-        }
-    }
 
     /**
      * Set the real SurfaceTexture buffer size used by mpv without changing the
@@ -330,7 +216,5 @@ abstract class BaseMPVView(context: Context, attrs: AttributeSet) : TextureView(
 
     companion object {
         private const val TAG = "mpv"
-        private const val FALLBACK_MAX_TEXTURE_SIZE = 4096
-        private const val MIN_REASONABLE_TEXTURE_SIZE = 2048
     }
 }

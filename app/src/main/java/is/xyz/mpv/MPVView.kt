@@ -14,17 +14,11 @@ import `is`.xyz.mpv.MPVLib.MpvFormat.MPV_FORMAT_INT64
 import `is`.xyz.mpv.MPVLib.MpvFormat.MPV_FORMAT_NONE
 import `is`.xyz.mpv.MPVLib.MpvFormat.MPV_FORMAT_STRING
 import java.security.MessageDigest
-import kotlin.math.ceil
 import kotlin.reflect.KProperty
 
 internal class MPVView(context: Context, attrs: AttributeSet) : BaseMPVView(context, attrs) {
     private var watchLaterOptionsBeforeDisable: String? = null
     private var watchLaterOptionsSuppressed = false
-
-    private var hugeImageSourceWidth = 0
-    private var hugeImageSourceHeight = 0
-    private var hugeImageFallbackFilterSpec: String? = null
-    private var highResolutionImageScalerConfigured = false
 
     override fun initOptions() {
         val sharedPreferences = PreferenceManager.getDefaultSharedPreferences(context)
@@ -376,8 +370,6 @@ internal class MPVView(context: Context, attrs: AttributeSet) : BaseMPVView(cont
             Property("video-params/rotate", MPV_FORMAT_DOUBLE),
             Property("video-params/w", MPV_FORMAT_INT64),
             Property("video-params/h", MPV_FORMAT_INT64),
-            Property("current-tracks/video/demux-w", MPV_FORMAT_INT64),
-            Property("current-tracks/video/demux-h", MPV_FORMAT_INT64),
             Property("video-aspect-override", MPV_FORMAT_STRING),
             Property("panscan", MPV_FORMAT_DOUBLE),
             Property("playlist-pos", MPV_FORMAT_INT64),
@@ -561,153 +553,6 @@ internal class MPVView(context: Context, attrs: AttributeSet) : BaseMPVView(cont
         return if (rot % 180 == 90) h to w else w to h
     }
 
-    /**
-     * Remove the private software downscale filter used for the previous file.
-     * The label makes this independent from every user-defined video filter.
-     */
-    fun resetHugeImageScreenFallback() {
-        removeHugeImageScreenFallback()
-        hugeImageSourceWidth = 0
-        hugeImageSourceHeight = 0
-        highResolutionImageScalerConfigured = false
-    }
-
-    /**
-     * Images with an edge larger than GL_MAX_TEXTURE_SIZE cannot be uploaded to
-     * the GPU at their decoded size. Reduce only those images in the software
-     * filter chain, before the VO upload, to the exact visible image rectangle.
-     *
-     * Normal images and videos are deliberately untouched. The existing compact
-     * media-aspect SurfaceTexture then has the same dimensions as this frame, so
-     * mpv and Android do not perform a second visible downscale.
-     */
-    fun applyHugeImageScreenFallbackIfNeeded() {
-        val imageFlag = MPVLib.getPropertyString("current-tracks/video/image")
-        if (imageFlag != "yes") {
-            if (imageFlag == "no")
-                resetHugeImageScreenFallback()
-            return
-        }
-
-        val demuxWidth = positiveProperty("current-tracks/video/demux-w")
-        val demuxHeight = positiveProperty("current-tracks/video/demux-h")
-        if (demuxWidth > 0 && demuxHeight > 0) {
-            // demux-* remains the unfiltered source size after vf changes video-params.
-            hugeImageSourceWidth = demuxWidth
-            hugeImageSourceHeight = demuxHeight
-        } else if (hugeImageSourceWidth <= 0 || hugeImageSourceHeight <= 0) {
-            val decodedWidth = positiveProperty("video-params/w")
-            val decodedHeight = positiveProperty("video-params/h")
-            if (decodedWidth <= 0 || decodedHeight <= 0)
-                return
-            hugeImageSourceWidth = decodedWidth
-            hugeImageSourceHeight = decodedHeight
-        }
-
-        val sourceWidth = hugeImageSourceWidth
-        val sourceHeight = hugeImageSourceHeight
-        val maxTextureSize = getMaximumGpuTextureSize()
-
-        val viewWidth = width
-        val viewHeight = height
-        if (viewWidth <= 1 || viewHeight <= 1)
-            return
-
-        val rawRotation = MPVLib.getPropertyInt("video-params/rotate")
-            ?: MPVLib.getPropertyInt("current-tracks/video/demux-rotation")
-            ?: 0
-        val rotation = ((rawRotation % 360) + 360) % 360
-        val quarterTurn = rotation == 90 || rotation == 270
-        val displayedSourceWidth = if (quarterTurn) sourceHeight else sourceWidth
-        val displayedSourceHeight = if (quarterTurn) sourceWidth else sourceHeight
-        if (displayedSourceWidth <= 0 || displayedSourceHeight <= 0)
-            return
-
-        // Match the same effective display aspect used by VideoZoomGestures, including
-        // video-aspect-override. Falling back to the source pixel aspect keeps startup safe
-        // while mpv is still publishing the effective aspect property.
-        val sourceAspect = getEffectiveVideoAspect()
-            ?.takeIf { it > 0.001 && it.isFinite() }
-            ?: (displayedSourceWidth.toDouble() / displayedSourceHeight.toDouble())
-        val viewAspect = viewWidth.toDouble() / viewHeight.toDouble()
-        val displayedTargetWidth: Int
-        val displayedTargetHeight: Int
-        if (sourceAspect >= viewAspect) {
-            displayedTargetWidth = viewWidth
-            displayedTargetHeight = ceil(viewWidth.toDouble() / sourceAspect).toInt()
-                .coerceIn(1, viewHeight)
-        } else {
-            displayedTargetHeight = viewHeight
-            displayedTargetWidth = ceil(viewHeight.toDouble() * sourceAspect).toInt()
-                .coerceIn(1, viewWidth)
-        }
-
-        val needsDisplayDownscale =
-            displayedSourceWidth > displayedTargetWidth ||
-                displayedSourceHeight > displayedTargetHeight
-        if (needsDisplayDownscale && !highResolutionImageScalerConfigured) {
-            // The app starts with mpv's fast profile. Use the sharpened Lanczos
-            // scaler only for still images that actually need downscaling. Unlike
-            // Mitchell, this does not add the softness reported by the previous fix.
-            setFileLocalString("dscale", "ewa_lanczossharp")
-            setFileLocalString("cscale", "ewa_lanczossharp")
-            setFileLocalString("correct-downscaling", "yes")
-            highResolutionImageScalerConfigured = true
-        }
-
-        if (sourceWidth <= maxTextureSize && sourceHeight <= maxTextureSize) {
-            // The normal GPU path is safe. Keep the original-detail zoom surface,
-            // but use the sharper downscaler above for the unzoomed screen fit.
-            removeHugeImageScreenFallback()
-            return
-        }
-
-        // libavfilter sees the frame before mpv applies display rotation.
-        val filterWidth = (if (quarterTurn) displayedTargetHeight else displayedTargetWidth)
-            .coerceAtMost(sourceWidth)
-            .coerceAtLeast(1)
-        val filterHeight = (if (quarterTurn) displayedTargetWidth else displayedTargetHeight)
-            .coerceAtMost(sourceHeight)
-            .coerceAtLeast(1)
-
-        val filterSpec =
-            "@$HUGE_IMAGE_FILTER_LABEL:lavfi=[scale=w=$filterWidth:h=$filterHeight:" +
-                "flags=lanczos+accurate_rnd+full_chroma_int]"
-        if (filterSpec == hugeImageFallbackFilterSpec)
-            return
-
-        val previousFilterSpec = hugeImageFallbackFilterSpec
-        hugeImageFallbackFilterSpec = filterSpec
-        try {
-            // Reusing a label replaces only our entry and preserves the user's vf chain.
-            MPVLib.command(arrayOf("no-osd", "vf", "add", filterSpec))
-            Log.i(
-                TAG,
-                "software-scaling oversized image ${sourceWidth}x${sourceHeight} " +
-                    "(GPU limit $maxTextureSize) to ${filterWidth}x${filterHeight}",
-            )
-        } catch (e: Throwable) {
-            hugeImageFallbackFilterSpec = previousFilterSpec
-            Log.w(TAG, "Unable to install oversized-image screen fallback", e)
-        }
-    }
-
-    private fun positiveProperty(name: String): Int {
-        return (MPVLib.getPropertyInt(name) ?: 0).coerceAtLeast(0)
-    }
-
-    private fun removeHugeImageScreenFallback() {
-        if (hugeImageFallbackFilterSpec == null)
-            return
-        try {
-            MPVLib.command(arrayOf("no-osd", "vf", "remove", "@$HUGE_IMAGE_FILTER_LABEL"))
-        } catch (e: Throwable) {
-            Log.w(TAG, "Unable to remove oversized-image screen fallback", e)
-        } finally {
-            hugeImageFallbackFilterSpec = null
-        }
-    }
-
     fun setAudioSessionId(id: Int) {
         MPVLib.setPropertyInt("audiotrack-session-id", id)
         MPVLib.setPropertyInt("aaudio-session-id", id)
@@ -803,7 +648,6 @@ internal class MPVView(context: Context, attrs: AttributeSet) : BaseMPVView(cont
 
     companion object {
         private const val TAG = "mpv"
-        private const val HUGE_IMAGE_FILTER_LABEL = "mpv_android_huge_image_screen"
 
         // Options controlled per media item by the Android UI. These are both reset between
         // playlist entries and included in watch-later persistence.
