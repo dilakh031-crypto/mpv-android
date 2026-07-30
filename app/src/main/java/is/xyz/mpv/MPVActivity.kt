@@ -3491,11 +3491,7 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
         if (!activityIsForeground) return
         when (property) {
             "track-list" -> player.loadTracks()
-            "current-tracks/audio/selected" -> updateAudioUI()
-            "current-tracks/video/image" -> {
-                updateAudioUI()
-                player.applyHighResolutionImageQuality()
-            }
+            "current-tracks/audio/selected", "current-tracks/video/image" -> updateAudioUI()
             "hwdec-current" -> updateDecoderButton()
         }
         if (metaUpdated)
@@ -3518,7 +3514,6 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
             "time-pos" -> updatePlaybackPos(psc.positionSec)
             "playlist-pos", "playlist-count" -> updatePlaylistButtons()
             "video-params/w", "video-params/h" -> {
-                player.applyHighResolutionImageQuality()
                 syncZoomVideoGeometry()
                 prepareZoomSurfaceAndRevealWhenReady()
             }
@@ -3530,7 +3525,6 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
         when (property) {
             "duration/full" -> updatePlaybackDuration(psc.durationSec)
             "video-params/aspect", "video-params/rotate" -> {
-                player.applyHighResolutionImageQuality()
                 updateOrientation()
                 updatePiPParams()
                 syncZoomVideoGeometry()
