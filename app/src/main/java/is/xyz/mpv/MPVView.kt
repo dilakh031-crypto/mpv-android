@@ -13,38 +13,23 @@ import `is`.xyz.mpv.MPVLib.MpvFormat.MPV_FORMAT_FLAG
 import `is`.xyz.mpv.MPVLib.MpvFormat.MPV_FORMAT_INT64
 import `is`.xyz.mpv.MPVLib.MpvFormat.MPV_FORMAT_NONE
 import `is`.xyz.mpv.MPVLib.MpvFormat.MPV_FORMAT_STRING
-import java.security.MessageDigest
-import java.util.concurrent.Executors
 import kotlin.reflect.KProperty
 
 internal class MPVView(context: Context, attrs: AttributeSet) : BaseMPVView(context, attrs) {
-    private var watchLaterOptionsBeforeDisable: String? = null
-    private var watchLaterOptionsSuppressed = false
-    private val geometryCommandExecutor =
-        Executors.newSingleThreadExecutor { task ->
-            Thread(task, "mpv-geometry-command").apply { isDaemon = true }
-        }
-    @Volatile
-    private var geometryCommandsReleased = false
+    private var configuredHwdec = "no"
 
     override fun initOptions() {
         val sharedPreferences = PreferenceManager.getDefaultSharedPreferences(context)
-        val persistFileState = sharedPreferences.getBoolean("save_position", false)
 
         // apply phone-optimized defaults
         MPVLib.setOptionString("profile", "fast")
-        // When Save position on quit is disabled, old watch-later files must not restore
-        // positions or any other per-file option before the activity can discard them.
-        MPVLib.setOptionString("resume-playback", if (persistFileState) "yes" else "no")
 
-        // vo
-        setVo(if (sharedPreferences.getBoolean("gpu_next", false))
-            "gpu-next"
-        else
-            "gpu")
+        // The app owns the Android display surface. mpv remains the filtered
+        // frame renderer, targeting an off-screen FBO through vo=libmpv.
+        setVo("libmpv")
 
         // hwdec
-        val hwdec = if (sharedPreferences.getBoolean("hardware_decoding", true))
+        configuredHwdec = if (sharedPreferences.getBoolean("hardware_decoding", true))
             HWDECS
         else
             "no"
@@ -109,18 +94,14 @@ internal class MPVView(context: Context, attrs: AttributeSet) : BaseMPVView(cont
             MPVLib.setOptionString("vd-lavc-skiploopfilter", "nonkey")
         }
 
-        MPVLib.setOptionString("gpu-context", "android")
         MPVLib.setOptionString("opengl-es", "yes")
-        MPVLib.setOptionString("hwdec", hwdec)
+        MPVLib.setOptionString("hwdec", configuredHwdec)
         MPVLib.setOptionString("hwdec-codecs", "h264,hevc,mpeg4,mpeg2video,vp8,vp9,av1")
         MPVLib.setOptionString("ao", "audiotrack,opensles")
         MPVLib.setOptionString("audio-set-media-role", "yes")
         MPVLib.setOptionString("tls-verify", "yes")
         MPVLib.setOptionString("tls-ca-file", "${this.context.filesDir.path}/cacert.pem")
         MPVLib.setOptionString("input-default-bindings", "yes")
-        // Keep still images open indefinitely instead of letting mpv advance/end them
-        // after its default image display timeout.
-        MPVLib.setOptionString("image-display-duration", "inf")
         // Limit demuxer cache since the defaults are too high for mobile devices
         val cacheMegs = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O_MR1) 64 else 32
         MPVLib.setOptionString("demuxer-max-bytes", "${cacheMegs * 1024 * 1024}")
@@ -134,217 +115,13 @@ internal class MPVView(context: Context, attrs: AttributeSet) : BaseMPVView(cont
     }
 
     override fun postInitOptions() {
-        // We call write-watch-later manually, including before every explicit playlist jump.
+        // we need to call write-watch-later manually
         MPVLib.setOptionString("save-position-on-quit", "no")
 
-        // Runtime option changes normally leak into the next playlist item. Reset every option
-        // exposed as a per-video control by this app, including changes made through input.conf.
-        mergeStringListProperty("reset-on-next-file", PER_FILE_PLAYBACK_OPTIONS + "start")
-
-        val sharedPreferences = PreferenceManager.getDefaultSharedPreferences(context)
-        configureFileStatePersistence(sharedPreferences.getBoolean("save_position", false))
-    }
-
-    /**
-     * Apply the Save position on quit preference to both reading and writing watch-later data.
-     * This is public so a preference change can take effect without recreating libmpv.
-     */
-    fun configureFileStatePersistence(enabled: Boolean) {
-        MPVLib.setPropertyString("resume-playback", if (enabled) "yes" else "no")
-        if (enabled) {
-            // Restore the complete pre-disable list first. This preserves mpv/user options that
-            // are unrelated to the controls managed by this app when the switch is toggled live.
-            if (watchLaterOptionsSuppressed) {
-                watchLaterOptionsBeforeDisable?.let {
-                    MPVLib.setPropertyString("watch-later-options", it)
-                }
-                watchLaterOptionsBeforeDisable = null
-                watchLaterOptionsSuppressed = false
-            }
-
-            // Saving is all-or-nothing for this app: position and every app-controlled per-file
-            // option are stored together while the preference is enabled.
-            mergeStringListProperty(
-                "watch-later-options",
-                PER_FILE_PLAYBACK_OPTIONS + "start"
-            )
-        } else {
-            if (!watchLaterOptionsSuppressed) {
-                watchLaterOptionsBeforeDisable =
-                    MPVLib.getPropertyString("watch-later-options")
-                watchLaterOptionsSuppressed = true
-            }
-
-            // An empty list also prevents an input.conf write-watch-later-config command from
-            // serializing gamma, delays, tracks or any other app-controlled file state.
-            MPVLib.setPropertyString("watch-later-options", "")
-        }
-    }
-
-    private fun mergeStringListProperty(
-        property: String,
-        required: Collection<String>,
-        remove: Collection<String> = emptyList()
-    ) {
-        val current = MPVLib.getPropertyString(property)
-            ?.split(',')
-            ?.map { it.trim() }
-            ?.filter { it.isNotEmpty() }
-            ?.toMutableList()
-            ?: mutableListOf()
-
-        current.removeAll(remove.toSet())
-        if (!current.contains("all")) {
-            for (option in required) {
-                if (!current.contains(option))
-                    current.add(option)
-            }
-        }
-        MPVLib.setPropertyString(property, current.joinToString(","))
-    }
-
-    /**
-     * Set an option only for the currently playing file. `file-local-options` guarantees that the
-     * value is restored to the pre-file value when this file unloads.
-     */
-    fun setFileLocalString(name: String, value: String) {
-        MPVLib.setPropertyString("file-local-options/$name", value)
-    }
-
-    fun setFileLocalInt(name: String, value: Int) {
-        MPVLib.setPropertyInt("file-local-options/$name", value)
-    }
-
-    fun setFileLocalDouble(name: String, value: Double) {
-        MPVLib.setPropertyDouble("file-local-options/$name", value)
-    }
-
-    /**
-     * Change the two properties that define every aspect/panscan presentation.
-     * The patched mpv command completes only after VO has presented an explicitly
-     * marked frame from the final combined state. Run it away from the UI thread:
-     * Android 9 must remain free to consume TextureView buffers while VO swaps.
-     */
-    fun setFileLocalAspectAndPanscan(
-        aspectOverride: String,
-        panscan: Double,
-        onComplete: (Long?) -> Unit,
-    ) {
-        if (geometryCommandsReleased) {
-            post { onComplete(null) }
-            return
-        }
-
-        try {
-            geometryCommandExecutor.execute {
-                val result = MPVLib.setAspectAndPanscan(aspectOverride, panscan)
-                if (result < 0)
-                    Log.e(TAG, "Synchronized aspect/panscan command failed with mpv error $result")
-                post {
-                    if (!geometryCommandsReleased)
-                        onComplete(result.takeIf { it >= 0 })
-                }
-            }
-        } catch (_: Throwable) {
-            post {
-                if (!geometryCommandsReleased)
-                    onComplete(null)
-            }
-        }
-    }
-
-    fun releaseGeometryCommands() {
-        geometryCommandsReleased = true
-        geometryCommandExecutor.shutdownNow()
-    }
-
-    fun persistCurrentFileState() {
-        if (!fileStatePersistenceEnabled())
-            return
-        persistCurrentPlaybackOptions()
-        // During teardown/pathological load failures there may be no writable current file.
-        if (MPVLib.getPropertyString("path") != null)
-            MPVLib.command(arrayOf("write-watch-later-config"))
-    }
-
-    /**
-     * Keep this file's playback options while removing its resume position.
-     *
-     * The Java property callback can run after mpv has started unloading the completed file.
-     * Rewriting watch-later at that point is racy: properties such as gamma may already be
-     * unavailable, while `start` can survive in an older file. App-controlled options are
-     * therefore stored separately as they change, and the watch-later file is deleted outright.
-     */
-    fun persistCurrentFileStateWithoutPosition(path: String) {
-        if (!fileStatePersistenceEnabled())
-            return
-
-        // Capture one last snapshot only if the completed file is still current. If it has
-        // already unloaded, the snapshots taken when settings changed remain authoritative.
-        if (MPVLib.getPropertyString("path") == path)
-            persistCurrentPlaybackOptions()
-
-        MPVLib.command(arrayOf("delete-watch-later-config", path))
-    }
-
-    /**
-     * Save options that must survive a completed file independently of watch-later `start`.
-     * Track selections are handled by MPVActivity because external tracks also need filenames.
-     */
-    fun persistCurrentPlaybackOptions() {
-        if (!fileStatePersistenceEnabled())
-            return
-        val path = MPVLib.getPropertyString("path") ?: return
-        val preferences = PreferenceManager.getDefaultSharedPreferences(context)
-
-        with (preferences.edit()) {
-            for (option in APP_PERSISTED_PLAYBACK_OPTIONS) {
-                val key = perFilePlaybackOptionKey(path, option)
-                val value = MPVLib.getPropertyString(option)
-                if (value == null)
-                    remove(key)
-                else
-                    putString(key, value)
-            }
-            commit()
-        }
-    }
-
-    fun restoreCurrentFilePlaybackOptions() {
-        if (!fileStatePersistenceEnabled())
-            return
-        val path = MPVLib.getPropertyString("path") ?: return
-        val preferences = PreferenceManager.getDefaultSharedPreferences(context)
-
-        for (option in APP_PERSISTED_PLAYBACK_OPTIONS) {
-            val value = preferences.getString(perFilePlaybackOptionKey(path, option), null)
-                ?: continue
-            setFileLocalString(option, value)
-        }
-    }
-
-    fun clearPersistedPlaybackOptions(path: String) {
-        val preferences = PreferenceManager.getDefaultSharedPreferences(context)
-        with (preferences.edit()) {
-            for (option in APP_PERSISTED_PLAYBACK_OPTIONS)
-                remove(perFilePlaybackOptionKey(path, option))
-            commit()
-        }
-    }
-
-    private fun perFilePlaybackOptionKey(path: String, option: String): String {
-        val digest = MessageDigest.getInstance("SHA-1")
-            .digest(path.toByteArray(Charsets.UTF_8))
-        val pathHash = buildString(digest.size * 2) {
-            for (byte in digest)
-                append(String.format("%02x", byte))
-        }
-        return "perfile_playback_${pathHash}_$option"
-    }
-
-    private fun fileStatePersistenceEnabled(): Boolean {
-        return PreferenceManager.getDefaultSharedPreferences(context)
-            .getBoolean("save_position", false)
+        // mpv.conf is intentionally loaded after the normal defaults above.
+        // Reassert the copy-capable decoder here because direct mediacodec
+        // bypasses both the libmpv FBO and every video/GPU filter.
+        MPVLib.setPropertyString("hwdec", configuredHwdec)
     }
 
     fun onPointerEvent(event: MotionEvent): Boolean {
@@ -416,6 +193,10 @@ internal class MPVView(context: Context, attrs: AttributeSet) : BaseMPVView(cont
             Property("video-params/rotate", MPV_FORMAT_DOUBLE),
             Property("video-params/w", MPV_FORMAT_INT64),
             Property("video-params/h", MPV_FORMAT_INT64),
+            Property("video-out-params/aspect", MPV_FORMAT_DOUBLE),
+            Property("video-out-params/rotate", MPV_FORMAT_DOUBLE),
+            Property("video-out-params/w", MPV_FORMAT_INT64),
+            Property("video-out-params/h", MPV_FORMAT_INT64),
             Property("video-aspect-override", MPV_FORMAT_STRING),
             Property("panscan", MPV_FORMAT_DOUBLE),
             Property("playlist-pos", MPV_FORMAT_INT64),
@@ -426,7 +207,6 @@ internal class MPVView(context: Context, attrs: AttributeSet) : BaseMPVView(cont
             Property("loop-playlist"),
             Property("loop-file"),
             Property("shuffle", MPV_FORMAT_FLAG),
-            Property("eof-reached", MPV_FORMAT_FLAG),
             Property("hwdec-current"),
             Property("mute", MPV_FORMAT_FLAG),
             Property("current-tracks/audio/selected")
@@ -527,21 +307,21 @@ internal class MPVView(context: Context, attrs: AttributeSet) : BaseMPVView(cont
 
     var playbackSpeed: Double?
         get() = MPVLib.getPropertyDouble("speed")
-        set(speed) = setFileLocalDouble("speed", speed!!)
+        set(speed) = MPVLib.setPropertyDouble("speed", speed!!)
 
     var subDelay: Double?
         get() = MPVLib.getPropertyDouble("sub-delay")
-        set(delay) = setFileLocalDouble("sub-delay", delay!!)
+        set(speed) = MPVLib.setPropertyDouble("sub-delay", speed!!)
 
     var secondarySubDelay: Double?
         get() = MPVLib.getPropertyDouble("secondary-sub-delay")
-        set(delay) = setFileLocalDouble("secondary-sub-delay", delay!!)
+        set(speed) = MPVLib.setPropertyDouble("secondary-sub-delay", speed!!)
 
     val estimatedVfFps: Double?
         get() = MPVLib.getPropertyDouble("estimated-vf-fps")
 
     /**
-     * Returns the video's native aspect ratio. Rotation is taken into account.
+     * Returns the video aspect ratio. Rotation is taken into account.
      */
     fun getVideoAspect(): Double? {
         return MPVLib.getPropertyDouble("video-params/aspect")?.let {
@@ -552,40 +332,36 @@ internal class MPVView(context: Context, attrs: AttributeSet) : BaseMPVView(cont
     }
 
     /**
-     * Returns the aspect ratio that mpv is currently displaying. This includes
-     * video-aspect-override values coming either from the in-app aspect menu or
-     * from mpv.conf, so the zoom render surface can keep the same geometry as mpv.
+     * The aspect mpv is actually displaying, including an aspect override.
+     * Rotation is applied in the same order as mpv.
      */
     fun getEffectiveVideoAspect(): Double? {
         parseAspectRatio(MPVLib.getPropertyString("video-aspect-override"))?.let {
-            // video-aspect-override describes the unrotated frame. mpv applies
-            // display rotation afterwards, so a rotated 4:3 frame is shown as
-            // 3:4. Keeping that order here makes the Android zoom rectangle
-            // identical to mpv in both device orientations.
             return orientAspectForVideoRotation(it)
         }
-        return getVideoAspect()
+        return MPVLib.getPropertyDouble("video-out-params/aspect")?.let {
+            if (it < 0.001) 0.0 else orientAspectForVideoRotation(it)
+        } ?: getVideoAspect()
     }
 
     private fun orientAspectForVideoRotation(aspect: Double): Double {
-        val rotation = ((MPVLib.getPropertyInt("video-params/rotate") ?: 0) % 360 + 360) % 360
-        return if (rotation == 90 || rotation == 270)
-            1.0 / aspect
-        else
-            aspect
+        val rotationValue =
+            MPVLib.getPropertyInt("video-out-params/rotate")
+                ?: MPVLib.getPropertyInt("video-params/rotate")
+                ?: 0
+        val rotation = ((rotationValue % 360) + 360) % 360
+        return if (rotation == 90 || rotation == 270) 1.0 / aspect else aspect
     }
 
-    fun getPanscan(): Double {
-        return MPVLib.getPropertyDouble("panscan") ?: 0.0
-    }
+    fun getPanscan(): Double = MPVLib.getPropertyDouble("panscan") ?: 0.0
 
     private fun parseAspectRatio(value: String?): Double? {
-        val trimmed = value?.trim() ?: return null
-        if (trimmed.isEmpty() || trimmed == "-1" || trimmed.equals("no", true))
+        val text = value?.trim() ?: return null
+        if (text.isEmpty() || text == "-1" || text.equals("no", true))
             return null
 
-        val parts = trimmed.split(':', limit = 2)
-        val parsed = if (parts.size == 2) {
+        val parts = text.split(':', limit = 2)
+        val ratio = if (parts.size == 2) {
             val width = parts[0].toDoubleOrNull()
             val height = parts[1].toDoubleOrNull()
             if (width != null && height != null && height != 0.0)
@@ -593,18 +369,32 @@ internal class MPVView(context: Context, attrs: AttributeSet) : BaseMPVView(cont
             else
                 null
         } else {
-            trimmed.toDoubleOrNull()
+            text.toDoubleOrNull()
         }
-        return parsed?.takeIf { it > 0.001 }
+        return ratio?.takeIf { it > 0.001 }
     }
 
     fun getVideoPixelSize(): Pair<Int, Int>? {
-        val w = MPVLib.getPropertyInt("video-params/w") ?: return null
-        val h = MPVLib.getPropertyInt("video-params/h") ?: return null
-        if (w <= 0 || h <= 0)
+        val width =
+            MPVLib.getPropertyInt("video-out-params/w")
+                ?: MPVLib.getPropertyInt("video-params/w")
+                ?: return null
+        val height =
+            MPVLib.getPropertyInt("video-out-params/h")
+                ?: MPVLib.getPropertyInt("video-params/h")
+                ?: return null
+        if (width <= 0 || height <= 0)
             return null
-        val rotation = ((MPVLib.getPropertyInt("video-params/rotate") ?: 0) % 360 + 360) % 360
-        return if (rotation == 90 || rotation == 270) h to w else w to h
+
+        val rotationValue =
+            MPVLib.getPropertyInt("video-out-params/rotate")
+                ?: MPVLib.getPropertyInt("video-params/rotate")
+                ?: 0
+        val rotation = ((rotationValue % 360) + 360) % 360
+        return if (rotation == 90 || rotation == 270)
+            height to width
+        else
+            width to height
     }
 
     fun setAudioSessionId(id: Int) {
@@ -612,7 +402,7 @@ internal class MPVView(context: Context, attrs: AttributeSet) : BaseMPVView(cont
         MPVLib.setPropertyInt("aaudio-session-id", id)
     }
 
-    inner class TrackDelegate(private val name: String) {
+    class TrackDelegate(private val name: String) {
         operator fun getValue(thisRef: Any?, property: KProperty<*>): Int {
             val v = MPVLib.getPropertyString(name)
             // we can get null here for "no" or other invalid value
@@ -620,9 +410,9 @@ internal class MPVView(context: Context, attrs: AttributeSet) : BaseMPVView(cont
         }
         operator fun setValue(thisRef: Any?, property: KProperty<*>, value: Int) {
             if (value == -1)
-                setFileLocalString(name, "no")
+                MPVLib.setPropertyString(name, "no")
             else
-                setFileLocalInt(name, value)
+                MPVLib.setPropertyInt(name, value)
         }
     }
 
@@ -634,36 +424,15 @@ internal class MPVView(context: Context, attrs: AttributeSet) : BaseMPVView(cont
     // Commands
 
     fun cyclePause() = MPVLib.command(arrayOf("cycle", "pause"))
-
-    private fun makeCurrentOptionFileLocal(name: String): Boolean {
-        val current = MPVLib.getPropertyString(name) ?: return false
-        setFileLocalString(name, current)
-        return true
-    }
-
-    fun cycleAudio() {
-        if (makeCurrentOptionFileLocal("aid"))
-            MPVLib.command(arrayOf("cycle", "audio"))
-    }
-
-    fun cycleSub() {
-        if (makeCurrentOptionFileLocal("sid"))
-            MPVLib.command(arrayOf("cycle", "sub"))
-    }
-
-    fun cycleHwdec() {
-        if (!makeCurrentOptionFileLocal("hwdec"))
-            return
-        MPVLib.command(arrayOf("cycle-values", "hwdec", HWDECS, "no"))
-        persistCurrentFileState()
-    }
+    fun cycleAudio() = MPVLib.command(arrayOf("cycle", "audio"))
+    fun cycleSub() = MPVLib.command(arrayOf("cycle", "sub"))
+    fun cycleHwdec() = MPVLib.command(arrayOf("cycle-values", "hwdec", HWDECS, "no"))
 
     fun cycleSpeed() {
         val speeds = arrayOf(0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0)
         val currentSpeed = playbackSpeed ?: 1.0
         val index = speeds.indexOfFirst { it > currentSpeed }
         playbackSpeed = speeds[if (index == -1) 0 else index]
-        persistCurrentFileState()
     }
 
     fun getRepeat(): Int {
@@ -703,31 +472,10 @@ internal class MPVView(context: Context, attrs: AttributeSet) : BaseMPVView(cont
     companion object {
         private const val TAG = "mpv"
 
-        // Options controlled per media item by the Android UI. These are both reset between
-        // playlist entries and included in watch-later persistence.
-        private val PER_FILE_PLAYBACK_OPTIONS = linkedSetOf(
-            "speed",
-            "audio-delay",
-            "sub-delay",
-            "secondary-sub-delay",
-            "video-aspect-override",
-            "panscan",
-            "contrast",
-            "brightness",
-            "gamma",
-            "saturation",
-            "hwdec",
-            "aid",
-            "sid",
-            "secondary-sid",
-            "vid",
-        )
-
-        // Audio/subtitle IDs are restored together with external filenames by MPVActivity.
-        private val APP_PERSISTED_PLAYBACK_OPTIONS =
-            PER_FILE_PLAYBACK_OPTIONS - setOf("aid", "sid", "secondary-sid")
-
         // mpv option `hwdec` is set to this
-        private const val HWDECS = "mediacodec,mediacodec-copy"
+        // Direct mediacodec renders to a decoder-owned Surface and bypasses
+        // mpv's filter/GPU chain. The copy mode still decodes in hardware, but
+        // exposes every frame to vf, shaders, deband and mpv's scalers.
+        private const val HWDECS = "mediacodec-copy"
     }
 }

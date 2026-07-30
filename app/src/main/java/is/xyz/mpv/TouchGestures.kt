@@ -30,7 +30,6 @@ internal class TouchGestures(private val observer: TouchGesturesObserver) {
     private enum class State {
         Up,
         Down,
-        Ignored,
         ControlSeek,
         ControlVolume,
         ControlBright,
@@ -49,11 +48,6 @@ internal class TouchGestures(private val observer: TouchGesturesObserver) {
     private var initialPos = PointF()
     // last non-throttled processed position
     private var lastPos = PointF()
-    // largest displacement seen before the gesture direction is locked
-    private var maxAbsDx = 0f
-    private var maxAbsDy = 0f
-    // latest point that still belonged clearly to the active movement axis
-    private var directionAnchor = PointF()
 
     private var width = 0f
     private var height = 0f
@@ -91,7 +85,7 @@ internal class TouchGestures(private val observer: TouchGesturesObserver) {
         private const val TRIGGER_RATE = 30
 
         // maximum duration between taps (ms) for a double tap to count
-        private const val TAP_DURATION = 225L
+        private const val TAP_DURATION = 300L
 
         // full sweep from left side to right side is 2:30
         private const val CONTROL_SEEK_MAX = 150f
@@ -106,96 +100,6 @@ internal class TouchGestures(private val observer: TouchGesturesObserver) {
         // do not trigger on X% of screen top/bottom
         // this is so that user can open android status bar
         private const val DEADZONE = 5
-
-        // Seeking should feel like 1s steps on slow drag (Samsung-like).
-        // We achieve this by sending seek updates more frequently than volume/brightness.
-        private const val SEEK_THROTTLE_DIV = 24
-
-        // Require gestures to be clearly horizontal/vertical before locking to that axis.
-        // This prevents accidental seeks when the user swipes mostly vertically.
-        private const val DIRECTION_LOCK_RATIO = 1.25f
-    }
-
-    fun cancel() {
-        // If a control gesture was active, finalize it.
-        if (state.isControl())
-            sendPropertyChange(PropertyChange.Finalize, 0f)
-        state = State.Up
-        lastTapTime = 0L
-    }
-
-    private fun State.isControl(): Boolean {
-        return this == State.ControlSeek ||
-                this == State.ControlVolume ||
-                this == State.ControlBright
-    }
-
-    private fun activationThreshold(gesture: State): Float {
-        return if (gesture == State.ControlSeek) trigger / 4 else trigger
-    }
-
-    private fun activateGesture(
-        gesture: State,
-        direction: Int,
-        p: PointF,
-        rebaseOrigin: Boolean,
-    ) {
-        stateDirection = direction
-        state = if (gesture == State.Down) State.Ignored else gesture
-        directionAnchor.set(p)
-
-        if (state == State.Ignored)
-            return
-
-        if (!state.isControl())
-            return
-
-        // Give the observer a chance to cache values before modifying them.
-        sendPropertyChange(PropertyChange.Init, 0f)
-
-        // Seeking always starts at zero delta to avoid an activation jump. When changing
-        // axes, every control starts from the turning point as though the new direction
-        // had begun there.
-        if (state == State.ControlSeek || rebaseOrigin) {
-            initialPos.set(p)
-            lastPos.set(p)
-        }
-    }
-
-    private fun processDirectionChange(p: PointF): Boolean {
-        val dx = p.x - directionAnchor.x
-        val dy = p.y - directionAnchor.y
-        val currentDelta = if (stateDirection == 0) abs(dx) else abs(dy)
-        val nextDelta = if (stateDirection == 0) abs(dy) else abs(dx)
-        val nextDirection = 1 - stateDirection
-        val nextGesture = if (nextDirection == 0) {
-            gestureHoriz
-        } else {
-            if (p.x > width / 2) gestureVertRight else gestureVertLeft
-        }
-
-        // Use the target gesture's normal activation threshold. In particular, changing to
-        // Seek must feel just as responsive as beginning with a horizontal Seek directly.
-        val changedDirection =
-            nextDelta > activationThreshold(nextGesture) &&
-            (currentDelta == 0f || nextDelta / currentDelta >= DIRECTION_LOCK_RATIO)
-
-        if (changedDirection) {
-            if (state.isControl())
-                sendPropertyChange(PropertyChange.Finalize, 0f)
-            activateGesture(nextGesture, nextDirection, p, rebaseOrigin = true)
-            return true
-        }
-
-        // Keep following the current axis. Rebasing here prevents vertical up/down motion
-        // and its small sideways drift from later looking like a horizontal direction change.
-        val continuesCurrentDirection =
-            currentDelta > 0f &&
-            (nextDelta == 0f || currentDelta / nextDelta >= DIRECTION_LOCK_RATIO)
-        if (continuesCurrentDirection)
-            directionAnchor.set(p)
-
-        return false
     }
 
     private fun processTap(p: PointF): Boolean {
@@ -231,57 +135,31 @@ internal class TouchGestures(private val observer: TouchGesturesObserver) {
     }
 
     private fun processMovement(p: PointF): Boolean {
-        if (state != State.Up && state != State.Down && processDirectionChange(p))
-            return true
-        if (state == State.Ignored)
-            return true
+        // throttle events: only send updates when there's some movement compared to last update
+        // 3 here is arbitrary
+        if (PointF(lastPos.x - p.x, lastPos.y - p.y).length() < trigger / 3)
+            return false
+        lastPos.set(p)
 
         assertFloat(initialPos.x, initialPos.y)
         val dx = p.x - initialPos.x
         val dy = p.y - initialPos.y
-        if (state == State.Down) {
-            maxAbsDx = max(maxAbsDx, abs(dx))
-            maxAbsDy = max(maxAbsDy, abs(dy))
-        }
-
-        // throttle events: only send updates when there's some movement compared to last update
-        // 3 here is arbitrary.
-        // For seeking we want finer updates so the step size becomes ~1s on slow drag.
-        val throttle = if (state == State.ControlSeek) trigger / SEEK_THROTTLE_DIV else trigger / 3
-        if (PointF(lastPos.x - p.x, lastPos.y - p.y).length() < throttle)
-            return false
-        lastPos.set(p)
-
         val dr = if (stateDirection == 0) (dx / width) else (-dy / height)
 
         when (state) {
             State.Up -> {}
-            State.Ignored -> {}
             State.Down -> {
-                // We might enter one of the Control states if the user moves enough.
-                // For seeking we want a shorter activation distance (Samsung-like), so the
-                // first visible step can be ~1s instead of jumping multiple seconds.
-                //
-                // Direction is decided from the largest displacement seen during this touch,
-                // not only from the latest point. This makes a fast vertical up/down swipe stay
-                // vertical after returning near its starting Y coordinate.
-                val vertGesture = if (initialPos.x > width / 2) gestureVertRight else gestureVertLeft
-
-                // Horizontal activation: require the gesture to be clearly horizontal.
-                val horizontalIntent =
-                    maxAbsDx > activationThreshold(gestureHoriz) &&
-                    (maxAbsDy == 0f || maxAbsDx / maxAbsDy >= DIRECTION_LOCK_RATIO)
-
-                // Vertical activation: require the gesture to be clearly vertical.
-                val verticalIntent =
-                    maxAbsDy > activationThreshold(vertGesture) &&
-                    (maxAbsDx == 0f || maxAbsDy / maxAbsDx >= DIRECTION_LOCK_RATIO)
-
-                if (horizontalIntent) {
-                    activateGesture(gestureHoriz, 0, p, rebaseOrigin = false)
-                } else if (verticalIntent) {
-                    activateGesture(vertGesture, 1, p, rebaseOrigin = false)
+                // we might get into one of Control states if user moves enough
+                if (abs(dx) > trigger) {
+                    state = gestureHoriz
+                    stateDirection = 0
+                } else if (abs(dy) > trigger) {
+                    state = if (initialPos.x > width / 2) gestureVertRight else gestureVertLeft
+                    stateDirection = 1
                 }
+                // send Init so that it has a chance to cache values before we start modifying them
+                if (state != State.Down)
+                    sendPropertyChange(PropertyChange.Init, 0f)
             }
             State.ControlSeek ->
                 sendPropertyChange(PropertyChange.Seek, CONTROL_SEEK_MAX * dr)
@@ -291,22 +169,6 @@ internal class TouchGestures(private val observer: TouchGesturesObserver) {
                 sendPropertyChange(PropertyChange.Bright, CONTROL_BRIGHT_MAX * dr)
         }
         return state != State.Up && state != State.Down
-    }
-
-    private fun processMovement(e: MotionEvent): Boolean {
-        var handled = false
-
-        // Fast direction changes can be delivered as batched historical points. Process them
-        // in order so a vertical excursion cannot disappear when the current point has already
-        // returned close to its starting position.
-        for (i in 0 until e.historySize) {
-            if (processMovement(PointF(e.getHistoricalX(i), e.getHistoricalY(i))))
-                handled = true
-        }
-        if (processMovement(PointF(e.x, e.y)))
-            handled = true
-
-        return handled
     }
 
     private fun sendPropertyChange(p: PropertyChange, diff: Float) {
@@ -337,6 +199,13 @@ internal class TouchGestures(private val observer: TouchGesturesObserver) {
         tapGestureRight = map2[get("gesture_tap_right", R.string.pref_gesture_tap_right_default)]
     }
 
+    fun cancel() {
+        if (state != State.Up && state != State.Down)
+            sendPropertyChange(PropertyChange.Finalize, 0f)
+        state = State.Up
+        lastTapTime = 0L
+    }
+
     fun onTouchEvent(e: MotionEvent): Boolean {
         if (width < 1 || height < 1) {
             Log.w(TAG, "TouchGestures: width or height not set!")
@@ -348,10 +217,14 @@ internal class TouchGestures(private val observer: TouchGesturesObserver) {
         }
         var gestureHandled = false
         val point = PointF(e.x, e.y)
-        when (e.actionMasked) {
+        when (e.action) {
+            MotionEvent.ACTION_CANCEL -> {
+                cancel()
+                gestureHandled = true
+            }
             MotionEvent.ACTION_UP -> {
-                gestureHandled = processMovement(e) or processTap(point)
-                if (state.isControl())
+                gestureHandled = processMovement(point) or processTap(point)
+                if (state != State.Down)
                     sendPropertyChange(PropertyChange.Finalize, 0f)
                 state = State.Up
             }
@@ -362,18 +235,12 @@ internal class TouchGestures(private val observer: TouchGesturesObserver) {
                 initialPos.set(point)
                 processTap(point)
                 lastPos.set(point)
-                maxAbsDx = 0f
-                maxAbsDy = 0f
                 state = State.Down
                 // always return true on ACTION_DOWN to continue receiving events
                 gestureHandled = true
             }
             MotionEvent.ACTION_MOVE -> {
-                gestureHandled = processMovement(e)
-            }
-            MotionEvent.ACTION_CANCEL, MotionEvent.ACTION_POINTER_DOWN -> {
-                cancel()
-                gestureHandled = false
+                gestureHandled = processMovement(point)
             }
         }
         return gestureHandled
