@@ -3681,6 +3681,11 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
 
         if (eventId == MpvEvent.MPV_EVENT_FILE_LOADED) {
             currentWatchLaterPath = MPVLib.getPropertyString("path")
+
+            // Apply the image-only scaler before preparing/revealing the compact
+            // normal surface. This avoids showing a bilinear first frame and does
+            // not change the rendering path used by ordinary videos.
+            try { player.applyStillImageDisplayQuality() } catch (_: Throwable) {}
             completedWatchLaterPath = null
             val persistFileState = fileStatePersistenceEnabled()
             player.configureFileStatePersistence(persistFileState)

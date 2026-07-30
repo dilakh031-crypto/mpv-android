@@ -12,6 +12,7 @@ import kotlin.math.ceil
 import kotlin.math.hypot
 import kotlin.math.max
 import kotlin.math.min
+import kotlin.math.roundToInt
 import kotlin.math.sqrt
 
 /**
@@ -567,20 +568,43 @@ internal class VideoZoomGestures(
         if (isPanscanActive())
             return ContentRect(0f, 0f, w, h)
 
-        val ar = if (videoAspect > 0.001) videoAspect.toFloat() else (w / h)
-        val viewAr = w / h
-        val cw: Float
-        val ch: Float
+        /*
+         * Keep the unzoomed compact SurfaceTexture on an exact output-pixel grid.
+         *
+         * Previously the calculated media rectangle could be fractional while the
+         * backing buffer was rounded up with ceil(). For example, a 480.2 px-high
+         * rectangle used a 481 px buffer and was then sampled back to 480.2 px at a
+         * half-pixel offset. That tiny compositor resize is enough to soften fine
+         * detail in a 720p screenshot even though the nominal resolution is close.
+         *
+         * TextureView dimensions are physical integer pixels, so choose the fitted
+         * media size in integers and place it at an integer origin. One letterbox
+         * side may differ by one pixel when the remaining space is odd; the image
+         * itself is then sampled 1:1 with no fractional Android filtering.
+         */
+        val outputW = w.roundToInt().coerceAtLeast(1)
+        val outputH = h.roundToInt().coerceAtLeast(1)
+        val ar = if (videoAspect > 0.001) videoAspect else outputW.toDouble() / outputH
+        val viewAr = outputW.toDouble() / outputH
+
+        val contentW: Int
+        val contentH: Int
         if (ar > viewAr) {
-            cw = w
-            ch = w / ar
+            contentW = outputW
+            contentH = (outputW / ar).roundToInt().coerceIn(1, outputH)
         } else {
-            ch = h
-            cw = h * ar
+            contentH = outputH
+            contentW = (outputH * ar).roundToInt().coerceIn(1, outputW)
         }
-        val ox = (w - cw) * 0.5f
-        val oy = (h - ch) * 0.5f
-        return ContentRect(ox, oy, cw, ch)
+
+        val left = (outputW - contentW) / 2
+        val top = (outputH - contentH) / 2
+        return ContentRect(
+            ox = left.toFloat(),
+            oy = top.toFloat(),
+            w = contentW.toFloat(),
+            h = contentH.toFloat(),
+        )
     }
 
     private fun clampTranslationToVideoContent() {
@@ -766,8 +790,10 @@ internal class VideoZoomGestures(
         // Keep the same media-aspect geometry used by the high-quality zoom
         // surface, but render only at the on-screen content size while unzoomed.
         // This avoids the start/end aspect switch that causes the visible tear.
-        val bufferWidth = ceilToIntAtLeastOne(c.w.toDouble())
-        val bufferHeight = ceilToIntAtLeastOne(c.h.toDouble())
+        // contentRect() is pixel-aligned, so these dimensions map to the
+        // on-screen rectangle exactly 1:1 without a compositor resample.
+        val bufferWidth = c.w.roundToInt().coerceAtLeast(1)
+        val bufferHeight = c.h.roundToInt().coerceAtLeast(1)
         player.setRenderSurfaceSize(bufferWidth, bufferHeight)
         renderSurfaceMode = RenderSurfaceMode.MEDIA_ASPECT_BASE
     }

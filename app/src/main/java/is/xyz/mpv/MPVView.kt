@@ -26,18 +26,6 @@ internal class MPVView(context: Context, attrs: AttributeSet) : BaseMPVView(cont
 
         // apply phone-optimized defaults
         MPVLib.setOptionString("profile", "fast")
-
-        // The fast profile selects bilinear downscaling. With very large still
-        // images this can look as though mpv rendered below the display's real
-        // resolution even when the SurfaceTexture already matches the visible
-        // output rectangle. Keep the mobile-oriented fast profile, but replace
-        // only its downscaler with a proper convolution filter. Lanczos with
-        // correct downscaling produces the final display-sized image directly in
-        // mpv and does not allocate a larger Android surface.
-        MPVLib.setOptionString("dscale", "lanczos")
-        MPVLib.setOptionString("correct-downscaling", "yes")
-        MPVLib.setOptionString("dscale-antiring", "0")
-
         // When Save position on quit is disabled, old watch-later files must not restore
         // positions or any other per-file option before the activity can discard them.
         MPVLib.setOptionString("resume-playback", if (persistFileState) "yes" else "no")
@@ -563,6 +551,32 @@ internal class MPVView(context: Context, attrs: AttributeSet) : BaseMPVView(cont
             return null
         val rot = MPVLib.getPropertyInt("video-params/rotate") ?: 0
         return if (rot % 180 == 90) h to w else w to h
+    }
+
+
+    /**
+     * Use a high-quality, sharp RGB reconstruction path for still images only.
+     *
+     * The mobile `fast` profile sets both `scale` and `dscale` to bilinear. Even
+     * when the luma downscaler is overridden, an image decoded with subsampled
+     * chroma still inherits bilinear `cscale`, which makes coloured edges look
+     * softer than a bitmap viewer. Keep normal video on the fast profile and
+     * make these options file-local so they disappear automatically afterwards.
+     */
+    fun applyStillImageDisplayQuality() {
+        if (MPVLib.getPropertyBoolean("current-tracks/video/image") != true)
+            return
+
+        setFileLocalString("scale", "ewa_lanczossharp")
+        setFileLocalString("cscale", "ewa_lanczossharp")
+        setFileLocalString("dscale", "ewa_lanczossharp")
+        setFileLocalString("correct-downscaling", "yes")
+
+        // Gamma-light downscaling retains the edge contrast expected from Android
+        // bitmap viewers. Linear-light resizing is valid but visibly softer for
+        // high-contrast scans and UI/text-like details on a 720p display.
+        setFileLocalString("linear-downscaling", "no")
+        setFileLocalString("sigmoid-upscaling", "no")
     }
 
     fun setAudioSessionId(id: Int) {
