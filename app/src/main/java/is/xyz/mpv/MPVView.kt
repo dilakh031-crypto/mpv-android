@@ -553,6 +553,29 @@ internal class MPVView(context: Context, attrs: AttributeSet) : BaseMPVView(cont
         return if (rot % 180 == 90) h to w else w to h
     }
 
+    /**
+     * Apply a proper one-pass downscaler to high-resolution still images.
+     *
+     * The global mobile profile intentionally uses bilinear downscaling for video
+     * speed. For a still image larger than the output surface, that makes fine
+     * detail look as if the image had first been reduced to a lower resolution.
+     * File-local options preserve the user's normal video settings and disappear
+     * automatically when the image is unloaded.
+     */
+    fun applyHighResolutionImageQuality() {
+        val isStillImage = MPVLib.getPropertyBoolean("current-tracks/video/image") == true
+        val source = getVideoPixelSize() ?: return
+        val outputWidth = width.coerceAtLeast(1)
+        val outputHeight = height.coerceAtLeast(1)
+        val needsDownscale = source.first > outputWidth || source.second > outputHeight
+
+        if (!isStillImage || !needsDownscale)
+            return
+
+        setFileLocalString("dscale", "mitchell")
+        setFileLocalString("correct-downscaling", "yes")
+    }
+
     fun setAudioSessionId(id: Int) {
         MPVLib.setPropertyInt("audiotrack-session-id", id)
         MPVLib.setPropertyInt("aaudio-session-id", id)
