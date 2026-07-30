@@ -553,32 +553,6 @@ internal class MPVView(context: Context, attrs: AttributeSet) : BaseMPVView(cont
         return if (rot % 180 == 90) h to w else w to h
     }
 
-
-    /**
-     * Use a high-quality, sharp RGB reconstruction path for still images only.
-     *
-     * The mobile `fast` profile sets both `scale` and `dscale` to bilinear. Even
-     * when the luma downscaler is overridden, an image decoded with subsampled
-     * chroma still inherits bilinear `cscale`, which makes coloured edges look
-     * softer than a bitmap viewer. Keep normal video on the fast profile and
-     * make these options file-local so they disappear automatically afterwards.
-     */
-    fun applyStillImageDisplayQuality() {
-        if (MPVLib.getPropertyBoolean("current-tracks/video/image") != true)
-            return
-
-        setFileLocalString("scale", "ewa_lanczossharp")
-        setFileLocalString("cscale", "ewa_lanczossharp")
-        setFileLocalString("dscale", "ewa_lanczossharp")
-        setFileLocalString("correct-downscaling", "yes")
-
-        // Gamma-light downscaling retains the edge contrast expected from Android
-        // bitmap viewers. Linear-light resizing is valid but visibly softer for
-        // high-contrast scans and UI/text-like details on a 720p display.
-        setFileLocalString("linear-downscaling", "no")
-        setFileLocalString("sigmoid-upscaling", "no")
-    }
-
     fun setAudioSessionId(id: Int) {
         MPVLib.setPropertyInt("audiotrack-session-id", id)
         MPVLib.setPropertyInt("aaudio-session-id", id)
