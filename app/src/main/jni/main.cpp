@@ -28,7 +28,6 @@ extern "C" {
     jni_func(void, command, jobjectArray jarray);
     jni_func(jint, commandAsync, jobjectArray jarray, jlong userdata);
     jni_func(void, abortAsyncCommand, jlong userdata);
-    jni_func(jlong, setAspectAndPanscan, jstring jaspect, jdouble panscan);
 };
 
 JavaVM *g_vm;
@@ -140,49 +139,3 @@ jni_func(void, abortAsyncCommand, jlong userdata) {
     mpv_abort_async_command(g_mpv, (uint64_t)userdata);
 }
 
-jni_func(jlong, setAspectAndPanscan, jstring jaspect, jdouble panscan) {
-    CHECK_MPV_INIT();
-
-    if (!jaspect)
-        return MPV_ERROR_INVALID_PARAMETER;
-
-    const char *aspect = env->GetStringUTFChars(jaspect, NULL);
-    if (!aspect)
-        return MPV_ERROR_NOMEM;
-
-    char panscan_value[64];
-    int written = snprintf(
-        panscan_value,
-        sizeof(panscan_value),
-        "%.17g",
-        (double)panscan);
-    if (written < 0 || written >= (int)sizeof(panscan_value)) {
-        env->ReleaseStringUTFChars(jaspect, aspect);
-        return MPV_ERROR_INVALID_PARAMETER;
-    }
-
-    /*
-     * This app-specific command is added to the bundled, release-matched mpv by
-     * buildscripts/scripts/mpv.sh. It does not return until the VO has presented
-     * a marked frame using both final values; the returned EGL presentation time
-     * identifies the same buffer when TextureView consumes it.
-     */
-    const char *arguments[] = {
-        "mpv-android-set-aspect-panscan",
-        aspect,
-        panscan_value,
-        NULL,
-    };
-    mpv_node command_result = {0};
-    int result = mpv_command_ret(g_mpv, arguments, &command_result);
-    env->ReleaseStringUTFChars(jaspect, aspect);
-    if (result < 0)
-        return result;
-
-    int64_t presentation_time =
-        command_result.format == MPV_FORMAT_INT64
-            ? command_result.u.int64
-            : 0;
-    mpv_free_node_contents(&command_result);
-    return presentation_time;
-}
