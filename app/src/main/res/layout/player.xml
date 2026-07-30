@@ -12,11 +12,11 @@
         android:layout_height="match_parent" />
 
     <!--
-        Frame-synchronized render handoff used only while the mpv-sized normal
-        buffer and the source-detail zoom buffer exchange ownership. It contains
-        the last valid TextureView frame; the producer changes only after this
-        overlay is committed, and it is removed only for confirmed destination
-        geometry, never by a timeout or startup blackout.
+        Frame-synchronized render handoff used only for real producer-geometry
+        changes (file, rotation, aspect or panscan). Normal playback and pinch
+        share one persistent source-detail buffer, so zoom never touches this
+        overlay. A captured valid frame remains until confirmed destination
+        geometry is visible, never until a guessed timeout.
     -->
     <ImageView
         android:id="@+id/renderHandoffOverlay"
