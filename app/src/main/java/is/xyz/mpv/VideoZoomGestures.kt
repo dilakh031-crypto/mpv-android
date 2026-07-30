@@ -12,16 +12,19 @@ import kotlin.math.ceil
 import kotlin.math.hypot
 import kotlin.math.max
 import kotlin.math.min
+import kotlin.math.sqrt
 
 /**
  * Pinch-to-zoom + pan for mpv output.
  *
  * Important quality detail:
- *  - Unzoomed view always keeps an mpv output surface exactly the size of the
- *    TextureView. mpv performs the source-to-screen downscale once; Android does
- *    not stretch a media-aspect buffer to the view and shrink it a second time.
- *  - When zoom starts, the backing buffer is upgraded to original detail only if
- *    that buffer can be allocated safely. Otherwise it stays exactly screen-sized.
+ *  - Unzoomed view uses a display-sized mpv-rendered compact surface, so mpv,
+ *    not Android's TextureView compositor, performs the huge downscale. This
+ *    avoids moire / false-color artifacts on high-frequency scans at 720p.
+ *  - After the first mpv frame is ready, the unzoomed view is prepared with the
+ *    same media-aspect fit that will be used while zoomed. At normal size it
+ *    uses only a display-sized compact buffer; when the user starts zooming it
+ *    upgrades the same geometry to an original-detail buffer.
  *  - New-file and window-exit transitions are forced back to the plain mpv/base
  *    surface so Android never animates a transformed TextureView while entering
  *    or leaving the player.
@@ -692,20 +695,18 @@ internal class VideoZoomGestures(
             return
         }
 
-        // Keep the buffer aspect identical to the actual TextureView. If the
-        // source-detail surface would exceed the safe allocation limit, do not
-        // partially cap it: partial caps add another unpredictable scaling step.
-        val bufferSize = originalDetailRenderSurfaceSizeOrNull(
+        // Same-orientation path: keep the buffer aspect identical to the on-screen
+        // view, but choose its scale so the video content rect inside it is
+        // rendered at the original source resolution.
+        val bufferScale = limitedOriginalDetailBufferScale(
             baseWidth = viewWidth.toDouble(),
             baseHeight = viewHeight.toDouble(),
             content = c,
         )
-        if (bufferSize == null) {
-            requestBaseRenderSurfaceSize(force = true)
-            return
-        }
 
-        player.setRenderSurfaceSize(bufferSize.first, bufferSize.second)
+        val bufferWidth = ceilToIntAtLeastOne(viewWidth.toDouble() * bufferScale)
+        val bufferHeight = ceilToIntAtLeastOne(viewHeight.toDouble() * bufferScale)
+        player.setRenderSurfaceSize(bufferWidth, bufferHeight)
         renderSurfaceMode = RenderSurfaceMode.VIEW_ASPECT_ORIGINAL
     }
 
@@ -727,30 +728,48 @@ internal class VideoZoomGestures(
             return
         }
 
-        // Use source detail while it is safe. For extremely large images, fall
-        // back to the exact screen-sized surface rather than an arbitrary capped
-        // intermediate resolution.
-        val bufferSize = originalDetailRenderSurfaceSizeOrNull(
+        // Media-aspect path: do not pad the render surface to the phone's
+        // portrait/landscape aspect. A view-aspect buffer can contain mostly
+        // black bars for panoramic/tall images and may lose source detail or hit
+        // GPU limits. applyToView() places this compact buffer into the normal
+        // content rect with View scale/translation.
+        val bufferScale = limitedOriginalDetailBufferScale(
             baseWidth = c.w.toDouble(),
             baseHeight = c.h.toDouble(),
             content = c,
         )
-        if (bufferSize == null) {
-            requestBaseRenderSurfaceSize(force = true)
-            return
-        }
 
-        player.setRenderSurfaceSize(bufferSize.first, bufferSize.second)
+        val bufferWidth = ceilToIntAtLeastOne(c.w.toDouble() * bufferScale)
+        val bufferHeight = ceilToIntAtLeastOne(c.h.toDouble() * bufferScale)
+        player.setRenderSurfaceSize(bufferWidth, bufferHeight)
         renderSurfaceMode = RenderSurfaceMode.MEDIA_ASPECT_ORIGINAL
     }
 
     private fun requestMediaAspectBaseRenderSurfaceSize(force: Boolean) {
-        // Never use a media-aspect SurfaceTexture while unzoomed. Android first
-        // stretches such a buffer to the TextureView and the View transform then
-        // shrinks it back into the content rectangle, causing a second filtering
-        // pass. The base surface is exactly the TextureView/screen resolution, so
-        // mpv performs one downscale directly to the final output pixels.
-        requestBaseRenderSurfaceSize(force)
+        val player = renderTarget ?: return
+        refreshMetricsFromTarget()
+
+        if (!force && renderSurfaceMode == RenderSurfaceMode.MEDIA_ASPECT_BASE)
+            return
+
+        if (viewWidth <= 1f || viewHeight <= 1f || videoAspect <= 0.001) {
+            requestBaseRenderSurfaceSize(force = true)
+            return
+        }
+
+        val c = contentRect()
+        if (c.w <= 1f || c.h <= 1f) {
+            requestBaseRenderSurfaceSize(force = true)
+            return
+        }
+
+        // Keep the same media-aspect geometry used by the high-quality zoom
+        // surface, but render only at the on-screen content size while unzoomed.
+        // This avoids the start/end aspect switch that causes the visible tear.
+        val bufferWidth = ceilToIntAtLeastOne(c.w.toDouble())
+        val bufferHeight = ceilToIntAtLeastOne(c.h.toDouble())
+        player.setRenderSurfaceSize(bufferWidth, bufferHeight)
+        renderSurfaceMode = RenderSurfaceMode.MEDIA_ASPECT_BASE
     }
 
     private fun usesOppositeOrientationMediaAspectRenderSurface(): Boolean {
@@ -796,20 +815,25 @@ internal class VideoZoomGestures(
 
     private fun isPanscanActive(): Boolean = panscan > EPS.toDouble()
 
-    private fun originalDetailRenderSurfaceSizeOrNull(
+    private fun limitedOriginalDetailBufferScale(
         baseWidth: Double,
         baseHeight: Double,
         content: ContentRect,
-    ): Pair<Int, Int>? {
-        val desiredScale = originalDetailBufferScale(content)
-        val desiredWidth = baseWidth.coerceAtLeast(1.0) * desiredScale
-        val desiredHeight = baseHeight.coerceAtLeast(1.0) * desiredScale
+    ): Double {
+        val desired = originalDetailBufferScale(content)
+        val maxEdge = max(baseWidth, baseHeight).coerceAtLeast(1.0)
+        val maxByEdge = MAX_RENDER_SURFACE_EDGE / maxEdge
+        val maxByPixels = sqrt(
+            MAX_RENDER_SURFACE_PIXELS / (baseWidth * baseHeight).coerceAtLeast(1.0),
+        )
 
-        if (max(desiredWidth, desiredHeight) > MAX_RENDER_SURFACE_EDGE ||
-            desiredWidth * desiredHeight > MAX_RENDER_SURFACE_PIXELS
-        ) return null
-
-        return ceilToIntAtLeastOne(desiredWidth) to ceilToIntAtLeastOne(desiredHeight)
+        // Avoid requesting oversized SurfaceTexture buffers. Very wide overridden
+        // ratios such as 2.35:1 on huge images can otherwise exceed the device
+        // texture limit and leave the TextureView black even after resetting zoom.
+        return desired
+            .coerceAtMost(maxByEdge)
+            .coerceAtMost(maxByPixels)
+            .coerceAtLeast(1.0)
     }
 
     private fun originalDetailBufferScale(c: ContentRect): Double {

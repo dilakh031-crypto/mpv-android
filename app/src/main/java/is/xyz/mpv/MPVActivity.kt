@@ -1810,6 +1810,12 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
         val isLandscape = newConfig.orientation == Configuration.ORIENTATION_LANDSCAPE
 
         updateGestureMetricsFromView()
+        if (::binding.isInitialized) {
+            binding.player.post {
+                try { player.applyHugeImageScreenFallbackIfNeeded() } catch (_: Throwable) {}
+                syncZoomVideoGeometry(prepareNormalSurface = true, immediate = true)
+            }
+        }
 
         // Adjust control margins (only after the player UI is attached)
         if (uiInitialized) {
@@ -3491,11 +3497,7 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
         if (!activityIsForeground) return
         when (property) {
             "track-list" -> player.loadTracks()
-            "current-tracks/audio/selected" -> updateAudioUI()
-            "current-tracks/video/image" -> {
-                updateAudioUI()
-                player.applyHighResolutionImageQuality()
-            }
+            "current-tracks/audio/selected", "current-tracks/video/image" -> updateAudioUI()
             "hwdec-current" -> updateDecoderButton()
         }
         if (metaUpdated)
@@ -3518,7 +3520,6 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
             "time-pos" -> updatePlaybackPos(psc.positionSec)
             "playlist-pos", "playlist-count" -> updatePlaylistButtons()
             "video-params/w", "video-params/h" -> {
-                player.applyHighResolutionImageQuality()
                 syncZoomVideoGeometry()
                 prepareZoomSurfaceAndRevealWhenReady()
             }
@@ -3530,7 +3531,6 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
         when (property) {
             "duration/full" -> updatePlaybackDuration(psc.durationSec)
             "video-params/aspect", "video-params/rotate" -> {
-                player.applyHighResolutionImageQuality()
                 updateOrientation()
                 updatePiPParams()
                 syncZoomVideoGeometry()
@@ -3562,6 +3562,9 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
     }
 
     override fun eventProperty(property: String) {
+        if (property == "current-tracks/video/image")
+            try { player.applyHugeImageScreenFallbackIfNeeded() } catch (_: Throwable) {}
+
         val metaUpdated = psc.update(property)
         if (metaUpdated)
             updateMediaSession()
@@ -3621,6 +3624,12 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
     }
 
     override fun eventProperty(property: String, value: Long) {
+        if (property == "video-params/w" || property == "video-params/h" ||
+            property == "current-tracks/video/demux-w" ||
+            property == "current-tracks/video/demux-h") {
+            try { player.applyHugeImageScreenFallbackIfNeeded() } catch (_: Throwable) {}
+        }
+
         if (psc.update(property, value))
             updateMediaSession()
 
@@ -3629,6 +3638,9 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
     }
 
     override fun eventProperty(property: String, value: Double) {
+        if (property == "video-params/rotate" || property == "video-params/aspect")
+            try { player.applyHugeImageScreenFallbackIfNeeded() } catch (_: Throwable) {}
+
         if (psc.update(property, value))
             updateMediaSession()
 
@@ -3691,6 +3703,10 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
             val persistFileState = fileStatePersistenceEnabled()
             player.configureFileStatePersistence(persistFileState)
 
+            // current-tracks/video/demux-w/h is available before the VO has to upload
+            // the first decoded frame, so oversized still images can be reduced first.
+            try { player.applyHugeImageScreenFallbackIfNeeded() } catch (_: Throwable) {}
+
             if (persistFileState) {
                 // Restore the chosen audio before any subtitle loading or synchronous preference
                 // writes. Resolving two external subtitles can take a few hundred milliseconds;
@@ -3729,6 +3745,7 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
         }
 
         if (eventId == MpvEvent.MPV_EVENT_START_FILE) {
+            try { player.resetHugeImageScreenFallback() } catch (_: Throwable) {}
             currentWatchLaterPath = null
             completedWatchLaterPath = null
             // Reset any view-level zoom/pan when a new file starts.
