@@ -1,14 +1,10 @@
 #include <jni.h>
-#include <cstring>
 
 #include <mpv/client.h>
 
 #include "globals.h"
 #include "jni_utils.h"
 #include "log.h"
-
-void render_begin_file_transition();
-void render_end_file_transition();
 
 static void sendPropertyUpdateToJava(JNIEnv *env, mpv_event_property *prop)
 {
@@ -49,6 +45,13 @@ static void sendEventToJava(JNIEnv *env, int event)
     env->CallStaticVoidMethod(mpv_MPVLib, mpv_MPVLib_event, event);
 }
 
+static void sendEndFileEventToJava(JNIEnv *env, mpv_event_end_file *event)
+{
+    const bool reached_eof = event && event->reason == MPV_END_FILE_REASON_EOF;
+    env->CallStaticVoidMethod(mpv_MPVLib, mpv_MPVLib_eventEndFile_b,
+        (jboolean) reached_eof);
+}
+
 static void sendLogMessageToJava(JNIEnv *env, mpv_event_log_message *msg)
 {
     // filter the most obvious cases of invalid utf-8, since Java would choke on it
@@ -74,7 +77,6 @@ static void sendLogMessageToJava(JNIEnv *env, mpv_event_log_message *msg)
 
 void *event_thread(void *arg)
 {
-    (void)arg;
     JNIEnv *env = NULL;
     acquire_jni_env(g_vm, &env);
     if (!env)
@@ -93,22 +95,6 @@ void *event_thread(void *arg)
         if (mp_event->event_id == MPV_EVENT_NONE)
             continue;
 
-        if (mp_event->event_id == MPV_EVENT_START_FILE) {
-            render_begin_file_transition();
-        } else if (mp_event->event_id == MPV_EVENT_VIDEO_RECONFIG ||
-                   mp_event->event_id == MPV_EVENT_END_FILE) {
-            render_end_file_transition();
-        } else if (mp_event->event_id == MPV_EVENT_FILE_LOADED) {
-            // Audio-only files do not emit VIDEO_RECONFIG. Release their file
-            // transition once mpv confirms that no video track is selected.
-            char *video_id = mpv_get_property_string(g_mpv, "vid");
-            const bool has_video =
-                video_id && std::strcmp(video_id, "no") != 0;
-            mpv_free(video_id);
-            if (!has_video)
-                render_end_file_transition();
-        }
-
         switch (mp_event->event_id) {
         case MPV_EVENT_LOG_MESSAGE:
             msg = (mpv_event_log_message*)mp_event->data;
@@ -118,6 +104,10 @@ void *event_thread(void *arg)
         case MPV_EVENT_PROPERTY_CHANGE:
             mp_property = (mpv_event_property*)mp_event->data;
             sendPropertyUpdateToJava(env, mp_property);
+            break;
+        case MPV_EVENT_END_FILE:
+            ALOGV("event: %s\n", mpv_event_name(mp_event->event_id));
+            sendEndFileEventToJava(env, (mpv_event_end_file*)mp_event->data);
             break;
         default:
             ALOGV("event: %s\n", mpv_event_name(mp_event->event_id));
