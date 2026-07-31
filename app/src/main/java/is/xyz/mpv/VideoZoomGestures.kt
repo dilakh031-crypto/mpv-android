@@ -17,15 +17,9 @@ import kotlin.math.sqrt
 /**
  * Pinch-to-zoom and pan for mpv output.
  *
- * The TextureView and its SurfaceTexture always keep the player view's aspect
- * ratio. mpv performs video-aspect-override and panscan inside that stable
- * output window; Android only applies uniform zoom and translation. Therefore
- * changing aspect ratio cannot reshape or move the previously displayed frame.
- *
- * The backing buffer is enlarged only by a uniform factor. Its factor is
- * calculated from the source pixels and the actual on-screen video rectangle,
- * so forced ratios retain the same source detail as the original ratio instead
- * of allocating detail for the black bars.
+ * The SurfaceTexture keeps the same aspect ratio as the player view. mpv performs
+ * aspect fitting inside that window, and Android receives only uniform zoom and
+ * translation transforms.
  */
 internal class VideoZoomGestures(
     private val target: View,
@@ -35,7 +29,7 @@ internal class VideoZoomGestures(
     private var viewWidth = 0f
     private var viewHeight = 0f
 
-    /** currently displayed aspect ratio, including video-aspect-override. 0 => unknown */
+    private var nativeVideoAspect = 0.0
     private var videoAspect = 0.0
     private var videoPixelWidth = 0
     private var videoPixelHeight = 0
@@ -74,8 +68,8 @@ internal class VideoZoomGestures(
 
     private var renderSurfaceMode = RenderSurfaceMode.BASE
 
-    // Startup and window-exit transitions use the base surface. After media
-    // geometry is stable, this switches once to the fixed high-detail surface.
+    // Native presentation can use the detailed surface at rest. Aspect overrides
+    // and panscan use the display-sized surface until the user starts zooming.
     private var stableDetailSurfacePrepared = false
 
     // When a pinch returns close enough to normal size, finish it through the
@@ -178,56 +172,27 @@ internal class VideoZoomGestures(
         }
     }
 
-    fun setVideoAspect(aspect: Double?) {
-        setVideoGeometry(
-            aspect = aspect,
-            pixelSize = videoPixelSizeOrNull(),
-            panscanValue = panscan,
-        )
-    }
-
-    fun setVideoPixelSize(size: Pair<Int, Int>?) {
-        setVideoGeometry(
-            aspect = videoAspect.takeIf { it > 0.001 },
-            pixelSize = size,
-            panscanValue = panscan,
-        )
-    }
-
-    fun setPanscan(value: Double?) {
-        setVideoGeometry(
-            aspect = videoAspect.takeIf { it > 0.001 },
-            pixelSize = videoPixelSizeOrNull(),
-            panscanValue = value,
-        )
-    }
-
     fun setVideoGeometry(
-        aspect: Double?,
+        nativeAspect: Double?,
+        effectiveAspect: Double?,
         pixelSize: Pair<Int, Int>?,
         panscanValue: Double?,
+        immediate: Boolean = false,
     ) {
-        videoAspect = aspect ?: 0.0
+        nativeVideoAspect = nativeAspect ?: 0.0
+        videoAspect = effectiveAspect ?: nativeVideoAspect
         videoPixelWidth = pixelSize?.first ?: 0
         videoPixelHeight = pixelSize?.second ?: 0
         panscan = panscanValue ?: 0.0
-
-        // As soon as mpv exposes complete geometry, use the detailed stable
-        // surface. There is no reveal gate and no wait for a later frame.
-        if (videoAspect > 0.001 && videoPixelWidth > 1 && videoPixelHeight > 1)
-            stableDetailSurfacePrepared = true
 
         if (isZoomed() || scaleDetector.isInProgress)
             clampTranslationToVideoContent()
 
         updateRenderSurfaceForCurrentState(force = true)
-        scheduleApply()
-    }
-
-    private fun videoPixelSizeOrNull(): Pair<Int, Int>? {
-        if (videoPixelWidth <= 0 || videoPixelHeight <= 0)
-            return null
-        return videoPixelWidth to videoPixelHeight
+        if (immediate)
+            applyToView()
+        else
+            scheduleApply()
     }
 
     fun isZoomed(): Boolean = scale > 1f + EPS
@@ -247,6 +212,7 @@ internal class VideoZoomGestures(
 
     fun resetForNewFile() {
         resetTransformState()
+        nativeVideoAspect = 0.0
         videoAspect = 0.0
         videoPixelWidth = 0
         videoPixelHeight = 0
@@ -256,11 +222,12 @@ internal class VideoZoomGestures(
         applyToView()
     }
 
-    fun prepareForWindowExit() {
-        resetTransformState()
-        stableDetailSurfacePrepared = false
-        target.alpha = 0f
-        requestBaseRenderSurfaceSize(force = true)
+    fun prepareForVisibleMedia() {
+        if (stableDetailSurfacePrepared)
+            return
+
+        stableDetailSurfacePrepared = true
+        updateRenderSurfaceForCurrentState(force = true)
         applyToView()
     }
 
@@ -279,7 +246,6 @@ internal class VideoZoomGestures(
         lastTapTime = 0L
         pendingPinchDoubleTapReset = false
         resetPanFilters(0f, 0f, SystemClock.uptimeMillis())
-        target.alpha = 1f
     }
 
     private fun resetLikeDoubleTapAfterPinch() {
@@ -582,11 +548,22 @@ internal class VideoZoomGestures(
     }
 
     private fun updateRenderSurfaceForCurrentState(force: Boolean) {
-        val needsDetailedSurface = stableDetailSurfacePrepared || isZoomed() || scaleDetector.isInProgress
+        val zooming = isZoomed() || scaleDetector.isInProgress
+        val needsDetailedSurface = zooming ||
+            (stableDetailSurfacePrepared && usesNativePresentation())
+
         if (needsDetailedSurface)
             requestStableDetailedRenderSurfaceSize(force)
         else
             requestBaseRenderSurfaceSize(force)
+    }
+
+    private fun usesNativePresentation(): Boolean {
+        if (isPanscanActive())
+            return false
+        if (nativeVideoAspect <= ASPECT_EPSILON || videoAspect <= ASPECT_EPSILON)
+            return true
+        return abs(nativeVideoAspect - videoAspect) <= ASPECT_EPSILON
     }
 
     private fun requestBaseRenderSurfaceSize(force: Boolean) {
@@ -618,38 +595,9 @@ internal class VideoZoomGestures(
     }
 
     private fun limitedStableViewBufferScale(): Double {
-        val c = contentRect()
-        if (viewWidth <= 1f || viewHeight <= 1f || c.w <= 1f || c.h <= 1f)
-            return 1.0
-
-        val sourceWidth: Double
-        val sourceHeight: Double
-
-        if (isPanscanActive()) {
-            // Panscan displays a crop of the source, not all source pixels. Size
-            // the surface for the crop that can actually become visible, avoiding
-            // resolution spent on pixels outside the screen.
-            val sourceAspect = videoPixelWidth.toDouble() / videoPixelHeight.toDouble()
-            val viewAspect = viewWidth.toDouble() / viewHeight.toDouble()
-            if (sourceAspect > viewAspect) {
-                sourceHeight = videoPixelHeight.toDouble()
-                sourceWidth = sourceHeight * viewAspect
-            } else {
-                sourceWidth = videoPixelWidth.toDouble()
-                sourceHeight = sourceWidth / viewAspect
-            }
-        } else {
-            // A forced aspect ratio stretches the whole source into c. Basing the
-            // factor on c (rather than the full player view) keeps both source axes
-            // at full detail even when the selected ratio has larger black bars.
-            sourceWidth = videoPixelWidth.toDouble()
-            sourceHeight = videoPixelHeight.toDouble()
-        }
-
-        val desired = max(
-            sourceWidth / c.w.toDouble(),
-            sourceHeight / c.h.toDouble(),
-        ).coerceAtLeast(1.0)
+        val widthScale = videoPixelWidth.toDouble() / viewWidth.toDouble()
+        val heightScale = videoPixelHeight.toDouble() / viewHeight.toDouble()
+        val desired = max(widthScale, heightScale).coerceAtLeast(1.0)
 
         val maxViewEdge = max(viewWidth.toDouble(), viewHeight.toDouble()).coerceAtLeast(1.0)
         val maxByEdge = MAX_RENDER_SURFACE_EDGE / maxViewEdge
@@ -768,6 +716,7 @@ internal class VideoZoomGestures(
 
     companion object {
         private const val EPS = 0.001f
+        private const val ASPECT_EPSILON = 0.001
         private const val MIN_SCALE = 1f
         private const val MAX_SCALE = 20f
         private const val PINCH_DOUBLE_TAP_RESET_SCALE = 1.001f
