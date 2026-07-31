@@ -169,6 +169,15 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
     private var deferPlayerInit: Boolean = false
     private var uiInitialized: Boolean = false
 
+    // One owner for hiding the mpv texture while a new file/reconfig is waiting
+    // for reliable video geometry. Aspect changes from the in-app menu bypass this
+    // blackout and use predictive geometry instead.
+    private var videoGeometryBlackoutActive = true
+    private var videoGeometryBlackoutGeneration = 0
+    private var videoGeometryBlackoutRevealArmed = false
+    private var videoGeometryBlackoutFileLoadedSeen = false
+    private var suppressAspectMenuGeometrySyncUntilMs = 0L
+
     private val psc = Utils.PlaybackStateCache()
     private var mediaSession: MediaSessionCompat? = null
 
@@ -414,6 +423,7 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
             binding = PlayerBinding.inflate(layoutInflater)
             gestures = TouchGestures(this)
             zoomGestures = VideoZoomGestures(binding.player)
+            binding.player.onSurfaceTextureFrameAvailable = { onPlayerSurfaceFrameAvailable() }
 
             // Do these here and not in MainActivity because mpv can be launched from a file browser.
             Utils.copyAssets(this)
@@ -531,6 +541,8 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
 
         updateOrientation(true)
 
+        setVideoGeometryBlackout(true)
+
         startPlayback(filepath)
     }
 
@@ -580,26 +592,119 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
         }
     }
 
-    private fun syncZoomVideoGeometry(
-        immediate: Boolean = false,
-    ) {
-        if (!::zoomGestures.isInitialized)
+    private fun setVideoGeometryBlackout(visible: Boolean) {
+        if (visible) {
+            videoGeometryBlackoutGeneration += 1
+            videoGeometryBlackoutRevealArmed = false
+            videoGeometryBlackoutFileLoadedSeen = false
+        }
+        videoGeometryBlackoutActive = visible
+        if (!::binding.isInitialized || !uiInitialized)
             return
 
-        val nativeAspect = try { player.getVideoAspect() } catch (_: Throwable) { null }
-        val effectiveAspect = try { player.getEffectiveVideoAspect() } catch (_: Throwable) { null }
+        binding.videoBlackoutOverlay.visibility = if (visible) View.VISIBLE else View.GONE
+    }
+
+    private fun beginVideoGeometryBlackout() {
+        setVideoGeometryBlackout(true)
+        if (::zoomGestures.isInitialized) {
+            try { zoomGestures.resetForNewFile() } catch (_: Throwable) {}
+        }
+    }
+
+    private fun armVideoGeometryBlackoutReveal() {
+        if (!videoGeometryBlackoutActive || videoGeometryBlackoutRevealArmed)
+            return
+        videoGeometryBlackoutRevealArmed = true
+    }
+
+    private fun onPlayerSurfaceFrameAvailable() {
+        if (Looper.myLooper() != Looper.getMainLooper()) {
+            eventUiHandler.post { onPlayerSurfaceFrameAvailable() }
+            return
+        }
+
+        if (!videoGeometryBlackoutActive || !videoGeometryBlackoutRevealArmed)
+            return
+        if (videoGeometryBlackoutActive && !videoGeometryBlackoutFileLoadedSeen)
+            return
+        if (!hasDisplayableVideoGeometry())
+            return
+
+        val generation = videoGeometryBlackoutGeneration
+        ViewCompat.postOnAnimation(binding.player) {
+            if (videoGeometryBlackoutActive &&
+                videoGeometryBlackoutRevealArmed &&
+                generation == videoGeometryBlackoutGeneration &&
+                videoGeometryBlackoutFileLoadedSeen &&
+                hasDisplayableVideoGeometry()
+            ) {
+                videoGeometryBlackoutRevealArmed = false
+                setVideoGeometryBlackout(false)
+            }
+        }
+    }
+
+    private fun hasDisplayableVideoGeometry(): Boolean {
+        val aspect = try { player.getEffectiveVideoAspect() ?: 0.0 } catch (_: Throwable) { 0.0 }
+        val size = try { player.getVideoPixelSize() } catch (_: Throwable) { null }
+        return aspect > 0.001 && size != null
+    }
+
+    private fun isAspectMenuGeometrySyncSuppressed(): Boolean {
+        return !videoGeometryBlackoutActive &&
+            SystemClock.uptimeMillis() < suppressAspectMenuGeometrySyncUntilMs
+    }
+
+    private fun syncZoomVideoGeometry(
+        prepareNormalSurface: Boolean = false,
+        immediate: Boolean = false,
+    ) {
+        if (!::zoomGestures.isInitialized || isAspectMenuGeometrySyncSuppressed())
+            return
+
+        val aspect = try { player.getEffectiveVideoAspect() } catch (_: Throwable) { null }
         val size = try { player.getVideoPixelSize() } catch (_: Throwable) { null }
         val pan = try { player.getPanscan() } catch (_: Throwable) { 0.0 }
 
         try {
             zoomGestures.setVideoGeometry(
-                nativeAspect = nativeAspect,
-                effectiveAspect = effectiveAspect,
+                aspect = aspect,
                 pixelSize = size,
                 panscanValue = pan,
+                prepareNormalSurface = prepareNormalSurface,
                 immediate = immediate,
             )
         } catch (_: Throwable) {}
+    }
+
+    private fun prepareZoomSurfaceAndRevealWhenReady() {
+        if (!::zoomGestures.isInitialized)
+            return
+
+        if (videoGeometryBlackoutActive && !videoGeometryBlackoutFileLoadedSeen)
+            return
+        if (!hasDisplayableVideoGeometry())
+            return
+
+        // Pull all geometry at once while the blackout is still covering mpv.
+        // The blackout is removed only after TextureView reports a real frame
+        // update with this geometry, which avoids revealing a stale fullscreen
+        // or old-aspect buffer on heavy images/videos.
+        syncZoomVideoGeometry(prepareNormalSurface = true, immediate = true)
+        try { zoomGestures.prepareForVisibleMedia() } catch (_: Throwable) {}
+        armVideoGeometryBlackoutReveal()
+    }
+
+    private fun prepareZoomSurfaceForWindowExit() {
+        if (!::zoomGestures.isInitialized || !::binding.isInitialized)
+            return
+
+        try {
+            zoomGestures.prepareForWindowExit()
+        } catch (_: Throwable) {
+            // ignore; finish must continue
+        }
     }
 
     private fun finishWithResult(code: Int, includeTimePos: Boolean = false) {
@@ -616,6 +721,11 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
             result.putExtra("duration", psc.duration.toInt())
         }
         setResult(code, result)
+
+        // Avoid letting Android's activity/window transition animate a transformed
+        // TextureView. The player is about to close, so return it to the plain
+        // mpv surface before finish/rotation starts.
+        prepareZoomSurfaceForWindowExit()
 
         // Restore the orientation we entered with. This also bypasses the system auto-rotate lock,
         // so the next activity does not briefly appear in the wrong orientation.
@@ -2768,11 +2878,11 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
             return abs(currentValue - ratioValue) < 0.001
         }
 
-        var currentPanscan = MPVLib.getPropertyDouble("panscan") ?: 0.0
-        var currentOverride = MPVLib.getPropertyString("video-aspect-override")?.trim() ?: ""
+        val currentPanscan = MPVLib.getPropertyDouble("panscan") ?: 0.0
+        val currentOverride = MPVLib.getPropertyString("video-aspect-override")?.trim() ?: ""
         val panscanIndex = ratios.indexOf("panscan")
         val originalIndex = ratios.indexOf("-1").takeIf { it >= 0 } ?: 0
-        var selectedIndex = if (currentPanscan > ASPECT_PROPERTY_EPSILON && panscanIndex >= 0) {
+        var selectedIndex = if (currentPanscan > 0.0 && panscanIndex >= 0) {
             panscanIndex
         } else {
             ratios.indexOfFirst { ratio ->
@@ -2785,38 +2895,40 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
         val dialog = with(AlertDialog.Builder(this)) {
             setSingleChoiceItems(names, selectedIndex) { _, item ->
                 val ratio = ratios[item]
-                val activeOverrideIsOriginal = currentOverride.isEmpty() ||
-                    currentOverride == "-1" || currentOverride.equals("no", true)
+                val targetPanscan = if (ratio == "panscan") 1.0 else 0.0
+                val targetAspect = if (ratio == "panscan") {
+                    try { player.getVideoAspect() } catch (_: Throwable) { null }
+                } else {
+                    parseAspectRatio(ratio) ?: try { player.getVideoAspect() } catch (_: Throwable) { null }
+                }
+                val targetPixelSize = try { player.getVideoPixelSize() } catch (_: Throwable) { null }
+
+                // Menu selections are the only transition where we already know the
+                // requested geometry. Apply it before asking mpv to redraw so the
+                // user never sees the temporary fullscreen/base layout.
+                if (::zoomGestures.isInitialized) {
+                    try {
+                        zoomGestures.applyPredictedAspectMenuGeometry(
+                            aspect = targetAspect,
+                            pixelSize = targetPixelSize,
+                            panscanValue = targetPanscan,
+                        )
+                    } catch (_: Throwable) {}
+                }
+
+                val suppressUntil = SystemClock.uptimeMillis() + ASPECT_MENU_PREDICTIVE_SYNC_GRACE_MS
+                suppressAspectMenuGeometrySyncUntilMs = suppressUntil
+                eventUiHandler.postDelayed({
+                    if (SystemClock.uptimeMillis() >= suppressUntil)
+                        syncZoomVideoGeometry(prepareNormalSurface = true, immediate = true)
+                }, ASPECT_MENU_PREDICTIVE_SYNC_GRACE_MS + 20L)
 
                 if (ratio == "panscan") {
-                    // Fill first while the current aspect is still active, then restore
-                    // the native aspect. This keeps both intermediate and final frames
-                    // full-screen instead of exposing a temporary letterboxed frame.
-                    if (currentPanscan <= ASPECT_PROPERTY_EPSILON) {
-                        player.setFileLocalDouble("panscan", 1.0)
-                        currentPanscan = 1.0
-                    }
-                    if (!activeOverrideIsOriginal) {
-                        player.setFileLocalString("video-aspect-override", "-1")
-                        currentOverride = "-1"
-                    }
+                    player.setFileLocalString("video-aspect-override", "-1")
+                    player.setFileLocalDouble("panscan", 1.0)
                 } else {
-                    val targetIsOriginal = ratio == "-1" || ratio.equals("no", true)
-                    val aspectAlreadySelected = if (targetIsOriginal)
-                        activeOverrideIsOriginal
-                    else
-                        aspectRatioMatches(currentOverride, ratio)
-
-                    // While leaving panscan, keep the image filled until the requested
-                    // aspect is installed; disabling panscan is the sole final geometry step.
-                    if (!aspectAlreadySelected) {
-                        player.setFileLocalString("video-aspect-override", ratio)
-                        currentOverride = ratio
-                    }
-                    if (currentPanscan > ASPECT_PROPERTY_EPSILON) {
-                        player.setFileLocalDouble("panscan", 0.0)
-                        currentPanscan = 0.0
-                    }
+                    player.setFileLocalString("video-aspect-override", ratio)
+                    player.setFileLocalDouble("panscan", 0.0)
                 }
                 player.persistCurrentFileState()
                 // Keep dialog open (apply-in-place).
@@ -3401,7 +3513,10 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
         when (property) {
             "time-pos" -> updatePlaybackPos(psc.positionSec)
             "playlist-pos", "playlist-count" -> updatePlaylistButtons()
-            "video-params/w", "video-params/h" -> syncZoomVideoGeometry()
+            "video-params/w", "video-params/h" -> {
+                syncZoomVideoGeometry()
+                prepareZoomSurfaceAndRevealWhenReady()
+            }
         }
     }
 
@@ -3413,8 +3528,12 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
                 updateOrientation()
                 updatePiPParams()
                 syncZoomVideoGeometry()
+                prepareZoomSurfaceAndRevealWhenReady()
             }
-            "panscan" -> syncZoomVideoGeometry()
+            "panscan" -> {
+                syncZoomVideoGeometry()
+                prepareZoomSurfaceAndRevealWhenReady()
+            }
         }
     }
 
@@ -3422,7 +3541,10 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
         if (!activityIsForeground) return
         when (property) {
             "speed" -> updateSpeedButton()
-            "video-aspect-override" -> syncZoomVideoGeometry()
+            "video-aspect-override" -> {
+                syncZoomVideoGeometry()
+                prepareZoomSurfaceAndRevealWhenReady()
+            }
         }
         if (metaUpdated)
             updateMetadataDisplay()
@@ -3591,13 +3713,13 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
             }
 
             eventUiHandler.post {
-                try { zoomGestures.prepareForVisibleMedia() } catch (_: Throwable) {}
-                syncZoomVideoGeometry(immediate = true)
+                videoGeometryBlackoutFileLoadedSeen = true
+                prepareZoomSurfaceAndRevealWhenReady()
             }
         }
 
         if (eventId == MpvEvent.MPV_EVENT_VIDEO_RECONFIG) {
-            eventUiHandler.post { syncZoomVideoGeometry() }
+            eventUiHandler.post { prepareZoomSurfaceAndRevealWhenReady() }
         }
 
         if (eventId == MpvEvent.MPV_EVENT_START_FILE) {
@@ -3612,9 +3734,7 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
                 if (p != null) eventUiHandler.post { try { applyOrientationFromMetadata(p) } catch (_: Throwable) {} }
             }
 
-            eventUiHandler.postAtFrontOfQueue {
-                try { zoomGestures.resetForNewFile() } catch (_: Throwable) {}
-            }
+            eventUiHandler.postAtFrontOfQueue { beginVideoGeometryBlackout() }
             try {
                 MPVLib.setPropertyDouble("video-zoom", 0.0)
                 MPVLib.setPropertyDouble("video-pan-x", 0.0)
@@ -3905,7 +4025,10 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
         // Controls fade-in/out durations (ms). Keep them very fast but non-zero to avoid a harsh pop.
         private const val CONTROLS_FADE_IN_DURATION = 80L
         private const val CONTROLS_FADE_OUT_DURATION = 80L
-        private const val ASPECT_PROPERTY_EPSILON = 0.0001
+        // Predictive aspect-menu geometry is held briefly so asynchronous mpv
+        // property notifications cannot momentarily restore an intermediate state.
+        private const val ASPECT_MENU_PREDICTIVE_SYNC_GRACE_MS = 120L
+
         // Tap timing (must match TouchGestures.TAP_DURATION).
         // - Double-tap gestures: fast window (ms)
         // - Single-tap control toggle: delayed slightly longer so double-tap can cancel it (ms)
