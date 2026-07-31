@@ -1,34 +1,28 @@
 package `is`.xyz.mpv
 
 import android.content.Context
+import android.graphics.SurfaceTexture
 import android.util.AttributeSet
 import android.util.Log
 import android.view.Surface
-import android.view.SurfaceHolder
-import android.view.SurfaceView
-import kotlin.math.max
-import kotlin.math.sqrt
+import android.view.TextureView
 
-// Contains only the essential code needed to get a picture on the screen.
-//
-// SurfaceView is deliberately used on Android 9. It gives the Exynos Note 8 a
-// direct compositor surface, avoids the extra TextureView copy and preserves the
-// platform's best available HDR/color path. Android N and newer synchronize
-// SurfaceView transforms with the rest of the View hierarchy, so pinch zoom can
-// still be implemented by scaling/translating this View.
-abstract class BaseMPVView(context: Context, attrs: AttributeSet) :
-    SurfaceView(context, attrs), SurfaceHolder.Callback2 {
+// Contains only the essential code needed to get a picture on the screen
 
+abstract class BaseMPVView(context: Context, attrs: AttributeSet) : TextureView(context, attrs), TextureView.SurfaceTextureListener {
     init {
-        holder.addCallback(this)
-        holder.setKeepScreenOn(true)
-        setZOrderOnTop(false)
-        setZOrderMediaOverlay(false)
+        // TextureView is part of the normal View hierarchy. This makes high-zoom
+        // scale/translation much smoother than transforming a SurfaceView layer,
+        // especially on older Android devices where SurfaceView composition is
+        // quantized by SurfaceFlinger/HWC.
+        isOpaque = true
     }
 
-    private var initialized = false
-
-    /** Initialize libmpv. Call this once before the view is shown. */
+    /**
+     * Initialize libmpv.
+     *
+     * Call this once before the view is shown.
+     */
     fun initialize(configDir: String, cacheDir: String) {
         MPVLib.create(context)
 
@@ -43,31 +37,41 @@ abstract class BaseMPVView(context: Context, attrs: AttributeSet) :
 
         /* set hardcoded options */
         postInitOptions()
+        // could mess up VO init before surfaceCreated() is called
         MPVLib.setOptionString("force-window", "no")
+        // need to idle at least once for playFile() logic to work
         MPVLib.setOptionString("idle", "once")
 
-        initialized = true
-        if (holder.surface.isValid)
-            attachSurface(holder.surface, width, height)
+        surfaceTextureListener = this
+        if (isAvailable) {
+            surfaceTexture?.let { attachSurfaceTexture(it, width, height) }
+        }
         observeProperties()
     }
 
-    /** Deinitialize libmpv. Call this once before the view is destroyed. */
+    /**
+     * Deinitialize libmpv.
+     *
+     * Call this once before the view is destroyed.
+     */
     fun destroy() {
-        initialized = false
-        detachSurface()
-        holder.removeCallback(this)
-        surfaceSizeGeneration += 1
+        // Disable texture callbacks to avoid using uninitialized mpv state.
+        surfaceTextureListener = null
+        detachSurfaceTexture()
+
         MPVLib.destroy()
     }
 
     protected abstract fun initOptions()
     protected abstract fun postInitOptions()
+
     protected abstract fun observeProperties()
 
     private var filePath: String? = null
 
-    /** Set the first file to be played once the player is ready. */
+    /**
+     * Set the first file to be played once the player is ready.
+     */
     fun playFile(filePath: String) {
         if (attachedSurface != null) {
             MPVLib.command(arrayOf("loadfile", filePath))
@@ -79,30 +83,35 @@ abstract class BaseMPVView(context: Context, attrs: AttributeSet) :
 
     private var voInUse: String = "gpu"
 
-    /** Sets the VO to use. It is automatically disabled/enabled with the surface. */
+    /**
+     * Sets the VO to use.
+     * It is automatically disabled/enabled when the surface dis-/appears.
+     */
     fun setVo(vo: String) {
         voInUse = vo
         MPVLib.setOptionString("vo", vo)
     }
 
     private var attachedSurface: Surface? = null
+    private var attachedTexture: SurfaceTexture? = null
+
     private var renderSurfaceWidth = 0
     private var renderSurfaceHeight = 0
     private var customRenderSurfaceSize = false
-    private var surfaceSizeGeneration = 0
 
-    // Kept under the old property name so the surrounding activity does not need a
-    // large mechanical change. With SurfaceView it is fired by Callback2 and by a
-    // guarded fallback after a surface resize.
     var onSurfaceTextureFrameAvailable: (() -> Unit)? = null
 
     /**
-     * Set the real Surface buffer size used by mpv without changing the on-screen
-     * size. Requests are clamped defensively for the Galaxy Note 8 / Mali-G71 so a
-     * malformed aspect ratio or huge scan cannot allocate an unsafe BufferQueue.
+     * Set the real SurfaceTexture buffer size used by mpv without changing the
+     * TextureView's on-screen size.
+     *
+     * This intentionally accepts the requested size as-is. The caller decides the
+     * size, so high-resolution media can be rendered at its original resolution
+     * instead of being reduced to the display resolution before Android zooms it.
      */
     fun setRenderSurfaceSize(width: Int, height: Int) {
-        val (safeWidth, safeHeight) = clampRenderSurfaceSize(width, height)
+        val safeWidth = width.coerceAtLeast(1)
+        val safeHeight = height.coerceAtLeast(1)
         customRenderSurfaceSize = true
 
         if (safeWidth == renderSurfaceWidth && safeHeight == renderSurfaceHeight)
@@ -115,140 +124,97 @@ abstract class BaseMPVView(context: Context, attrs: AttributeSet) :
 
     fun resetRenderSurfaceSize() {
         customRenderSurfaceSize = false
-        renderSurfaceWidth = width.coerceAtLeast(1)
-        renderSurfaceHeight = height.coerceAtLeast(1)
+        val safeWidth = width.coerceAtLeast(1)
+        val safeHeight = height.coerceAtLeast(1)
 
-        if (holder.surface.isValid) {
-            Log.d(TAG, "restoring surface size from layout")
-            holder.setSizeFromLayout()
-            updateMpvSurfaceSize(renderSurfaceWidth, renderSurfaceHeight)
-            scheduleFrameReadyFallback()
-        }
-    }
+        if (safeWidth == renderSurfaceWidth && safeHeight == renderSurfaceHeight)
+            return
 
-    private fun clampRenderSurfaceSize(width: Int, height: Int): Pair<Int, Int> {
-        val requestedWidth = width.coerceAtLeast(1).toDouble()
-        val requestedHeight = height.coerceAtLeast(1).toDouble()
-        val edgeScale = MAX_RENDER_SURFACE_EDGE / max(requestedWidth, requestedHeight)
-        val pixelScale = sqrt(
-            MAX_RENDER_SURFACE_PIXELS /
-                (requestedWidth * requestedHeight).coerceAtLeast(1.0),
-        )
-        val scale = minOf(1.0, edgeScale, pixelScale)
-        return (requestedWidth * scale).toInt().coerceAtLeast(1) to
-            (requestedHeight * scale).toInt().coerceAtLeast(1)
+        renderSurfaceWidth = safeWidth
+        renderSurfaceHeight = safeHeight
+        applyRenderSurfaceSize()
     }
 
     private fun ensureRenderSurfaceSize(width: Int, height: Int) {
         if (customRenderSurfaceSize)
             return
+
         renderSurfaceWidth = width.coerceAtLeast(1)
         renderSurfaceHeight = height.coerceAtLeast(1)
     }
 
     private fun applyRenderSurfaceSize() {
-        if (!holder.surface.isValid || renderSurfaceWidth <= 0 || renderSurfaceHeight <= 0)
+        val texture = attachedTexture ?: return
+        if (renderSurfaceWidth <= 0 || renderSurfaceHeight <= 0)
             return
 
-        Log.d(TAG, "requesting fixed surface ${renderSurfaceWidth}x${renderSurfaceHeight}")
-        holder.setFixedSize(renderSurfaceWidth, renderSurfaceHeight)
-        updateMpvSurfaceSize(renderSurfaceWidth, renderSurfaceHeight)
-        scheduleFrameReadyFallback()
+        texture.setDefaultBufferSize(renderSurfaceWidth, renderSurfaceHeight)
+        MPVLib.setPropertyString("android-surface-size", "${renderSurfaceWidth}x${renderSurfaceHeight}")
     }
 
-    private fun updateMpvSurfaceSize(width: Int, height: Int) {
-        if (!initialized || attachedSurface == null)
-            return
-        MPVLib.setPropertyString("android-surface-size", "${width}x${height}")
-    }
-
-    private fun attachSurface(surface: Surface, width: Int, height: Int) {
-        if (!initialized || attachedSurface != null || !surface.isValid)
+    private fun attachSurfaceTexture(texture: SurfaceTexture, width: Int, height: Int) {
+        if (attachedSurface != null)
             return
 
+        attachedTexture = texture
         ensureRenderSurfaceSize(width, height)
-        if (customRenderSurfaceSize)
-            holder.setFixedSize(renderSurfaceWidth, renderSurfaceHeight)
+        texture.setDefaultBufferSize(renderSurfaceWidth, renderSurfaceHeight)
 
-        Log.w(TAG, "attaching surface ${renderSurfaceWidth}x${renderSurfaceHeight}")
+        Log.w(TAG, "attaching texture surface ${renderSurfaceWidth}x${renderSurfaceHeight}")
+        val surface = Surface(texture)
         attachedSurface = surface
+
         MPVLib.attachSurface(surface)
-        updateMpvSurfaceSize(renderSurfaceWidth, renderSurfaceHeight)
+        MPVLib.setPropertyString("android-surface-size", "${renderSurfaceWidth}x${renderSurfaceHeight}")
+        // This forces mpv to render subs/osd/whatever into our surface even if it would ordinarily not
         MPVLib.setOptionString("force-window", "yes")
 
         if (filePath != null) {
             MPVLib.command(arrayOf("loadfile", filePath as String))
             filePath = null
         } else {
+            // We disable video output when the context disappears, enable it back
             MPVLib.setPropertyString("vo", voInUse)
         }
-        scheduleFrameReadyFallback()
     }
 
-    private fun detachSurface() {
-        if (attachedSurface == null)
-            return
+    private fun detachSurfaceTexture() {
+        val surface = attachedSurface ?: return
 
-        Log.w(TAG, "detaching surface")
-        surfaceSizeGeneration += 1
-        try {
-            MPVLib.setPropertyString("vo", "null")
-            MPVLib.setPropertyString("force-window", "no")
-            MPVLib.detachSurface()
-        } catch (error: Throwable) {
-            Log.w(TAG, "failed to detach mpv surface cleanly", error)
-        } finally {
-            // SurfaceView owns holder.surface; releasing it here races with the
-            // compositor and was the source of the old detach/use-after-release risk.
-            attachedSurface = null
-        }
+        Log.w(TAG, "detaching texture surface")
+        MPVLib.setPropertyString("vo", "null")
+        MPVLib.setPropertyString("force-window", "no")
+        // Note that before calling detachSurface() we need to be sure that libmpv
+        // is done using the surface.
+        // FIXME: There could be a race condition here, because I don't think
+        // setting a property will wait for VO deinit.
+        MPVLib.detachSurface()
+        surface.release()
+        attachedSurface = null
+        attachedTexture = null
     }
 
-    private fun scheduleFrameReadyFallback() {
-        surfaceSizeGeneration += 1
-        val generation = surfaceSizeGeneration
-        postDelayed({
-            if (generation == surfaceSizeGeneration && attachedSurface != null)
-                onSurfaceTextureFrameAvailable?.invoke()
-        }, FRAME_READY_FALLBACK_MS)
+    // Texture callbacks
+
+    override fun onSurfaceTextureAvailable(surface: SurfaceTexture, width: Int, height: Int) {
+        attachSurfaceTexture(surface, width, height)
     }
 
-    override fun surfaceCreated(holder: SurfaceHolder) {
-        attachSurface(holder.surface, width, height)
+    override fun onSurfaceTextureSizeChanged(surface: SurfaceTexture, width: Int, height: Int) {
+        ensureRenderSurfaceSize(width, height)
+        applyRenderSurfaceSize()
     }
 
-    override fun surfaceChanged(holder: SurfaceHolder, format: Int, width: Int, height: Int) {
-        if (!initialized)
-            return
-        if (attachedSurface == null)
-            attachSurface(holder.surface, width, height)
-
-        if (!customRenderSurfaceSize) {
-            renderSurfaceWidth = width.coerceAtLeast(1)
-            renderSurfaceHeight = height.coerceAtLeast(1)
-        }
-        updateMpvSurfaceSize(width.coerceAtLeast(1), height.coerceAtLeast(1))
-        scheduleFrameReadyFallback()
+    override fun onSurfaceTextureDestroyed(surface: SurfaceTexture): Boolean {
+        detachSurfaceTexture()
+        return true
     }
 
-    override fun surfaceDestroyed(holder: SurfaceHolder) {
-        detachSurface()
-    }
-
-    override fun surfaceRedrawNeeded(holder: SurfaceHolder) {
-        // Invalidate the delayed fallback so a real redraw does not produce a
-        // second reveal callback shortly afterwards.
-        surfaceSizeGeneration += 1
+    override fun onSurfaceTextureUpdated(surface: SurfaceTexture) {
         onSurfaceTextureFrameAvailable?.invoke()
     }
 
     companion object {
         private const val TAG = "mpv"
-
-        // Mali-G71 supports larger textures, but a 4096 edge and roughly 10 MP
-        // keeps triple-buffered RGBA surfaces within a sane budget on the Note 8.
-        private const val MAX_RENDER_SURFACE_EDGE = 4096.0
-        private const val MAX_RENDER_SURFACE_PIXELS = 10_000_000.0
-        private const val FRAME_READY_FALLBACK_MS = 120L
     }
 }
