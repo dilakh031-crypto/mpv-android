@@ -1,5 +1,6 @@
 package `is`.xyz.mpv
 
+import android.app.ActivityManager
 import android.content.Context
 import android.os.Build
 import android.os.Environment
@@ -7,7 +8,6 @@ import android.preference.PreferenceManager
 import android.util.AttributeSet
 import android.util.Log
 import android.view.*
-import androidx.core.content.ContextCompat
 import `is`.xyz.mpv.MPVLib.MpvFormat.MPV_FORMAT_DOUBLE
 import `is`.xyz.mpv.MPVLib.MpvFormat.MPV_FORMAT_FLAG
 import `is`.xyz.mpv.MPVLib.MpvFormat.MPV_FORMAT_INT64
@@ -24,8 +24,16 @@ internal class MPVView(context: Context, attrs: AttributeSet) : BaseMPVView(cont
         val sharedPreferences = PreferenceManager.getDefaultSharedPreferences(context)
         val persistFileState = sharedPreferences.getBoolean("save_position", false)
 
-        // apply phone-optimized defaults
-        MPVLib.setOptionString("profile", "fast")
+        // Balanced high-quality defaults. Individual user preferences below still win.
+        // Avoid mpv's "fast" profile: it disables dithering and high-quality scaling.
+        MPVLib.setOptionString("scale", "spline36")
+        MPVLib.setOptionString("dscale", "mitchell")
+        MPVLib.setOptionString("cscale", "spline36")
+        MPVLib.setOptionString("dither", "fruit")
+        MPVLib.setOptionString("dither-depth", "auto")
+        MPVLib.setOptionString("correct-downscaling", "yes")
+        MPVLib.setOptionString("sigmoid-upscaling", "yes")
+        MPVLib.setOptionString("hdr-compute-peak", "yes")
         // When Save position on quit is disabled, old watch-later files must not restore
         // positions or any other per-file option before the activity can discard them.
         MPVLib.setOptionString("resume-playback", if (persistFileState) "yes" else "no")
@@ -42,17 +50,8 @@ internal class MPVView(context: Context, attrs: AttributeSet) : BaseMPVView(cont
         else
             "no"
 
-        // vo: set display fps as reported by android
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-            val disp = ContextCompat.getDisplayOrDefault(context)
-            val refreshRate = disp.mode.refreshRate
-
-            Log.v(TAG, "Display ${disp.displayId} reports FPS of $refreshRate")
-            MPVLib.setOptionString("display-fps-override", refreshRate.toString())
-        } else {
-            Log.v(TAG, "Android version too old, disabling refresh rate functionality " +
-                       "(${Build.VERSION.SDK_INT} < ${Build.VERSION_CODES.M})")
-        }
+        // Do not force display-fps-override. A stale override causes judder on variable-
+        // refresh-rate displays. Surface.setFrameRate() is updated from estimated-vf-fps.
 
         // set non-complex options
         data class Property(val preferenceName: String, val mpvOption: String)
@@ -114,10 +113,30 @@ internal class MPVView(context: Context, attrs: AttributeSet) : BaseMPVView(cont
         // Keep still images open indefinitely instead of letting mpv advance/end them
         // after its default image display timeout.
         MPVLib.setOptionString("image-display-duration", "inf")
-        // Limit demuxer cache since the defaults are too high for mobile devices
-        val cacheMegs = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O_MR1) 64 else 32
-        MPVLib.setOptionString("demuxer-max-bytes", "${cacheMegs * 1024 * 1024}")
-        MPVLib.setOptionString("demuxer-max-back-bytes", "${cacheMegs * 1024 * 1024}")
+        // Device-aware network cache. Forward buffering is prioritized over rewind data,
+        // and low-RAM devices are kept well below the process heap ceiling.
+        val activityManager = context.getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager
+        val lowRam = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.KITKAT)
+            activityManager.isLowRamDevice
+        else
+            activityManager.memoryClass <= 128
+        val (forwardCacheMegs, backCacheMegs, readaheadSeconds) = when {
+            lowRam || activityManager.memoryClass <= 192 -> Triple(24, 8, 12)
+            activityManager.memoryClass <= 256 -> Triple(48, 12, 18)
+            activityManager.memoryClass <= 512 -> Triple(96, 24, 25)
+            else -> Triple(128, 32, 30)
+        }
+        MPVLib.setOptionString("cache", "auto")
+        MPVLib.setOptionString("cache-pause", "yes")
+        MPVLib.setOptionString("cache-pause-wait", "1.5")
+        MPVLib.setOptionString("demuxer-readahead-secs", readaheadSeconds.toString())
+        MPVLib.setOptionString("demuxer-max-bytes", "${forwardCacheMegs * 1024 * 1024}")
+        MPVLib.setOptionString("demuxer-max-back-bytes", "${backCacheMegs * 1024 * 1024}")
+        Log.i(
+            TAG,
+            "Cache budget: forward=${forwardCacheMegs}MiB back=${backCacheMegs}MiB " +
+                "readahead=${readaheadSeconds}s lowRam=$lowRam memoryClass=${activityManager.memoryClass}",
+        )
         //
         val screenshotDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_PICTURES)
         screenshotDir.mkdirs()
@@ -372,6 +391,11 @@ internal class MPVView(context: Context, attrs: AttributeSet) : BaseMPVView(cont
             Property("video-params/h", MPV_FORMAT_INT64),
             Property("video-aspect-override", MPV_FORMAT_STRING),
             Property("panscan", MPV_FORMAT_DOUBLE),
+            Property("estimated-vf-fps", MPV_FORMAT_DOUBLE),
+            Property("demuxer-cache-duration", MPV_FORMAT_DOUBLE),
+            Property("cache-buffering-state", MPV_FORMAT_INT64),
+            Property("frame-drop-count", MPV_FORMAT_INT64),
+            Property("decoder-frame-drop-count", MPV_FORMAT_INT64),
             Property("playlist-pos", MPV_FORMAT_INT64),
             Property("playlist-count", MPV_FORMAT_INT64),
             Property("current-tracks/video/image"),
