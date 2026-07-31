@@ -17,8 +17,14 @@ import android.content.pm.ActivityInfo
 import android.content.pm.PackageManager
 import android.content.res.ColorStateList
 import android.content.res.Configuration
-import android.graphics.drawable.Icon
+import android.graphics.Bitmap
+import android.graphics.Canvas
 import android.graphics.Color
+import android.graphics.Matrix
+import android.graphics.Paint
+import android.graphics.drawable.BitmapDrawable
+import android.graphics.drawable.ColorDrawable
+import android.graphics.drawable.Icon
 import android.util.Log
 import android.media.AudioManager
 import android.media.MediaMetadataRetriever
@@ -176,7 +182,13 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
     private var videoGeometryBlackoutGeneration = 0
     private var videoGeometryBlackoutRevealArmed = false
     private var videoGeometryBlackoutFileLoadedSeen = false
-    private var suppressAspectMenuGeometrySyncUntilMs = 0L
+
+    private var aspectMenuTransitionActive = false
+    private var aspectMenuTransitionGeneration = 0
+    private var aspectMenuTransitionTargetAspect: Double? = null
+    private var aspectMenuTransitionTargetPanscan = 0.0
+    private var aspectMenuTransitionConfirmedFrames = 0
+    private var aspectMenuTransitionSnapshot: Bitmap? = null
 
     private val psc = Utils.PlaybackStateCache()
     private var mediaSession: MediaSessionCompat? = null
@@ -423,7 +435,7 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
             binding = PlayerBinding.inflate(layoutInflater)
             gestures = TouchGestures(this)
             zoomGestures = VideoZoomGestures(binding.player)
-            binding.player.onSurfaceFrameAvailable = { onPlayerSurfaceFrameAvailable() }
+            binding.player.onSurfaceTextureFrameAvailable = { onPlayerSurfaceFrameAvailable() }
 
             // Do these here and not in MainActivity because mpv can be launched from a file browser.
             Utils.copyAssets(this)
@@ -602,7 +614,151 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
         if (!::binding.isInitialized || !uiInitialized)
             return
 
-        binding.videoBlackoutOverlay.visibility = if (visible) View.VISIBLE else View.GONE
+        if (visible && !aspectMenuTransitionActive)
+            binding.videoBlackoutOverlay.background = ColorDrawable(Color.BLACK)
+        binding.videoBlackoutOverlay.visibility =
+            if (visible || aspectMenuTransitionActive) View.VISIBLE else View.GONE
+    }
+
+    private fun captureAspectMenuTransitionSnapshot() {
+        if (!::binding.isInitialized || !uiInitialized)
+            return
+
+        val playerView = binding.player
+        val overlay = binding.videoBlackoutOverlay
+        if (playerView.width <= 0 || playerView.height <= 0 || overlay.width <= 0 || overlay.height <= 0)
+            return
+
+        val source = try {
+            playerView.getBitmap(playerView.width, playerView.height)
+        } catch (_: Throwable) {
+            null
+        } ?: return
+
+        val snapshot = try {
+            Bitmap.createBitmap(overlay.width, overlay.height, Bitmap.Config.ARGB_8888)
+        } catch (_: Throwable) {
+            source.recycle()
+            return
+        }
+
+        try {
+            val canvas = Canvas(snapshot)
+            canvas.drawColor(Color.BLACK)
+
+            val playerLocation = IntArray(2)
+            val overlayLocation = IntArray(2)
+            playerView.getLocationOnScreen(playerLocation)
+            overlay.getLocationOnScreen(overlayLocation)
+
+            val matrix = Matrix().apply {
+                setScale(
+                    playerView.scaleX,
+                    playerView.scaleY,
+                    playerView.pivotX,
+                    playerView.pivotY,
+                )
+                postTranslate(
+                    playerLocation[0] - overlayLocation[0] + playerView.translationX,
+                    playerLocation[1] - overlayLocation[1] + playerView.translationY,
+                )
+            }
+            canvas.drawBitmap(source, matrix, Paint(Paint.FILTER_BITMAP_FLAG))
+        } finally {
+            source.recycle()
+        }
+
+        aspectMenuTransitionSnapshot?.recycle()
+        aspectMenuTransitionSnapshot = snapshot
+        overlay.background = BitmapDrawable(resources, snapshot).apply {
+            gravity = Gravity.FILL
+        }
+    }
+
+    private fun beginAspectMenuTransition(targetAspect: Double?, targetPanscan: Double) {
+        if (!aspectMenuTransitionActive)
+            captureAspectMenuTransitionSnapshot()
+
+        aspectMenuTransitionActive = true
+        aspectMenuTransitionGeneration += 1
+        aspectMenuTransitionTargetAspect = targetAspect
+        aspectMenuTransitionTargetPanscan = targetPanscan
+        aspectMenuTransitionConfirmedFrames = 0
+
+        if (::binding.isInitialized && uiInitialized) {
+            binding.videoBlackoutOverlay.visibility = View.VISIBLE
+        }
+
+        val generation = aspectMenuTransitionGeneration
+        eventUiHandler.postDelayed({
+            if (aspectMenuTransitionActive && generation == aspectMenuTransitionGeneration)
+                finishAspectMenuTransition(generation)
+        }, ASPECT_MENU_TRANSITION_TIMEOUT_MS)
+    }
+
+    private fun aspectMenuTargetIsApplied(): Boolean {
+        val currentPanscan = try { player.getPanscan() } catch (_: Throwable) { return false }
+        if (abs(currentPanscan - aspectMenuTransitionTargetPanscan) > ASPECT_VALUE_EPSILON)
+            return false
+
+        val targetAspect = aspectMenuTransitionTargetAspect ?: return true
+        val currentAspect = try { player.getEffectiveVideoAspect() } catch (_: Throwable) { null }
+            ?: return false
+        return abs(currentAspect - targetAspect) <=
+            maxOf(ASPECT_VALUE_EPSILON, targetAspect * ASPECT_RELATIVE_EPSILON)
+    }
+
+    private fun onAspectMenuTransitionFrameAvailable() {
+        if (!aspectMenuTransitionActive || !aspectMenuTargetIsApplied())
+            return
+
+        val generation = aspectMenuTransitionGeneration
+        aspectMenuTransitionConfirmedFrames += 1
+        if (aspectMenuTransitionConfirmedFrames >= 2) {
+            ViewCompat.postOnAnimation(binding.player) {
+                if (aspectMenuTransitionActive &&
+                    generation == aspectMenuTransitionGeneration &&
+                    aspectMenuTargetIsApplied()
+                ) {
+                    finishAspectMenuTransition(generation)
+                }
+            }
+            return
+        }
+
+        eventUiHandler.postDelayed({
+            if (aspectMenuTransitionActive &&
+                generation == aspectMenuTransitionGeneration &&
+                aspectMenuTransitionConfirmedFrames > 0 &&
+                aspectMenuTargetIsApplied()
+            ) {
+                finishAspectMenuTransition(generation)
+            }
+        }, ASPECT_MENU_SINGLE_FRAME_REVEAL_DELAY_MS)
+    }
+
+    private fun finishAspectMenuTransition(generation: Int) {
+        if (!aspectMenuTransitionActive || generation != aspectMenuTransitionGeneration)
+            return
+
+        aspectMenuTransitionActive = false
+        aspectMenuTransitionConfirmedFrames = 0
+        syncZoomVideoGeometry(prepareNormalSurface = true, immediate = true)
+
+        if (::binding.isInitialized && uiInitialized) {
+            val overlay = binding.videoBlackoutOverlay
+            overlay.visibility = if (videoGeometryBlackoutActive) View.VISIBLE else View.GONE
+            overlay.background = ColorDrawable(Color.BLACK)
+        }
+
+        val snapshot = aspectMenuTransitionSnapshot
+        aspectMenuTransitionSnapshot = null
+        if (snapshot != null) {
+            ViewCompat.postOnAnimation(binding.videoBlackoutOverlay) {
+                if (!snapshot.isRecycled)
+                    snapshot.recycle()
+            }
+        }
     }
 
     private fun beginVideoGeometryBlackout() {
@@ -623,6 +779,8 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
             eventUiHandler.post { onPlayerSurfaceFrameAvailable() }
             return
         }
+
+        onAspectMenuTransitionFrameAvailable()
 
         if (!videoGeometryBlackoutActive || !videoGeometryBlackoutRevealArmed)
             return
@@ -652,8 +810,7 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
     }
 
     private fun isAspectMenuGeometrySyncSuppressed(): Boolean {
-        return !videoGeometryBlackoutActive &&
-            SystemClock.uptimeMillis() < suppressAspectMenuGeometrySyncUntilMs
+        return aspectMenuTransitionActive && !videoGeometryBlackoutActive
     }
 
     private fun syncZoomVideoGeometry(
@@ -688,9 +845,9 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
             return
 
         // Pull all geometry at once while the blackout is still covering mpv.
-        // The blackout is removed after the SurfaceView has received the new surface
-        // geometry and passed a redraw boundary, avoiding a stale fullscreen or
-        // old-aspect buffer on heavy images/videos.
+        // The blackout is removed only after TextureView reports a real frame
+        // update with this geometry, which avoids revealing a stale fullscreen
+        // or old-aspect buffer on heavy images/videos.
         syncZoomVideoGeometry(prepareNormalSurface = true, immediate = true)
         try { zoomGestures.prepareForVisibleMedia() } catch (_: Throwable) {}
         armVideoGeometryBlackoutReveal()
@@ -723,8 +880,8 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
         setResult(code, result)
 
         // Avoid letting Android's activity/window transition animate a transformed
-        // video surface. The player is about to close, so reset the transform before
-        // finish/rotation starts.
+        // TextureView. The player is about to close, so return it to the plain
+        // mpv surface before finish/rotation starts.
         prepareZoomSurfaceForWindowExit()
 
         // Restore the orientation we entered with. This also bypasses the system auto-rotate lock,
@@ -779,6 +936,13 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
 
         // take the background service with us
         stopServiceRunnable.run()
+
+        aspectMenuTransitionActive = false
+        aspectMenuTransitionSnapshot?.let {
+            if (!it.isRecycled)
+                it.recycle()
+        }
+        aspectMenuTransitionSnapshot = null
 
         player.removeObserver(this)
         player.destroy()
@@ -873,6 +1037,8 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
         // media session uses the same thumbnail
         updateMediaSession()
 
+        if (aspectMenuTransitionActive)
+            finishAspectMenuTransition(aspectMenuTransitionGeneration)
         activityIsForeground = false
         eventUiHandler.removeCallbacksAndMessages(null)
         cancelPendingTapToggle()
@@ -1193,7 +1359,7 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
     /**
      * Keeps the Android UI overlay above the video layer and forces a redraw.
      *
-     * Keep the normal Android overlay hierarchy explicitly above the SurfaceView during player
+     * On some devices the TextureView can momentarily win composition/z-order during player
      * startup. Touch still reaches gestureLayer, so seeking works, but controls/gestureTextView
      * do not become visible until the window is redrawn by something external (for example
      * pulling the notification shade). Poking the overlay here makes that redraw deterministic.
@@ -2870,7 +3036,14 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
             }
         }
 
+        fun isOriginalAspectRatio(value: String): Boolean {
+            val trimmed = value.trim()
+            return trimmed.isEmpty() || trimmed == "-1" || trimmed.equals("no", true)
+        }
+
         fun aspectRatioMatches(current: String, ratio: String): Boolean {
+            if (isOriginalAspectRatio(current) && isOriginalAspectRatio(ratio))
+                return true
             if (current == ratio)
                 return true
             val currentValue = parseAspectRatio(current) ?: return false
@@ -2902,10 +3075,18 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
                     parseAspectRatio(ratio) ?: try { player.getVideoAspect() } catch (_: Throwable) { null }
                 }
                 val targetPixelSize = try { player.getVideoPixelSize() } catch (_: Throwable) { null }
+                val appliedPanscan = MPVLib.getPropertyDouble("panscan") ?: 0.0
+                val appliedOverride = MPVLib.getPropertyString("video-aspect-override")?.trim() ?: ""
+                val panscanNeedsChange = abs(appliedPanscan - targetPanscan) > ASPECT_VALUE_EPSILON
+                val aspectNeedsChange = if (ratio == "panscan") {
+                    !isOriginalAspectRatio(appliedOverride)
+                } else {
+                    !aspectRatioMatches(appliedOverride, ratio)
+                }
+                if (!panscanNeedsChange && !aspectNeedsChange)
+                    return@setSingleChoiceItems
 
-                // Menu selections are the only transition where we already know the
-                // requested geometry. Apply it before asking mpv to redraw so the
-                // user never sees the temporary fullscreen/base layout.
+                beginAspectMenuTransition(targetAspect, targetPanscan)
                 if (::zoomGestures.isInitialized) {
                     try {
                         zoomGestures.applyPredictedAspectMenuGeometry(
@@ -2916,19 +3097,16 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
                     } catch (_: Throwable) {}
                 }
 
-                val suppressUntil = SystemClock.uptimeMillis() + ASPECT_MENU_PREDICTIVE_SYNC_GRACE_MS
-                suppressAspectMenuGeometrySyncUntilMs = suppressUntil
-                eventUiHandler.postDelayed({
-                    if (SystemClock.uptimeMillis() >= suppressUntil)
-                        syncZoomVideoGeometry(prepareNormalSurface = true, immediate = true)
-                }, ASPECT_MENU_PREDICTIVE_SYNC_GRACE_MS + 20L)
-
                 if (ratio == "panscan") {
-                    player.setFileLocalString("video-aspect-override", "-1")
-                    player.setFileLocalDouble("panscan", 1.0)
+                    if (aspectNeedsChange)
+                        player.setFileLocalString("video-aspect-override", "-1")
+                    if (panscanNeedsChange)
+                        player.setFileLocalDouble("panscan", 1.0)
                 } else {
-                    player.setFileLocalString("video-aspect-override", ratio)
-                    player.setFileLocalDouble("panscan", 0.0)
+                    if (panscanNeedsChange)
+                        player.setFileLocalDouble("panscan", 0.0)
+                    if (aspectNeedsChange)
+                        player.setFileLocalString("video-aspect-override", ratio)
                 }
                 player.persistCurrentFileState()
                 // Keep dialog open (apply-in-place).
@@ -4025,9 +4203,10 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
         // Controls fade-in/out durations (ms). Keep them very fast but non-zero to avoid a harsh pop.
         private const val CONTROLS_FADE_IN_DURATION = 80L
         private const val CONTROLS_FADE_OUT_DURATION = 80L
-        // Predictive aspect-menu geometry is held briefly so asynchronous mpv
-        // property notifications cannot momentarily restore an intermediate state.
-        private const val ASPECT_MENU_PREDICTIVE_SYNC_GRACE_MS = 120L
+        private const val ASPECT_MENU_SINGLE_FRAME_REVEAL_DELAY_MS = 70L
+        private const val ASPECT_MENU_TRANSITION_TIMEOUT_MS = 3000L
+        private const val ASPECT_VALUE_EPSILON = 0.001
+        private const val ASPECT_RELATIVE_EPSILON = 0.0005
 
         // Tap timing (must match TouchGestures.TAP_DURATION).
         // - Double-tap gestures: fast window (ms)

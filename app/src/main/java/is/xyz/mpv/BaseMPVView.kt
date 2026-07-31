@@ -1,23 +1,21 @@
 package `is`.xyz.mpv
 
 import android.content.Context
-import android.graphics.PixelFormat
+import android.graphics.SurfaceTexture
 import android.util.AttributeSet
 import android.util.Log
 import android.view.Surface
-import android.view.SurfaceHolder
-import android.view.SurfaceView
+import android.view.TextureView
 
 // Contains only the essential code needed to get a picture on the screen
 
-abstract class BaseMPVView(context: Context, attrs: AttributeSet) :
-    SurfaceView(context, attrs),
-    SurfaceHolder.Callback2 {
-
+abstract class BaseMPVView(context: Context, attrs: AttributeSet) : TextureView(context, attrs), TextureView.SurfaceTextureListener {
     init {
-        setZOrderOnTop(false)
-        setZOrderMediaOverlay(false)
-        holder.setFormat(PixelFormat.OPAQUE)
+        // TextureView is part of the normal View hierarchy. This makes high-zoom
+        // scale/translation much smoother than transforming a SurfaceView layer,
+        // especially on older Android devices where SurfaceView composition is
+        // quantized by SurfaceFlinger/HWC.
+        isOpaque = true
     }
 
     /**
@@ -44,9 +42,10 @@ abstract class BaseMPVView(context: Context, attrs: AttributeSet) :
         // need to idle at least once for playFile() logic to work
         MPVLib.setOptionString("idle", "once")
 
-        holder.addCallback(this)
-        if (holder.surface.isValid)
-            attachSurface(holder.surface, holder.surfaceFrame.width(), holder.surfaceFrame.height())
+        surfaceTextureListener = this
+        if (isAvailable) {
+            surfaceTexture?.let { attachSurfaceTexture(it, width, height) }
+        }
         observeProperties()
     }
 
@@ -56,8 +55,10 @@ abstract class BaseMPVView(context: Context, attrs: AttributeSet) :
      * Call this once before the view is destroyed.
      */
     fun destroy() {
-        holder.removeCallback(this)
-        detachSurface()
+        // Disable texture callbacks to avoid using uninitialized mpv state.
+        surfaceTextureListener = null
+        detachSurfaceTexture()
+
         MPVLib.destroy()
     }
 
@@ -92,26 +93,29 @@ abstract class BaseMPVView(context: Context, attrs: AttributeSet) :
     }
 
     private var attachedSurface: Surface? = null
+    private var attachedTexture: SurfaceTexture? = null
 
     private var renderSurfaceWidth = 0
     private var renderSurfaceHeight = 0
     private var customRenderSurfaceSize = false
 
-    var onSurfaceFrameAvailable: (() -> Unit)? = null
+    var onSurfaceTextureFrameAvailable: (() -> Unit)? = null
 
     /**
-     * Set the real Surface buffer size used by mpv without changing the
-     * SurfaceView's on-screen layout size.
+     * Set the real SurfaceTexture buffer size used by mpv without changing the
+     * TextureView's on-screen size.
+     *
+     * This intentionally accepts the requested size as-is. The caller decides the
+     * size, so high-resolution media can be rendered at its original resolution
+     * instead of being reduced to the display resolution before Android zooms it.
      */
     fun setRenderSurfaceSize(width: Int, height: Int) {
         val safeWidth = width.coerceAtLeast(1)
         val safeHeight = height.coerceAtLeast(1)
         customRenderSurfaceSize = true
 
-        if (safeWidth == renderSurfaceWidth && safeHeight == renderSurfaceHeight) {
-            scheduleSurfaceFrameSignal()
+        if (safeWidth == renderSurfaceWidth && safeHeight == renderSurfaceHeight)
             return
-        }
 
         renderSurfaceWidth = safeWidth
         renderSurfaceHeight = safeHeight
@@ -123,17 +127,12 @@ abstract class BaseMPVView(context: Context, attrs: AttributeSet) :
         val safeWidth = width.coerceAtLeast(1)
         val safeHeight = height.coerceAtLeast(1)
 
-        if (safeWidth == renderSurfaceWidth && safeHeight == renderSurfaceHeight) {
-            holder.setSizeFromLayout()
-            scheduleSurfaceFrameSignal()
+        if (safeWidth == renderSurfaceWidth && safeHeight == renderSurfaceHeight)
             return
-        }
 
         renderSurfaceWidth = safeWidth
         renderSurfaceHeight = safeHeight
-        holder.setSizeFromLayout()
-        applyAndroidSurfaceSize()
-        scheduleSurfaceFrameSignal()
+        applyRenderSurfaceSize()
     }
 
     private fun ensureRenderSurfaceSize(width: Int, height: Int) {
@@ -145,37 +144,28 @@ abstract class BaseMPVView(context: Context, attrs: AttributeSet) :
     }
 
     private fun applyRenderSurfaceSize() {
+        val texture = attachedTexture ?: return
         if (renderSurfaceWidth <= 0 || renderSurfaceHeight <= 0)
             return
 
-        holder.setFixedSize(renderSurfaceWidth, renderSurfaceHeight)
-        applyAndroidSurfaceSize()
-        scheduleSurfaceFrameSignal()
+        texture.setDefaultBufferSize(renderSurfaceWidth, renderSurfaceHeight)
+        MPVLib.setPropertyString("android-surface-size", "${renderSurfaceWidth}x${renderSurfaceHeight}")
     }
 
-    private fun applyAndroidSurfaceSize() {
-        if (attachedSurface == null || renderSurfaceWidth <= 0 || renderSurfaceHeight <= 0)
-            return
-
-        MPVLib.setPropertyString(
-            "android-surface-size",
-            "${renderSurfaceWidth}x${renderSurfaceHeight}",
-        )
-    }
-
-    private fun attachSurface(surface: Surface, width: Int, height: Int) {
+    private fun attachSurfaceTexture(texture: SurfaceTexture, width: Int, height: Int) {
         if (attachedSurface != null)
             return
 
+        attachedTexture = texture
         ensureRenderSurfaceSize(width, height)
-        if (customRenderSurfaceSize)
-            holder.setFixedSize(renderSurfaceWidth, renderSurfaceHeight)
+        texture.setDefaultBufferSize(renderSurfaceWidth, renderSurfaceHeight)
 
-        Log.w(TAG, "attaching surface ${renderSurfaceWidth}x${renderSurfaceHeight}")
+        Log.w(TAG, "attaching texture surface ${renderSurfaceWidth}x${renderSurfaceHeight}")
+        val surface = Surface(texture)
         attachedSurface = surface
 
         MPVLib.attachSurface(surface)
-        applyAndroidSurfaceSize()
+        MPVLib.setPropertyString("android-surface-size", "${renderSurfaceWidth}x${renderSurfaceHeight}")
         // This forces mpv to render subs/osd/whatever into our surface even if it would ordinarily not
         MPVLib.setOptionString("force-window", "yes")
 
@@ -186,15 +176,12 @@ abstract class BaseMPVView(context: Context, attrs: AttributeSet) :
             // We disable video output when the context disappears, enable it back
             MPVLib.setPropertyString("vo", voInUse)
         }
-
-        scheduleSurfaceFrameSignal()
     }
 
-    private fun detachSurface() {
-        if (attachedSurface == null)
-            return
+    private fun detachSurfaceTexture() {
+        val surface = attachedSurface ?: return
 
-        Log.w(TAG, "detaching surface")
+        Log.w(TAG, "detaching texture surface")
         MPVLib.setPropertyString("vo", "null")
         MPVLib.setPropertyString("force-window", "no")
         // Note that before calling detachSurface() we need to be sure that libmpv
@@ -202,36 +189,29 @@ abstract class BaseMPVView(context: Context, attrs: AttributeSet) :
         // FIXME: There could be a race condition here, because I don't think
         // setting a property will wait for VO deinit.
         MPVLib.detachSurface()
+        surface.release()
         attachedSurface = null
+        attachedTexture = null
     }
 
-    private fun scheduleSurfaceFrameSignal() {
-        postOnAnimation {
-            postOnAnimation {
-                if (attachedSurface != null)
-                    onSurfaceFrameAvailable?.invoke()
-            }
-        }
+    // Texture callbacks
+
+    override fun onSurfaceTextureAvailable(surface: SurfaceTexture, width: Int, height: Int) {
+        attachSurfaceTexture(surface, width, height)
     }
 
-    // Surface callbacks
-
-    override fun surfaceCreated(holder: SurfaceHolder) {
-        attachSurface(holder.surface, holder.surfaceFrame.width(), holder.surfaceFrame.height())
-    }
-
-    override fun surfaceChanged(holder: SurfaceHolder, format: Int, width: Int, height: Int) {
+    override fun onSurfaceTextureSizeChanged(surface: SurfaceTexture, width: Int, height: Int) {
         ensureRenderSurfaceSize(width, height)
-        applyAndroidSurfaceSize()
-        scheduleSurfaceFrameSignal()
+        applyRenderSurfaceSize()
     }
 
-    override fun surfaceDestroyed(holder: SurfaceHolder) {
-        detachSurface()
+    override fun onSurfaceTextureDestroyed(surface: SurfaceTexture): Boolean {
+        detachSurfaceTexture()
+        return true
     }
 
-    override fun surfaceRedrawNeeded(holder: SurfaceHolder) {
-        onSurfaceFrameAvailable?.invoke()
+    override fun onSurfaceTextureUpdated(surface: SurfaceTexture) {
+        onSurfaceTextureFrameAvailable?.invoke()
     }
 
     companion object {
