@@ -580,7 +580,15 @@ internal class VideoZoomGestures(
         }
         val ox = (w - cw) * 0.5f
         val oy = (h - ch) * 0.5f
-        return ContentRect(ox, oy, cw, ch)
+
+        // [الحل] استخدام التقريب (round) لجعل الإزاحة والأبعاد أرقام صحيحة (Pixels)
+        // هذا يمنع الأندرويد من رسم البيكسلات بشكل ضبابي
+        return ContentRect(
+            kotlin.math.round(ox).toFloat(),
+            kotlin.math.round(oy).toFloat(),
+            kotlin.math.round(cw).toFloat(),
+            kotlin.math.round(ch).toFloat()
+        )
     }
 
     private fun clampTranslationToVideoContent() {
@@ -662,6 +670,8 @@ internal class VideoZoomGestures(
         // can come from mpv.conf / video-aspect-override, not only from the file.
         if (zooming)
             requestMediaAspectOriginalRenderSurfaceSize(force)
+        else if (normalCompactSurfacePrepared)
+            requestMediaAspectBaseRenderSurfaceSize(force)
         else
             requestBaseRenderSurfaceSize(force)
     }
@@ -741,6 +751,36 @@ internal class VideoZoomGestures(
         val bufferHeight = ceilToIntAtLeastOne(c.h.toDouble() * bufferScale)
         player.setRenderSurfaceSize(bufferWidth, bufferHeight)
         renderSurfaceMode = RenderSurfaceMode.MEDIA_ASPECT_ORIGINAL
+    }
+
+    private fun requestMediaAspectBaseRenderSurfaceSize(force: Boolean) {
+        val player = renderTarget ?: return
+        refreshMetricsFromTarget()
+
+        if (!force && renderSurfaceMode == RenderSurfaceMode.MEDIA_ASPECT_BASE)
+            return
+
+        if (viewWidth <= 1f || viewHeight <= 1f || videoAspect <= 0.001) {
+            requestBaseRenderSurfaceSize(force = true)
+            return
+        }
+
+        val c = contentRect()
+        if (c.w <= 1f || c.h <= 1f) {
+            requestBaseRenderSurfaceSize(force = true)
+            return
+        }
+
+        // [الحل] تطبيق معامل مضاعفة (Supersample) خفيف.
+        // ضرب الأبعاد في 1.5 أو 2.0 يعطي للـ TextureView بيانات كافية لتبدو
+        // الصورة حادة جداً 100% مثل وضع الزووم، ولكن بدون استهلاك الرام/البطارية الخاص بـ 20 ميجابكسل
+        val supersampleFactor = 1.5 // يمكنك رفعها إلى 2.0 إذا أردت حدة أكثر
+
+        val bufferWidth = ceilToIntAtLeastOne(c.w.toDouble() * supersampleFactor)
+        val bufferHeight = ceilToIntAtLeastOne(c.h.toDouble() * supersampleFactor)
+
+        player.setRenderSurfaceSize(bufferWidth, bufferHeight)
+        renderSurfaceMode = RenderSurfaceMode.MEDIA_ASPECT_BASE
     }
 
     private fun usesOppositeOrientationMediaAspectRenderSurface(): Boolean {
@@ -851,6 +891,7 @@ internal class VideoZoomGestures(
     private enum class RenderSurfaceMode(val usesMediaAspectFit: Boolean) {
         BASE(false),
         VIEW_ASPECT_ORIGINAL(false),
+        MEDIA_ASPECT_BASE(true),
         MEDIA_ASPECT_ORIGINAL(true),
     }
 
