@@ -580,7 +580,15 @@ internal class VideoZoomGestures(
         }
         val ox = (w - cw) * 0.5f
         val oy = (h - ch) * 0.5f
-        return ContentRect(ox, oy, cw, ch)
+
+        // [الحل] استخدام التقريب (round) لجعل الإزاحة والأبعاد أرقام صحيحة (Pixels)
+        // هذا يمنع الأندرويد من رسم البيكسلات بشكل ضبابي
+        return ContentRect(
+            kotlin.math.round(ox).toFloat(),
+            kotlin.math.round(oy).toFloat(),
+            kotlin.math.round(cw).toFloat(),
+            kotlin.math.round(ch).toFloat()
+        )
     }
 
     private fun clampTranslationToVideoContent() {
@@ -763,11 +771,14 @@ internal class VideoZoomGestures(
             return
         }
 
-        // Keep the same media-aspect geometry used by the high-quality zoom
-        // surface, but render only at the on-screen content size while unzoomed.
-        // This avoids the start/end aspect switch that causes the visible tear.
-        val bufferWidth = ceilToIntAtLeastOne(c.w.toDouble())
-        val bufferHeight = ceilToIntAtLeastOne(c.h.toDouble())
+        // [الحل] تطبيق معامل مضاعفة (Supersample) خفيف.
+        // ضرب الأبعاد في 1.5 أو 2.0 يعطي للـ TextureView بيانات كافية لتبدو
+        // الصورة حادة جداً 100% مثل وضع الزووم، ولكن بدون استهلاك الرام/البطارية الخاص بـ 20 ميجابكسل
+        val supersampleFactor = 1.5 // يمكنك رفعها إلى 2.0 إذا أردت حدة أكثر
+
+        val bufferWidth = ceilToIntAtLeastOne(c.w.toDouble() * supersampleFactor)
+        val bufferHeight = ceilToIntAtLeastOne(c.h.toDouble() * supersampleFactor)
+
         player.setRenderSurfaceSize(bufferWidth, bufferHeight)
         renderSurfaceMode = RenderSurfaceMode.MEDIA_ASPECT_BASE
     }
