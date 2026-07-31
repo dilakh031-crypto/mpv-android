@@ -423,7 +423,7 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
             binding = PlayerBinding.inflate(layoutInflater)
             gestures = TouchGestures(this)
             zoomGestures = VideoZoomGestures(binding.player)
-            binding.player.onSurfaceTextureFrameAvailable = { onPlayerSurfaceFrameAvailable() }
+            binding.player.onSurfaceFrameAvailable = { onPlayerSurfaceFrameAvailable() }
 
             // Do these here and not in MainActivity because mpv can be launched from a file browser.
             Utils.copyAssets(this)
@@ -688,9 +688,9 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
             return
 
         // Pull all geometry at once while the blackout is still covering mpv.
-        // The blackout is removed only after TextureView reports a real frame
-        // update with this geometry, which avoids revealing a stale fullscreen
-        // or old-aspect buffer on heavy images/videos.
+        // The blackout is removed after the SurfaceView has received the new surface
+        // geometry and passed a redraw boundary, avoiding a stale fullscreen or
+        // old-aspect buffer on heavy images/videos.
         syncZoomVideoGeometry(prepareNormalSurface = true, immediate = true)
         try { zoomGestures.prepareForVisibleMedia() } catch (_: Throwable) {}
         armVideoGeometryBlackoutReveal()
@@ -723,8 +723,8 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
         setResult(code, result)
 
         // Avoid letting Android's activity/window transition animate a transformed
-        // TextureView. The player is about to close, so return it to the plain
-        // mpv surface before finish/rotation starts.
+        // video surface. The player is about to close, so reset the transform before
+        // finish/rotation starts.
         prepareZoomSurfaceForWindowExit()
 
         // Restore the orientation we entered with. This also bypasses the system auto-rotate lock,
@@ -1193,7 +1193,7 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
     /**
      * Keeps the Android UI overlay above the video layer and forces a redraw.
      *
-     * On some devices the TextureView can momentarily win composition/z-order during player
+     * Keep the normal Android overlay hierarchy explicitly above the SurfaceView during player
      * startup. Touch still reaches gestureLayer, so seeking works, but controls/gestureTextView
      * do not become visible until the window is redrawn by something external (for example
      * pulling the notification shade). Poking the overlay here makes that redraw deterministic.

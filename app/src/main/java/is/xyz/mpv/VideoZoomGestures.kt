@@ -18,20 +18,11 @@ import kotlin.math.sqrt
  * Pinch-to-zoom + pan for mpv output.
  *
  * Important quality detail:
- *  - Unzoomed view uses a display-sized mpv-rendered compact surface, so mpv,
- *    not Android's TextureView compositor, performs the huge downscale. This
- *    avoids moire / false-color artifacts on high-frequency scans at 720p.
- *  - After the first mpv frame is ready, the unzoomed view is prepared with the
- *    same media-aspect fit that will be used while zoomed. At normal size it
- *    uses only a display-sized compact buffer; when the user starts zooming it
- *    upgrades the same geometry to an original-detail buffer.
- *  - New-file and window-exit transitions are forced back to the plain mpv/base
- *    surface so Android never animates a transformed TextureView while entering
- *    or leaving the player.
- *  - Because the geometry does not switch at zoom start/end, Android never shows
- *    the one-frame shrink/stretch tear. Because the zoom buffer has no oversized
- *    black bars, it keeps full source detail in both matching and opposite
- *    phone/media orientations.
+ *  - The SurfaceView backing buffer keeps original media detail at normal size
+ *    and throughout zoom, capped at 8192 x 8192.
+ *  - Non-panscan modes use a compact media-aspect buffer; panscan keeps a
+ *    view-aspect buffer so mpv performs the crop correctly.
+ *  - Zoom and pan continue to use the same View transform and gesture math.
  *
  * We do not use mpv video-pan/video-zoom for finger movement.
  */
@@ -304,7 +295,6 @@ internal class VideoZoomGestures(
         resetTransformState()
         normalCompactSurfacePrepared = false
         target.alpha = 0f
-        requestBaseRenderSurfaceSize(force = true)
         applyToView()
     }
 
@@ -642,20 +632,13 @@ internal class VideoZoomGestures(
     }
 
     private fun updateRenderSurfaceForCurrentState(force: Boolean) {
-        val zooming = isZoomed() || scaleDetector.isInProgress
-
-        if (isPanscanActive()) {
-            if (zooming || normalCompactSurfacePrepared)
-                requestViewAspectOriginalRenderSurfaceSize(force)
-            else
-                requestBaseRenderSurfaceSize(force)
-            return
-        }
-
-        if (zooming || normalCompactSurfacePrepared)
-            requestMediaAspectOriginalRenderSurfaceSize(force)
+        // Keep the backing SurfaceView at original media detail at every zoom level.
+        // Panscan still needs a view-aspect output surface so mpv performs the crop;
+        // all other aspect modes use the compact media-aspect surface.
+        if (isPanscanActive())
+            requestViewAspectOriginalRenderSurfaceSize(force)
         else
-            requestBaseRenderSurfaceSize(force)
+            requestMediaAspectOriginalRenderSurfaceSize(force)
     }
 
     private fun requestBaseRenderSurfaceSize(force: Boolean) {
@@ -817,9 +800,9 @@ internal class VideoZoomGestures(
             MAX_RENDER_SURFACE_PIXELS / (baseWidth * baseHeight).coerceAtLeast(1.0),
         )
 
-        // Avoid requesting oversized SurfaceTexture buffers. Very wide overridden
+        // Avoid requesting oversized SurfaceView buffers. Very wide overridden
         // ratios such as 2.35:1 on huge images can otherwise exceed the device
-        // texture limit and leave the TextureView black even after resetting zoom.
+        // texture limit and leave the SurfaceView black even after resetting zoom.
         return desired
             .coerceAtMost(maxByEdge)
             .coerceAtMost(maxByPixels)
