@@ -580,20 +580,7 @@ internal class VideoZoomGestures(
         }
         val ox = (w - cw) * 0.5f
         val oy = (h - ch) * 0.5f
-
-        // Align the final rectangle edges to physical pixels. Rounding the four
-        // values independently can make left + width + right differ from the view
-        // by one pixel, so round the edges first and derive the dimensions.
-        val left = kotlin.math.round(ox).toFloat()
-        val top = kotlin.math.round(oy).toFloat()
-        val right = kotlin.math.round(ox + cw).toFloat()
-        val bottom = kotlin.math.round(oy + ch).toFloat()
-        return ContentRect(
-            ox = left,
-            oy = top,
-            w = (right - left).coerceAtLeast(1f),
-            h = (bottom - top).coerceAtLeast(1f),
-        )
+        return ContentRect(ox, oy, cw, ch)
     }
 
     private fun clampTranslationToVideoContent() {
@@ -662,22 +649,21 @@ internal class VideoZoomGestures(
             // has no letterbox area for mpv to crop into, so panscan would appear
             // identical to the original aspect. While zoomed, keep source detail by
             // using the same high-resolution sizing strategy on the view-shaped window.
-            if (zooming || normalCompactSurfacePrepared)
+            if (zooming)
                 requestViewAspectOriginalRenderSurfaceSize(force)
             else
                 requestBaseRenderSurfaceSize(force)
             return
         }
 
-        // Once the visible media geometry is ready, keep the exact same
-        // source-detail buffer before, during, and after zoom. This removes the
-        // remaining quality jump caused by switching from a 1.5x compact buffer
-        // to the original-detail buffer on the first pinch movement.
-        //
-        // limitedOriginalDetailBufferScale() still applies the existing GPU edge
-        // and total-pixel limits, so pathological source sizes remain bounded.
-        if (zooming || normalCompactSurfacePrepared)
+        // Keep the same effective-aspect fit in every orientation. The only thing
+        // that changes at zoom start/end is the backing buffer resolution, not
+        // the on-screen rectangle, so there is no transient aspect jump. The aspect
+        // can come from mpv.conf / video-aspect-override, not only from the file.
+        if (zooming)
             requestMediaAspectOriginalRenderSurfaceSize(force)
+        else if (normalCompactSurfacePrepared)
+            requestMediaAspectFilteredRenderSurfaceSize(force)
         else
             requestBaseRenderSurfaceSize(force)
     }
@@ -759,6 +745,34 @@ internal class VideoZoomGestures(
         renderSurfaceMode = RenderSurfaceMode.MEDIA_ASPECT_ORIGINAL
     }
 
+    private fun requestMediaAspectFilteredRenderSurfaceSize(force: Boolean) {
+        val player = renderTarget ?: return
+        refreshMetricsFromTarget()
+
+        if (!force && renderSurfaceMode == RenderSurfaceMode.MEDIA_ASPECT_FILTERED)
+            return
+
+        if (
+            viewWidth <= 1f || viewHeight <= 1f || videoAspect <= 0.001 ||
+            videoPixelWidth <= 1 || videoPixelHeight <= 1
+        ) {
+            requestBaseRenderSurfaceSize(force = true)
+            return
+        }
+
+        val c = contentRect()
+        if (c.w <= 1f || c.h <= 1f) {
+            requestBaseRenderSurfaceSize(force = true)
+            return
+        }
+
+        val bufferScale = filteredNormalDetailBufferScale(c)
+        val bufferWidth = ceilToIntAtLeastOne(c.w.toDouble() * bufferScale)
+        val bufferHeight = ceilToIntAtLeastOne(c.h.toDouble() * bufferScale)
+        player.setRenderSurfaceSize(bufferWidth, bufferHeight)
+        renderSurfaceMode = RenderSurfaceMode.MEDIA_ASPECT_FILTERED
+    }
+
     private fun usesOppositeOrientationMediaAspectRenderSurface(): Boolean {
         if (viewWidth <= 1f || viewHeight <= 1f || videoAspect <= 0.001)
             return false
@@ -807,16 +821,44 @@ internal class VideoZoomGestures(
         baseHeight: Double,
         content: ContentRect,
     ): Double {
-        val desired = originalDetailBufferScale(content)
+        return limitedRenderSurfaceScale(
+            desired = originalDetailBufferScale(content),
+            baseWidth = baseWidth,
+            baseHeight = baseHeight,
+        )
+    }
+
+    private fun filteredNormalDetailBufferScale(content: ContentRect): Double {
+        val nativeScaleX = videoPixelWidth.toDouble() / content.w.toDouble()
+        val nativeScaleY = videoPixelHeight.toDouble() / content.h.toDouble()
+        val nativeScale = min(nativeScaleX, nativeScaleY)
+
+        // Keep a supersampled normal buffer for the same sharp presentation as the
+        // quality fix, but leave a real reduction from the native image so mpv uses
+        // the configured dscale/downscaling pipeline before Android displays it.
+        val desired = min(
+            NORMAL_FILTERED_DETAIL_MAX_SCALE,
+            nativeScale * NORMAL_FILTERED_NATIVE_FRACTION,
+        ).coerceAtLeast(1.0)
+
+        return limitedRenderSurfaceScale(
+            desired = desired,
+            baseWidth = content.w.toDouble(),
+            baseHeight = content.h.toDouble(),
+        )
+    }
+
+    private fun limitedRenderSurfaceScale(
+        desired: Double,
+        baseWidth: Double,
+        baseHeight: Double,
+    ): Double {
         val maxEdge = max(baseWidth, baseHeight).coerceAtLeast(1.0)
         val maxByEdge = MAX_RENDER_SURFACE_EDGE / maxEdge
         val maxByPixels = sqrt(
             MAX_RENDER_SURFACE_PIXELS / (baseWidth * baseHeight).coerceAtLeast(1.0),
         )
 
-        // Avoid requesting oversized SurfaceTexture buffers. Very wide overridden
-        // ratios such as 2.35:1 on huge images can otherwise exceed the device
-        // texture limit and leave the TextureView black even after resetting zoom.
         return desired
             .coerceAtMost(maxByEdge)
             .coerceAtMost(maxByPixels)
@@ -867,6 +909,7 @@ internal class VideoZoomGestures(
     private enum class RenderSurfaceMode(val usesMediaAspectFit: Boolean) {
         BASE(false),
         VIEW_ASPECT_ORIGINAL(false),
+        MEDIA_ASPECT_FILTERED(true),
         MEDIA_ASPECT_ORIGINAL(true),
     }
 
@@ -955,6 +998,8 @@ internal class VideoZoomGestures(
         private const val MEDIA_ASPECT_FALLBACK_MAX_EDGE = 8192.0
         private const val MAX_RENDER_SURFACE_EDGE = 8192.0
         private const val MAX_RENDER_SURFACE_PIXELS = MAX_RENDER_SURFACE_EDGE * MAX_RENDER_SURFACE_EDGE
+        private const val NORMAL_FILTERED_DETAIL_MAX_SCALE = 2.0
+        private const val NORMAL_FILTERED_NATIVE_FRACTION = 0.75
 
         private const val DEFAULT_FRAME_DT = 1f / 60f
         private const val MIN_FILTER_DT = 1f / 240f
