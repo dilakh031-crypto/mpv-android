@@ -170,13 +170,11 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
     private var uiInitialized: Boolean = false
 
     // One owner for hiding the mpv texture while a new file/reconfig is waiting
-    // for reliable video geometry. Aspect changes from the in-app menu bypass this
-    // blackout and use predictive geometry instead.
+    // for reliable video geometry. Aspect changes keep the existing stable surface.
     private var videoGeometryBlackoutActive = true
     private var videoGeometryBlackoutGeneration = 0
     private var videoGeometryBlackoutRevealArmed = false
     private var videoGeometryBlackoutFileLoadedSeen = false
-    private var suppressAspectMenuGeometrySyncUntilMs = 0L
 
     private val psc = Utils.PlaybackStateCache()
     private var mediaSession: MediaSessionCompat? = null
@@ -651,16 +649,11 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
         return aspect > 0.001 && size != null
     }
 
-    private fun isAspectMenuGeometrySyncSuppressed(): Boolean {
-        return !videoGeometryBlackoutActive &&
-            SystemClock.uptimeMillis() < suppressAspectMenuGeometrySyncUntilMs
-    }
-
     private fun syncZoomVideoGeometry(
         prepareNormalSurface: Boolean = false,
         immediate: Boolean = false,
     ) {
-        if (!::zoomGestures.isInitialized || isAspectMenuGeometrySyncSuppressed())
+        if (!::zoomGestures.isInitialized)
             return
 
         val aspect = try { player.getEffectiveVideoAspect() } catch (_: Throwable) { null }
@@ -2895,34 +2888,6 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
         val dialog = with(AlertDialog.Builder(this)) {
             setSingleChoiceItems(names, selectedIndex) { _, item ->
                 val ratio = ratios[item]
-                val targetPanscan = if (ratio == "panscan") 1.0 else 0.0
-                val targetAspect = if (ratio == "panscan") {
-                    try { player.getVideoAspect() } catch (_: Throwable) { null }
-                } else {
-                    parseAspectRatio(ratio) ?: try { player.getVideoAspect() } catch (_: Throwable) { null }
-                }
-                val targetPixelSize = try { player.getVideoPixelSize() } catch (_: Throwable) { null }
-
-                // Menu selections are the only transition where we already know the
-                // requested geometry. Apply it before asking mpv to redraw so the
-                // user never sees the temporary fullscreen/base layout.
-                if (::zoomGestures.isInitialized) {
-                    try {
-                        zoomGestures.applyPredictedAspectMenuGeometry(
-                            aspect = targetAspect,
-                            pixelSize = targetPixelSize,
-                            panscanValue = targetPanscan,
-                        )
-                    } catch (_: Throwable) {}
-                }
-
-                val suppressUntil = SystemClock.uptimeMillis() + ASPECT_MENU_PREDICTIVE_SYNC_GRACE_MS
-                suppressAspectMenuGeometrySyncUntilMs = suppressUntil
-                eventUiHandler.postDelayed({
-                    if (SystemClock.uptimeMillis() >= suppressUntil)
-                        syncZoomVideoGeometry(prepareNormalSurface = true, immediate = true)
-                }, ASPECT_MENU_PREDICTIVE_SYNC_GRACE_MS + 20L)
-
                 if (ratio == "panscan") {
                     player.setFileLocalString("video-aspect-override", "-1")
                     player.setFileLocalDouble("panscan", 1.0)
@@ -4025,10 +3990,6 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
         // Controls fade-in/out durations (ms). Keep them very fast but non-zero to avoid a harsh pop.
         private const val CONTROLS_FADE_IN_DURATION = 80L
         private const val CONTROLS_FADE_OUT_DURATION = 80L
-        // Predictive aspect-menu geometry is held briefly so asynchronous mpv
-        // property notifications cannot momentarily restore an intermediate state.
-        private const val ASPECT_MENU_PREDICTIVE_SYNC_GRACE_MS = 120L
-
         // Tap timing (must match TouchGestures.TAP_DURATION).
         // - Double-tap gestures: fast window (ms)
         // - Single-tap control toggle: delayed slightly longer so double-tap can cancel it (ms)
