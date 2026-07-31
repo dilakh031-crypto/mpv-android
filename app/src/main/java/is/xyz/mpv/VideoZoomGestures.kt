@@ -1,5 +1,7 @@
 package `is`.xyz.mpv
 
+import android.graphics.Matrix
+import android.graphics.RectF
 import android.os.SystemClock
 import android.view.Choreographer
 import android.view.MotionEvent
@@ -13,6 +15,7 @@ import kotlin.math.hypot
 import kotlin.math.max
 import kotlin.math.min
 import kotlin.math.sqrt
+import kotlin.math.roundToInt
 
 /**
  * Pinch-to-zoom + pan for mpv output.
@@ -92,6 +95,15 @@ internal class VideoZoomGestures(
     // onScaleEnd still sees ScaleGestureDetector as in-progress on some devices,
     // which keeps the original-detail Android surface selected for that frame.
     private var pendingPinchDoubleTapReset = false
+
+    // The media-aspect fit belongs to TextureView's content transform, not to
+    // the View transform used for interactive zoom/pan. Keeping these two stages
+    // separate prevents the compact normal buffer from first being expanded to
+    // the full view and then reduced again by View scaling.
+    private val textureTransform = Matrix()
+    private val textureSourceRect = RectF()
+    private val textureDestinationRect = RectF()
+    private var appliedSurfaceFitTransform: SurfaceFitTransform? = null
 
     // Coalesce view property updates to vsync. We do not animate here; we only avoid
     // writing View properties multiple times in one display frame.
@@ -557,37 +569,46 @@ internal class VideoZoomGestures(
         }
     }
 
-    /** Compute the content/video rect within the view at base scale. */
+    /** Compute a pixel-aligned content/video rect within the view at base scale. */
     private fun contentRect(): ContentRect {
         val w = viewWidth
         val h = viewHeight
         if (w <= 1f || h <= 1f)
             return ContentRect(0f, 0f, w, h)
 
+        val pixelWidth = w.roundToInt().coerceAtLeast(1)
+        val pixelHeight = h.roundToInt().coerceAtLeast(1)
+
         if (isPanscanActive())
-            return ContentRect(0f, 0f, w, h)
+            return ContentRect(0f, 0f, pixelWidth.toFloat(), pixelHeight.toFloat())
 
-        val ar = if (videoAspect > 0.001) videoAspect.toFloat() else (w / h)
-        val viewAr = w / h
-        val cw: Float
-        val ch: Float
+        val ar = if (videoAspect > 0.001) videoAspect else pixelWidth.toDouble() / pixelHeight
+        val viewAr = pixelWidth.toDouble() / pixelHeight
+
+        val contentWidth: Int
+        val contentHeight: Int
         if (ar > viewAr) {
-            cw = w
-            ch = w / ar
+            contentWidth = pixelWidth
+            contentHeight = (pixelWidth / ar)
+                .roundToInt()
+                .coerceIn(1, pixelHeight)
         } else {
-            ch = h
-            cw = h * ar
+            contentHeight = pixelHeight
+            contentWidth = (pixelHeight * ar)
+                .roundToInt()
+                .coerceIn(1, pixelWidth)
         }
-        val ox = (w - cw) * 0.5f
-        val oy = (h - ch) * 0.5f
 
-        // [الحل] استخدام التقريب (round) لجعل الإزاحة والأبعاد أرقام صحيحة (Pixels)
-        // هذا يمنع الأندرويد من رسم البيكسلات بشكل ضبابي
+        // Integer edges avoid sampling between adjacent display pixels. When the
+        // remaining letterbox span is odd, the unavoidable one-pixel difference is
+        // placed on the trailing edge instead of using half-pixel coordinates.
+        val offsetX = (pixelWidth - contentWidth) / 2
+        val offsetY = (pixelHeight - contentHeight) / 2
         return ContentRect(
-            kotlin.math.round(ox).toFloat(),
-            kotlin.math.round(oy).toFloat(),
-            kotlin.math.round(cw).toFloat(),
-            kotlin.math.round(ch).toFloat()
+            offsetX.toFloat(),
+            offsetY.toFloat(),
+            contentWidth.toFloat(),
+            contentHeight.toFloat(),
         )
     }
 
@@ -623,14 +644,45 @@ internal class VideoZoomGestures(
     }
 
     private fun applyToView() {
-        val fit = renderSurfaceFitTransform()
+        applySurfaceFitToTexture(renderSurfaceFitTransform())
 
         target.pivotX = 0f
         target.pivotY = 0f
-        target.scaleX = scale * fit.scaleX
-        target.scaleY = scale * fit.scaleY
-        target.translationX = (tx + scale * fit.translationX).toFloat()
-        target.translationY = (ty + scale * fit.translationY).toFloat()
+        target.scaleX = scale
+        target.scaleY = scale
+        target.translationX = tx.toFloat()
+        target.translationY = ty.toFloat()
+    }
+
+    private fun applySurfaceFitToTexture(fit: SurfaceFitTransform) {
+        val player = renderTarget ?: return
+        if (fit == appliedSurfaceFitTransform)
+            return
+
+        if (fit == SurfaceFitTransform.IDENTITY) {
+            player.setTransform(null)
+            player.setOpaque(true)
+        } else {
+            // TextureView.setTransform() changes only the SurfaceTexture content.
+            // The View itself stays full-screen, so zoom/pan can be applied later
+            // without rasterizing a full-view intermediate image first.
+            textureSourceRect.set(0f, 0f, viewWidth, viewHeight)
+            textureDestinationRect.set(
+                fit.translationX.toFloat(),
+                fit.translationY.toFloat(),
+                fit.translationX.toFloat() + viewWidth * fit.scaleX,
+                fit.translationY.toFloat() + viewHeight * fit.scaleY,
+            )
+            textureTransform.setRectToRect(
+                textureSourceRect,
+                textureDestinationRect,
+                Matrix.ScaleToFit.FILL,
+            )
+            player.setOpaque(false)
+            player.setTransform(textureTransform)
+        }
+
+        appliedSurfaceFitTransform = fit
     }
 
     private fun renderSurfaceFitTransform(): SurfaceFitTransform {
@@ -771,14 +823,11 @@ internal class VideoZoomGestures(
             return
         }
 
-        // [الحل] تطبيق معامل مضاعفة (Supersample) خفيف.
-        // ضرب الأبعاد في 1.5 أو 2.0 يعطي للـ TextureView بيانات كافية لتبدو
-        // الصورة حادة جداً 100% مثل وضع الزووم، ولكن بدون استهلاك الرام/البطارية الخاص بـ 20 ميجابكسل
-        val supersampleFactor = 1.5 // يمكنك رفعها إلى 2.0 إذا أردت حدة أكثر
-
-        val bufferWidth = ceilToIntAtLeastOne(c.w.toDouble() * supersampleFactor)
-        val bufferHeight = ceilToIntAtLeastOne(c.h.toDouble() * supersampleFactor)
-
+        // Keep the same media-aspect geometry used by the high-quality zoom
+        // surface, but render only at the on-screen content size while unzoomed.
+        // This avoids the start/end aspect switch that causes the visible tear.
+        val bufferWidth = ceilToIntAtLeastOne(c.w.toDouble())
+        val bufferHeight = ceilToIntAtLeastOne(c.h.toDouble())
         player.setRenderSurfaceSize(bufferWidth, bufferHeight)
         renderSurfaceMode = RenderSurfaceMode.MEDIA_ASPECT_BASE
     }
