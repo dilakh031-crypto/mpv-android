@@ -99,8 +99,6 @@ abstract class BaseMPVView(context: Context, attrs: AttributeSet) : TextureView(
     private var renderSurfaceHeight = 0
     private var customRenderSurfaceSize = false
 
-    var onSurfaceTextureFrameAvailable: (() -> Unit)? = null
-
     /**
      * Set the real SurfaceTexture buffer size used by mpv without changing the
      * TextureView's on-screen size.
@@ -210,9 +208,7 @@ abstract class BaseMPVView(context: Context, attrs: AttributeSet) : TextureView(
         return true
     }
 
-    override fun onSurfaceTextureUpdated(surface: SurfaceTexture) {
-        onSurfaceTextureFrameAvailable?.invoke()
-    }
+    override fun onSurfaceTextureUpdated(surface: SurfaceTexture) = Unit
 
     companion object {
         private const val TAG = "mpv"

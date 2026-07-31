@@ -17,14 +17,15 @@ import kotlin.math.sqrt
 /**
  * Pinch-to-zoom and pan for mpv output.
  *
- * The SurfaceTexture always keeps the same aspect ratio as the player view. mpv
- * performs aspect-ratio fitting inside that stable output window, while Android
- * only receives a uniform zoom scale and translation. This prevents an old frame
- * from being non-uniformly reshaped while a new aspect-ratio frame is pending.
+ * The TextureView and its SurfaceTexture always keep the player view's aspect
+ * ratio. mpv performs video-aspect-override and panscan inside that stable
+ * output window; Android only applies uniform zoom and translation. Therefore
+ * changing aspect ratio cannot reshape or move the previously displayed frame.
  *
- * Once media geometry is known, the stable surface is enlarged (within the
- * existing GPU limits) so high-resolution media keeps its detail before and
- * during zoom. Changing video-aspect-override or panscan does not resize it.
+ * The backing buffer is enlarged only by a uniform factor. Its factor is
+ * calculated from the source pixels and the actual on-screen video rectangle,
+ * so forced ratios retain the same source detail as the original ratio instead
+ * of allocating detail for the black bars.
  */
 internal class VideoZoomGestures(
     private val target: View,
@@ -182,8 +183,6 @@ internal class VideoZoomGestures(
             aspect = aspect,
             pixelSize = videoPixelSizeOrNull(),
             panscanValue = panscan,
-            prepareNormalSurface = false,
-            immediate = false,
         )
     }
 
@@ -192,8 +191,6 @@ internal class VideoZoomGestures(
             aspect = videoAspect.takeIf { it > 0.001 },
             pixelSize = size,
             panscanValue = panscan,
-            prepareNormalSurface = false,
-            immediate = false,
         )
     }
 
@@ -202,8 +199,6 @@ internal class VideoZoomGestures(
             aspect = videoAspect.takeIf { it > 0.001 },
             pixelSize = videoPixelSizeOrNull(),
             panscanValue = value,
-            prepareNormalSurface = false,
-            immediate = false,
         )
     }
 
@@ -211,25 +206,22 @@ internal class VideoZoomGestures(
         aspect: Double?,
         pixelSize: Pair<Int, Int>?,
         panscanValue: Double?,
-        prepareNormalSurface: Boolean = false,
-        immediate: Boolean = false,
     ) {
         videoAspect = aspect ?: 0.0
         videoPixelWidth = pixelSize?.first ?: 0
         videoPixelHeight = pixelSize?.second ?: 0
         panscan = panscanValue ?: 0.0
 
-        if (prepareNormalSurface)
+        // As soon as mpv exposes complete geometry, use the detailed stable
+        // surface. There is no reveal gate and no wait for a later frame.
+        if (videoAspect > 0.001 && videoPixelWidth > 1 && videoPixelHeight > 1)
             stableDetailSurfacePrepared = true
 
         if (isZoomed() || scaleDetector.isInProgress)
             clampTranslationToVideoContent()
 
         updateRenderSurfaceForCurrentState(force = true)
-        if (immediate)
-            applyToView()
-        else
-            scheduleApply()
+        scheduleApply()
     }
 
     private fun videoPixelSizeOrNull(): Pair<Int, Int>? {
@@ -261,15 +253,6 @@ internal class VideoZoomGestures(
         panscan = 0.0
         stableDetailSurfacePrepared = false
         requestBaseRenderSurfaceSize(force = true)
-        applyToView()
-    }
-
-    fun prepareForVisibleMedia() {
-        if (stableDetailSurfacePrepared)
-            return
-
-        stableDetailSurfacePrepared = true
-        updateRenderSurfaceForCurrentState(force = true)
         applyToView()
     }
 
@@ -635,9 +618,38 @@ internal class VideoZoomGestures(
     }
 
     private fun limitedStableViewBufferScale(): Double {
-        val widthScale = videoPixelWidth.toDouble() / viewWidth.toDouble()
-        val heightScale = videoPixelHeight.toDouble() / viewHeight.toDouble()
-        val desired = max(widthScale, heightScale).coerceAtLeast(1.0)
+        val c = contentRect()
+        if (viewWidth <= 1f || viewHeight <= 1f || c.w <= 1f || c.h <= 1f)
+            return 1.0
+
+        val sourceWidth: Double
+        val sourceHeight: Double
+
+        if (isPanscanActive()) {
+            // Panscan displays a crop of the source, not all source pixels. Size
+            // the surface for the crop that can actually become visible, avoiding
+            // resolution spent on pixels outside the screen.
+            val sourceAspect = videoPixelWidth.toDouble() / videoPixelHeight.toDouble()
+            val viewAspect = viewWidth.toDouble() / viewHeight.toDouble()
+            if (sourceAspect > viewAspect) {
+                sourceHeight = videoPixelHeight.toDouble()
+                sourceWidth = sourceHeight * viewAspect
+            } else {
+                sourceWidth = videoPixelWidth.toDouble()
+                sourceHeight = sourceWidth / viewAspect
+            }
+        } else {
+            // A forced aspect ratio stretches the whole source into c. Basing the
+            // factor on c (rather than the full player view) keeps both source axes
+            // at full detail even when the selected ratio has larger black bars.
+            sourceWidth = videoPixelWidth.toDouble()
+            sourceHeight = videoPixelHeight.toDouble()
+        }
+
+        val desired = max(
+            sourceWidth / c.w.toDouble(),
+            sourceHeight / c.h.toDouble(),
+        ).coerceAtLeast(1.0)
 
         val maxViewEdge = max(viewWidth.toDouble(), viewHeight.toDouble()).coerceAtLeast(1.0)
         val maxByEdge = MAX_RENDER_SURFACE_EDGE / maxViewEdge
