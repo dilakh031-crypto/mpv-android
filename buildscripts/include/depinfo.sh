@@ -39,8 +39,14 @@ dep_mpv_android=(mpv)
 
 ## for CI workflow
 
-# pinned ffmpeg revision
-v_ci_ffmpeg=n8.0.1
+# Pinned revisions from the official mpv-android 2026-04-25 release.
+# Keeping all git dependencies detached at these commits makes local and CI builds reproducible.
+v_git_dav1d=c0f2fe3135e2f193e31089ff013f628b01aa8d21
+v_git_ffmpeg=fc4960b155aa33b9a08cf26c5e0a0530f0545f24
+v_git_libass=fadc390583f24eb5cf98f16925fd3adee50bca88
+v_git_libplacebo=82224764a98164ce9d2d9a10e4fefca934e475fb
+v_git_mpv=9ce79bcaa0132660a2e45b6bfc1fb0c199665277
+v_ci_ffmpeg=$v_git_ffmpeg
 
 # filename used to uniquely identify a build prefix
-ci_tarball="prefix-ndk-${v_ndk}-lua-${v_lua}-unibreak-${v_unibreak}-harfbuzz-${v_harfbuzz}-fribidi-${v_fribidi}-freetype-${v_freetype}-libxml2-${v_libxml2}-fontconfig-${v_fontconfig}-mbedtls-${v_mbedtls}-ffmpeg-${v_ci_ffmpeg}.tgz"
+ci_tarball="prefix-ndk-${v_ndk}-lua-${v_lua}-unibreak-${v_unibreak}-harfbuzz-${v_harfbuzz}-fribidi-${v_fribidi}-freetype-${v_freetype}-libxml2-${v_libxml2}-fontconfig-${v_fontconfig}-mbedtls-${v_mbedtls}-dav1d-${v_git_dav1d}-ffmpeg-${v_git_ffmpeg}-libass-${v_git_libass}-libplacebo-${v_git_libplacebo}-mpv-${v_git_mpv}.tgz"
