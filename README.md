@@ -1,4 +1,4 @@
-# pv for Android
+# mpv for Android
 
 [![Build Status](https://github.com/mpv-android/mpv-android/actions/workflows/build.yml/badge.svg?branch=master)](https://github.com/mpv-android/mpv-android/actions/workflows/build.yml)
 
