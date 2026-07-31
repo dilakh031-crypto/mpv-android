@@ -169,7 +169,7 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
     private var deferPlayerInit: Boolean = false
     private var uiInitialized: Boolean = false
 
-    // One owner for hiding the mpv surface while a new file/reconfig is waiting
+    // One owner for hiding the mpv texture while a new file/reconfig is waiting
     // for reliable video geometry. Aspect changes from the in-app menu bypass this
     // blackout and use predictive geometry instead.
     private var videoGeometryBlackoutActive = true
@@ -423,6 +423,7 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
             binding = PlayerBinding.inflate(layoutInflater)
             gestures = TouchGestures(this)
             zoomGestures = VideoZoomGestures(binding.player)
+            binding.player.onSurfaceTextureFrameAvailable = { onPlayerSurfaceFrameAvailable() }
 
             // Do these here and not in MainActivity because mpv can be launched from a file browser.
             Utils.copyAssets(this)
@@ -607,11 +608,7 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
     private fun beginVideoGeometryBlackout() {
         setVideoGeometryBlackout(true)
         if (::zoomGestures.isInitialized) {
-            try {
-                zoomGestures.resetForNewFile()
-            } catch (t: Throwable) {
-                Log.w(TAG, "Failed to reset zoom geometry for a new file", t)
-            }
+            try { zoomGestures.resetForNewFile() } catch (_: Throwable) {}
         }
     }
 
@@ -619,25 +616,11 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
         if (!videoGeometryBlackoutActive || videoGeometryBlackoutRevealArmed)
             return
         videoGeometryBlackoutRevealArmed = true
-
-        // PLAYBACK_RESTART is the primary reveal signal. Keep a conservative fallback
-        // for paused still images or unusual demuxers that do not emit it promptly.
-        val generation = videoGeometryBlackoutGeneration
-        eventUiHandler.postDelayed({
-            if (videoGeometryBlackoutActive &&
-                videoGeometryBlackoutRevealArmed &&
-                generation == videoGeometryBlackoutGeneration &&
-                videoGeometryBlackoutFileLoadedSeen &&
-                hasDisplayableVideoGeometry()
-            ) {
-                onPlayerFrameReady()
-            }
-        }, VIDEO_SURFACE_REVEAL_FALLBACK_MS)
     }
 
-    private fun onPlayerFrameReady() {
+    private fun onPlayerSurfaceFrameAvailable() {
         if (Looper.myLooper() != Looper.getMainLooper()) {
-            eventUiHandler.post { onPlayerFrameReady() }
+            eventUiHandler.post { onPlayerSurfaceFrameAvailable() }
             return
         }
 
@@ -692,9 +675,7 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
                 prepareNormalSurface = prepareNormalSurface,
                 immediate = immediate,
             )
-        } catch (t: Throwable) {
-            Log.w(TAG, "Failed to synchronize zoom/video geometry", t)
-        }
+        } catch (_: Throwable) {}
     }
 
     private fun prepareZoomSurfaceAndRevealWhenReady() {
@@ -707,14 +688,11 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
             return
 
         // Pull all geometry at once while the blackout is still covering mpv.
-        // Reveal only after mpv reports PLAYBACK_RESTART for the updated geometry;
-        // this avoids exposing a stale fullscreen or old-aspect buffer on heavy media.
+        // The blackout is removed only after TextureView reports a real frame
+        // update with this geometry, which avoids revealing a stale fullscreen
+        // or old-aspect buffer on heavy images/videos.
         syncZoomVideoGeometry(prepareNormalSurface = true, immediate = true)
-        try {
-            zoomGestures.prepareForVisibleMedia()
-        } catch (t: Throwable) {
-            Log.w(TAG, "Failed to prepare visible video surface", t)
-        }
+        try { zoomGestures.prepareForVisibleMedia() } catch (_: Throwable) {}
         armVideoGeometryBlackoutReveal()
     }
 
@@ -745,7 +723,7 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
         setResult(code, result)
 
         // Avoid letting Android's activity/window transition animate a transformed
-        // video surface. The player is about to close, so return it to the plain
+        // TextureView. The player is about to close, so return it to the plain
         // mpv surface before finish/rotation starts.
         prepareZoomSurfaceForWindowExit()
 
@@ -896,7 +874,6 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
         updateMediaSession()
 
         activityIsForeground = false
-        player.setPreferredFrameRate(0f)
         eventUiHandler.removeCallbacksAndMessages(null)
         cancelPendingTapToggle()
         if (isFinishing) {
@@ -991,8 +968,6 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
         // If we weren't actually in the background (e.g. multi window mode), don't reinitialize stuff
         if (activityIsForeground) {
             super.onResume()
-            if (playbackInitialized)
-                player.setPreferredFrameRate(player.estimatedVfFps?.toFloat() ?: 0f)
             refreshPlayerOverlay()
             return
         }
@@ -1016,8 +991,6 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
         }
 
         activityIsForeground = true
-        if (playbackInitialized)
-            player.setPreferredFrameRate(player.estimatedVfFps?.toFloat() ?: 0f)
         // stop background service with a delay
         stopServiceHandler.removeCallbacks(stopServiceRunnable)
         stopServiceHandler.postDelayed(stopServiceRunnable, 1000L)
@@ -1220,7 +1193,7 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
     /**
      * Keeps the Android UI overlay above the video layer and forces a redraw.
      *
-     * On some devices the video surface can momentarily win composition/z-order during player
+     * On some devices the TextureView can momentarily win composition/z-order during player
      * startup. Touch still reaches gestureLayer, so seeking works, but controls/gestureTextView
      * do not become visible until the window is redrawn by something external (for example
      * pulling the notification shade). Poking the overlay here makes that redraw deterministic.
@@ -3561,7 +3534,6 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
                 syncZoomVideoGeometry()
                 prepareZoomSurfaceAndRevealWhenReady()
             }
-            "estimated-vf-fps" -> player.setPreferredFrameRate(value.toFloat())
         }
     }
 
@@ -3703,11 +3675,8 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
             // play/pause choice they made while the seek was in progress.
             scrubSeekInFlight = false
             lastScrubAsyncUserdata = 0L
-            eventUiHandler.post {
-                onPlayerFrameReady()
-                if (!gestureScrubActive && !seekbarScrubActive)
-                    finishScrubPlaybackHoldIfReady()
-            }
+            if (!gestureScrubActive && !seekbarScrubActive)
+                eventUiHandler.post { finishScrubPlaybackHoldIfReady() }
         }
 
         if (eventId == MpvEvent.MPV_EVENT_FILE_LOADED) {
@@ -4059,7 +4028,6 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
         // Predictive aspect-menu geometry is held briefly so asynchronous mpv
         // property notifications cannot momentarily restore an intermediate state.
         private const val ASPECT_MENU_PREDICTIVE_SYNC_GRACE_MS = 120L
-        private const val VIDEO_SURFACE_REVEAL_FALLBACK_MS = 350L
 
         // Tap timing (must match TouchGestures.TAP_DURATION).
         // - Double-tap gestures: fast window (ms)

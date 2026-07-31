@@ -1,8 +1,6 @@
 package `is`.xyz.mpv
 
-import android.app.ActivityManager
 import android.content.Context
-import android.os.Build
 import android.os.Environment
 import android.preference.PreferenceManager
 import android.util.AttributeSet
@@ -24,16 +22,21 @@ internal class MPVView(context: Context, attrs: AttributeSet) : BaseMPVView(cont
         val sharedPreferences = PreferenceManager.getDefaultSharedPreferences(context)
         val persistFileState = sharedPreferences.getBoolean("save_position", false)
 
-        // Balanced high-quality defaults. Individual user preferences below still win.
-        // Avoid mpv's "fast" profile: it disables dithering and high-quality scaling.
+        // Balanced quality defaults for the Galaxy Note 8 Exynos / Mali-G71.
+        // Avoid mpv's "fast" profile: it forces bilinear scaling and disables
+        // dithering/correct downscaling. User preferences and mpv.conf can still
+        // replace any of these options.
         MPVLib.setOptionString("scale", "spline36")
         MPVLib.setOptionString("dscale", "mitchell")
-        MPVLib.setOptionString("cscale", "spline36")
-        MPVLib.setOptionString("dither", "fruit")
-        MPVLib.setOptionString("dither-depth", "auto")
+        MPVLib.setOptionString("cscale", "bilinear")
+        MPVLib.setOptionString("tscale", "oversample")
         MPVLib.setOptionString("correct-downscaling", "yes")
         MPVLib.setOptionString("sigmoid-upscaling", "yes")
-        MPVLib.setOptionString("hdr-compute-peak", "yes")
+        MPVLib.setOptionString("dither", "fruit")
+        MPVLib.setOptionString("dither-depth", "auto")
+        MPVLib.setOptionString("temporal-dither", "no")
+        MPVLib.setOptionString("hdr-compute-peak", "auto")
+        MPVLib.setOptionString("tone-mapping", "bt.2390")
         // When Save position on quit is disabled, old watch-later files must not restore
         // positions or any other per-file option before the activity can discard them.
         MPVLib.setOptionString("resume-playback", if (persistFileState) "yes" else "no")
@@ -50,8 +53,9 @@ internal class MPVView(context: Context, attrs: AttributeSet) : BaseMPVView(cont
         else
             "no"
 
-        // Do not force display-fps-override. A stale override causes judder on variable-
-        // refresh-rate displays. Surface.setFrameRate() is updated from estimated-vf-fps.
+        // Do not force display-fps-override. The Note 8 is normally 60 Hz, but
+        // Android can report 59.94/60 differently and a slightly wrong override
+        // causes judder. mpv's measured display timing is safer on Android 9.
 
         // set non-complex options
         data class Property(val preferenceName: String, val mpvOption: String)
@@ -98,13 +102,15 @@ internal class MPVView(context: Context, attrs: AttributeSet) : BaseMPVView(cont
 
         if (sharedPreferences.getBoolean("video_fastdecode", false)) {
             MPVLib.setOptionString("vd-lavc-fast", "yes")
-            MPVLib.setOptionString("vd-lavc-skiploopfilter", "nonkey")
+            // Skip only non-reference frames. This is still a quality trade-off,
+            // but avoids the severe blocking caused by skipping every non-key frame.
+            MPVLib.setOptionString("vd-lavc-skiploopfilter", "nonref")
         }
 
         MPVLib.setOptionString("gpu-context", "android")
         MPVLib.setOptionString("opengl-es", "yes")
         MPVLib.setOptionString("hwdec", hwdec)
-        MPVLib.setOptionString("hwdec-codecs", "h264,hevc,mpeg4,mpeg2video,vp8,vp9,av1")
+        MPVLib.setOptionString("hwdec-codecs", "h264,hevc,mpeg4,mpeg2video,vp8,vp9")
         MPVLib.setOptionString("ao", "audiotrack,opensles")
         MPVLib.setOptionString("audio-set-media-role", "yes")
         MPVLib.setOptionString("tls-verify", "yes")
@@ -113,30 +119,15 @@ internal class MPVView(context: Context, attrs: AttributeSet) : BaseMPVView(cont
         // Keep still images open indefinitely instead of letting mpv advance/end them
         // after its default image display timeout.
         MPVLib.setOptionString("image-display-duration", "inf")
-        // Device-aware network cache. Forward buffering is prioritized over rewind data,
-        // and low-RAM devices are kept well below the process heap ceiling.
-        val activityManager = context.getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager
-        val lowRam = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.KITKAT)
-            activityManager.isLowRamDevice
-        else
-            activityManager.memoryClass <= 128
-        val (forwardCacheMegs, backCacheMegs, readaheadSeconds) = when {
-            lowRam || activityManager.memoryClass <= 192 -> Triple(24, 8, 12)
-            activityManager.memoryClass <= 256 -> Triple(48, 12, 18)
-            activityManager.memoryClass <= 512 -> Triple(96, 24, 25)
-            else -> Triple(128, 32, 30)
-        }
-        MPVLib.setOptionString("cache", "auto")
-        MPVLib.setOptionString("cache-pause", "yes")
-        MPVLib.setOptionString("cache-pause-wait", "1.5")
-        MPVLib.setOptionString("demuxer-readahead-secs", readaheadSeconds.toString())
-        MPVLib.setOptionString("demuxer-max-bytes", "${forwardCacheMegs * 1024 * 1024}")
-        MPVLib.setOptionString("demuxer-max-back-bytes", "${backCacheMegs * 1024 * 1024}")
-        Log.i(
-            TAG,
-            "Cache budget: forward=${forwardCacheMegs}MiB back=${backCacheMegs}MiB " +
-                "readahead=${readaheadSeconds}s lowRam=$lowRam memoryClass=${activityManager.memoryClass}",
-        )
+        // Note 8 (6 GB RAM) streaming cache: prioritize forward readahead while
+        // keeping the rewind cache small. This is enough for roughly 8 seconds at
+        // 100 Mbps without consuming the 128 MiB used by the previous symmetric cap.
+        MPVLib.setOptionString("demuxer-max-bytes", "100663296") // 96 MiB ahead
+        MPVLib.setOptionString("demuxer-max-back-bytes", "16777216") // 16 MiB behind
+        MPVLib.setOptionString("demuxer-readahead-secs", "20")
+        MPVLib.setOptionString("cache-secs", "30")
+        MPVLib.setOptionString("demuxer-hysteresis-secs", "10")
+        MPVLib.setOptionString("cache-pause-wait", "2")
         //
         val screenshotDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_PICTURES)
         screenshotDir.mkdirs()
@@ -391,11 +382,6 @@ internal class MPVView(context: Context, attrs: AttributeSet) : BaseMPVView(cont
             Property("video-params/h", MPV_FORMAT_INT64),
             Property("video-aspect-override", MPV_FORMAT_STRING),
             Property("panscan", MPV_FORMAT_DOUBLE),
-            Property("estimated-vf-fps", MPV_FORMAT_DOUBLE),
-            Property("demuxer-cache-duration", MPV_FORMAT_DOUBLE),
-            Property("cache-buffering-state", MPV_FORMAT_INT64),
-            Property("frame-drop-count", MPV_FORMAT_INT64),
-            Property("decoder-frame-drop-count", MPV_FORMAT_INT64),
             Property("playlist-pos", MPV_FORMAT_INT64),
             Property("playlist-count", MPV_FORMAT_INT64),
             Property("current-tracks/video/image"),
