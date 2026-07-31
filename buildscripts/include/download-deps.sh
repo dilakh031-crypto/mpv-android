@@ -7,92 +7,75 @@
 
 mkdir -p deps && cd deps
 
-# Fetch exactly one known revision. This keeps local and CI builds identical and
-# avoids using moving upstream default branches for video/color-critical code.
-clone_pinned() {
-    repo="$1"
-    dir="$2"
-    revision="$3"
-    recursive="${4:-0}"
-
-    [ -d "$dir" ] && return 0
-
-    git init -q "$dir"
-    git -C "$dir" remote add origin "$repo"
-    git -C "$dir" fetch -q --depth=1 origin "$revision"
-    git -C "$dir" checkout -q --detach FETCH_HEAD
-
-    if [ "$recursive" -eq 1 ]; then
-        git -C "$dir" submodule update -q --init --recursive --depth=1
-    fi
-}
-
 # mbedtls
 if [ ! -d mbedtls ]; then
-    mkdir mbedtls
-    $WGET https://github.com/Mbed-TLS/mbedtls/releases/download/mbedtls-$v_mbedtls/mbedtls-$v_mbedtls.tar.bz2 -O - | \
-        tar -xj -C mbedtls --strip-components=1
+	mkdir mbedtls
+	$WGET https://github.com/Mbed-TLS/mbedtls/releases/download/mbedtls-$v_mbedtls/mbedtls-$v_mbedtls.tar.bz2 -O - | \
+		tar -xj -C mbedtls --strip-components=1
 fi
 
 # dav1d
-clone_pinned https://github.com/videolan/dav1d dav1d "$v_dav1d"
+[ ! -d dav1d ] && git clone https://github.com/videolan/dav1d
 
 # ffmpeg
-clone_pinned https://github.com/FFmpeg/FFmpeg ffmpeg "$v_ffmpeg"
+if [ ! -d ffmpeg ]; then
+	args=()
+	[ $IN_CI -eq 1 ] && args+=(--depth=1 -b "$v_ci_ffmpeg")
+	git clone https://github.com/FFmpeg/FFmpeg ffmpeg "${args[@]}"
+fi
 
 # freetype2
-[ ! -d freetype2 ] && git clone --depth=1 --recurse-submodules --shallow-submodules \
-    https://gitlab.freedesktop.org/freetype/freetype.git freetype2 -b VER-${v_freetype//./-}
+[ ! -d freetype2 ] && git clone --recurse-submodules https://gitlab.freedesktop.org/freetype/freetype.git freetype2 -b VER-${v_freetype//./-}
 
 # fribidi
 if [ ! -d fribidi ]; then
-    mkdir fribidi
-    $WGET https://github.com/fribidi/fribidi/releases/download/v$v_fribidi/fribidi-$v_fribidi.tar.xz -O - | \
-        tar -xJ -C fribidi --strip-components=1
+	mkdir fribidi
+	$WGET https://github.com/fribidi/fribidi/releases/download/v$v_fribidi/fribidi-$v_fribidi.tar.xz -O - | \
+		tar -xJ -C fribidi --strip-components=1
 fi
 
 # harfbuzz
 if [ ! -d harfbuzz ]; then
-    mkdir harfbuzz
-    $WGET https://github.com/harfbuzz/harfbuzz/releases/download/$v_harfbuzz/harfbuzz-$v_harfbuzz.tar.xz -O - | \
-        tar -xJ -C harfbuzz --strip-components=1
+	mkdir harfbuzz
+	$WGET https://github.com/harfbuzz/harfbuzz/releases/download/$v_harfbuzz/harfbuzz-$v_harfbuzz.tar.xz -O - | \
+		tar -xJ -C harfbuzz --strip-components=1
 fi
 
 # unibreak
 if [ ! -d unibreak ]; then
-    mkdir unibreak
-    $WGET https://github.com/adah1972/libunibreak/releases/download/libunibreak_${v_unibreak//./_}/libunibreak-${v_unibreak}.tar.gz -O - | \
-        tar -xz -C unibreak --strip-components=1
+	mkdir unibreak
+	$WGET https://github.com/adah1972/libunibreak/releases/download/libunibreak_${v_unibreak//./_}/libunibreak-${v_unibreak}.tar.gz -O - | \
+		tar -xz -C unibreak --strip-components=1
 fi
 
 # libxml2
 if [ ! -d libxml2 ]; then
-    mkdir libxml2
-    $WGET https://gitlab.gnome.org/GNOME/libxml2/-/archive/v${v_libxml2}/libxml2-v${v_libxml2}.tar.gz -O - | \
-        tar -xz -C libxml2 --strip-components=1
+	mkdir libxml2
+	$WGET https://gitlab.gnome.org/GNOME/libxml2/-/archive/v${v_libxml2}/libxml2-v${v_libxml2}.tar.gz -O - | \
+		tar -xz -C libxml2 --strip-components=1
 fi
 
 # fontconfig
 if [ ! -d fontconfig ]; then
-    mkdir fontconfig
-    $WGET https://gitlab.freedesktop.org/fontconfig/fontconfig/-/archive/${v_fontconfig}/fontconfig-${v_fontconfig}.tar.gz -O - | \
-        tar -xz -C fontconfig --strip-components=1
+	mkdir fontconfig
+	$WGET https://gitlab.freedesktop.org/fontconfig/fontconfig/-/archive/${v_fontconfig}/fontconfig-${v_fontconfig}.tar.gz -O - | \
+		tar -xz -C fontconfig --strip-components=1
 fi
 
 # libass
-clone_pinned https://github.com/libass/libass libass "$v_libass"
+[ ! -d libass ] && git clone https://github.com/libass/libass
 
 # lua
 if [ ! -d lua ]; then
-    mkdir lua
-    $WGET https://www.lua.org/ftp/lua-$v_lua.tar.gz -O - | \
-        tar -xz -C lua --strip-components=1
+	mkdir lua
+	$WGET https://www.lua.org/ftp/lua-$v_lua.tar.gz -O - | \
+		tar -xz -C lua --strip-components=1
 fi
 
 # libplacebo
-clone_pinned https://github.com/haasn/libplacebo libplacebo "$v_libplacebo" 1
+[ ! -d libplacebo ] && git clone --recursive https://github.com/haasn/libplacebo
 
 # mpv
-clone_pinned https://github.com/mpv-player/mpv mpv "$v_mpv"
+[ ! -d mpv ] && git clone https://github.com/mpv-player/mpv
 
 cd ..

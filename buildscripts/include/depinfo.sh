@@ -18,15 +18,6 @@ v_mbedtls=3.6.6
 v_libxml2=2.15.3
 v_fontconfig=2.17.1
 
-# Exact source revisions used by the official 2026-04-25 mpv-android build.
-# Keeping these pinned makes decoder, scaler, tone-mapping and subtitle output
-# reproducible instead of silently changing whenever an upstream HEAD moves.
-v_dav1d=c0f2fe3135e2f193e31089ff013f628b01aa8d21
-v_ffmpeg=fc4960b155aa33b9a08cf26c5e0a0530f0545f24
-v_libass=fadc390583f24eb5cf98f16925fd3adee50bca88
-v_libplacebo=82224764a98164ce9d2d9a10e4fefca934e475fb
-v_mpv=9ce79bcaa0132660a2e45b6bfc1fb0c199665277
-
 
 ## Dependency tree
 
@@ -49,7 +40,7 @@ dep_mpv_android=(mpv)
 ## for CI workflow
 
 # pinned ffmpeg revision
-v_ci_ffmpeg=$v_ffmpeg
+v_ci_ffmpeg=n8.0.1
 
 # filename used to uniquely identify a build prefix
 ci_tarball="prefix-ndk-${v_ndk}-lua-${v_lua}-unibreak-${v_unibreak}-harfbuzz-${v_harfbuzz}-fribidi-${v_fribidi}-freetype-${v_freetype}-libxml2-${v_libxml2}-fontconfig-${v_fontconfig}-mbedtls-${v_mbedtls}-ffmpeg-${v_ci_ffmpeg}.tgz"
