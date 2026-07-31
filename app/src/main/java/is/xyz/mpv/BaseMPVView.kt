@@ -24,7 +24,7 @@ abstract class BaseMPVView(context: Context, attrs: AttributeSet) :
         val maxPixels: Long,
     )
 
-    private val renderSurfaceLimits: RenderSurfaceLimits by lazy {
+    private val cachedRenderSurfaceLimits: RenderSurfaceLimits by lazy {
         calculateRenderSurfaceLimits()
     }
 
@@ -40,7 +40,7 @@ abstract class BaseMPVView(context: Context, attrs: AttributeSet) :
     fun initialize(configDir: String, cacheDir: String) {
         // Resolve the allocation ceiling before libmpv creates its own EGL context.
         // This keeps the temporary capability probe isolated from the video renderer.
-        renderSurfaceLimits
+        cachedRenderSurfaceLimits
         MPVLib.create(context)
 
         /* set normal options (user-supplied config can override) */
@@ -109,7 +109,7 @@ abstract class BaseMPVView(context: Context, attrs: AttributeSet) :
     private var preferredFrameRate = 0f
 
     /** The actual device-aware ceiling used by zoom surface allocation. */
-    fun getRenderSurfaceLimits(): RenderSurfaceLimits = renderSurfaceLimits
+    fun getRenderSurfaceLimits(): RenderSurfaceLimits = cachedRenderSurfaceLimits
 
     /**
      * Set the real Surface buffer size used by mpv without changing this view's layout size.
@@ -267,7 +267,7 @@ abstract class BaseMPVView(context: Context, attrs: AttributeSet) :
     private fun clampRenderSurfaceSize(width: Int, height: Int): Pair<Int, Int> {
         var safeWidth = width.coerceAtLeast(1).toLong()
         var safeHeight = height.coerceAtLeast(1).toLong()
-        val limits = renderSurfaceLimits
+        val limits = cachedRenderSurfaceLimits
 
         val edgeScale = min(
             limits.maxEdge.toDouble() / safeWidth.toDouble(),
