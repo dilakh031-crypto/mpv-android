@@ -65,11 +65,11 @@ elif [ "$1" = "install" ]; then
 	msg "Fetching SDK + NDK"
 	IN_CI=1 ./include/download-sdk.sh
 
-	msg "Fetching pinned mpv"
-	rm -rf deps/mpv
-	git clone https://github.com/mpv-player/mpv deps/mpv
-	git -C deps/mpv fetch --depth=1 origin "$v_git_mpv"
-	git -C deps/mpv checkout --detach FETCH_HEAD
+	msg "Fetching mpv"
+	mkdir -p deps/mpv
+	$WGET https://github.com/mpv-player/mpv/archive/master.tar.gz -O master.tgz
+	tar -xzf master.tgz -C deps/mpv --strip-components=1
+	rm master.tgz
 
 	msg "Trying to fetch existing prefix"
 	mkdir -p prefix

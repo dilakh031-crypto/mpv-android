@@ -5,34 +5,27 @@
 [ -z "$IN_CI" ] && IN_CI=0
 [ -z "$WGET" ] && WGET=wget
 
-checkout_pinned_git() {
-    local directory="$1"
-    local repository="$2"
-    local revision="$3"
-    local recursive="${4:-0}"
+mkdir -p deps && cd deps
 
-    if [ ! -d "$directory/.git" ]; then
-        # Old CI paths may have unpacked a source tarball here. Replace it with a
-        # real git checkout so the requested revision can be verified exactly.
-        rm -rf "$directory"
-        if [ "$recursive" -eq 1 ]; then
-            git clone --recursive "$repository" "$directory"
-        else
-            git clone "$repository" "$directory"
-        fi
-    fi
+# Fetch exactly one known revision. This keeps local and CI builds identical and
+# avoids using moving upstream default branches for video/color-critical code.
+clone_pinned() {
+    repo="$1"
+    dir="$2"
+    revision="$3"
+    recursive="${4:-0}"
 
-    # Fetch the exact object even when an old dependency directory was restored
-    # from cache, then detach HEAD so branches cannot drift between builds.
-    git -C "$directory" fetch --depth=1 origin "$revision"
-    git -C "$directory" checkout --detach FETCH_HEAD
+    [ -d "$dir" ] && return 0
+
+    git init -q "$dir"
+    git -C "$dir" remote add origin "$repo"
+    git -C "$dir" fetch -q --depth=1 origin "$revision"
+    git -C "$dir" checkout -q --detach FETCH_HEAD
+
     if [ "$recursive" -eq 1 ]; then
-        git -C "$directory" submodule sync --recursive
-        git -C "$directory" submodule update --init --recursive --depth=1
+        git -C "$dir" submodule update -q --init --recursive --depth=1
     fi
 }
-
-mkdir -p deps && cd deps
 
 # mbedtls
 if [ ! -d mbedtls ]; then
@@ -41,12 +34,15 @@ if [ ! -d mbedtls ]; then
         tar -xj -C mbedtls --strip-components=1
 fi
 
-# git dependencies pinned to the official 2026-04-25 release revisions
-checkout_pinned_git dav1d https://github.com/videolan/dav1d "$v_git_dav1d"
-checkout_pinned_git ffmpeg https://github.com/FFmpeg/FFmpeg "$v_git_ffmpeg"
+# dav1d
+clone_pinned https://github.com/videolan/dav1d dav1d "$v_dav1d"
+
+# ffmpeg
+clone_pinned https://github.com/FFmpeg/FFmpeg ffmpeg "$v_ffmpeg"
 
 # freetype2
-[ ! -d freetype2 ] && git clone --recurse-submodules https://gitlab.freedesktop.org/freetype/freetype.git freetype2 -b VER-${v_freetype//./-}
+[ ! -d freetype2 ] && git clone --depth=1 --recurse-submodules --shallow-submodules \
+    https://gitlab.freedesktop.org/freetype/freetype.git freetype2 -b VER-${v_freetype//./-}
 
 # fribidi
 if [ ! -d fribidi ]; then
@@ -83,7 +79,8 @@ if [ ! -d fontconfig ]; then
         tar -xz -C fontconfig --strip-components=1
 fi
 
-checkout_pinned_git libass https://github.com/libass/libass "$v_git_libass"
+# libass
+clone_pinned https://github.com/libass/libass libass "$v_libass"
 
 # lua
 if [ ! -d lua ]; then
@@ -92,7 +89,10 @@ if [ ! -d lua ]; then
         tar -xz -C lua --strip-components=1
 fi
 
-checkout_pinned_git libplacebo https://github.com/haasn/libplacebo "$v_git_libplacebo" 1
-checkout_pinned_git mpv https://github.com/mpv-player/mpv "$v_git_mpv"
+# libplacebo
+clone_pinned https://github.com/haasn/libplacebo libplacebo "$v_libplacebo" 1
+
+# mpv
+clone_pinned https://github.com/mpv-player/mpv mpv "$v_mpv"
 
 cd ..
