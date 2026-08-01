@@ -18,24 +18,11 @@ object MPVLib {
     external fun create(appctx: Context)
     external fun init()
     external fun destroy()
-    external fun attachSurface(surface: Surface, width: Int, height: Int): Boolean
-    external fun resizeSurface(width: Int, height: Int)
+    external fun attachSurface(surface: Surface)
     external fun detachSurface()
-    external fun beginNewMediaRenderState(): Long
-    external fun setRenderState(
-        normalWidth: Int,
-        normalHeight: Int,
-        detailWidth: Int,
-        detailHeight: Int,
-        useDetail: Boolean,
-        left: Float,
-        top: Float,
-        right: Float,
-        bottom: Float,
-    ): Long
-    external fun getPresentedRenderStateSerial(): Long
 
     external fun command(cmd: Array<out String>)
+    external fun commandString(cmd: String): Int
     external fun commandAsync(cmd: Array<out String>, userdata: Long): Int
     external fun abortAsyncCommand(userdata: Long)
 
