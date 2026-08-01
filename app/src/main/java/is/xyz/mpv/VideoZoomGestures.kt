@@ -84,14 +84,16 @@ internal class VideoZoomGestures(
     private var requestedRenderSurfaceMode = RenderSurfaceMode.BASE
     private var displayedRenderSurfaceMode = RenderSurfaceMode.BASE
     private var surfaceModeTransitionInFlight: RenderSurfaceMode? = null
+    private var surfaceResizeInFlight = false
     private var queuedRenderSurfaceUpdate = false
     private var requestedRenderSurfaceScale = 1.0
+    private var requestedRenderSurfaceWidth = 0
+    private var requestedRenderSurfaceHeight = 0
 
     private var pinchInProgress = false
     private var renderResizeGeneration = 0
-    private var liveResizeScheduled = false
-    private var pendingLiveZoomScale = 1.0
-    private var lastLiveResizeRequestUptimeMs = Long.MIN_VALUE
+    private var pinchSettleProbeScale = 1f
+    private var pinchSettleScheduled = false
 
     // Keep the startup/exit window transitions on the plain mpv surface. Once
     // MPVActivity has a stable first frame hidden behind the startup preview, it
@@ -114,6 +116,22 @@ internal class VideoZoomGestures(
         applyToView()
     }
 
+    private val pinchSettleRunnable = Runnable {
+        pinchSettleScheduled = false
+        if (!pinchInProgress)
+            return@Runnable
+
+        val currentScale = scale
+        val deviation = relativeScaleMovement(currentScale, pinchSettleProbeScale)
+        if (deviation <= PINCH_SETTLE_RELATIVE_TOLERANCE) {
+            performSettledRenderSurfaceUpdate(currentScale.toDouble())
+            pinchSettleProbeScale = currentScale
+        } else {
+            pinchSettleProbeScale = currentScale
+            schedulePinchSettleCheck(restart = false)
+        }
+    }
+
     private val scaleDetector = ScaleGestureDetector(
         target.context,
         object : ScaleGestureDetector.SimpleOnScaleGestureListener() {
@@ -125,12 +143,7 @@ internal class VideoZoomGestures(
                 pinchInProgress = true
 
                 normalCompactSurfacePrepared = true
-                if (scale <= 1f + EPS) {
-                    requestLiveRenderSurfaceUpdate(
-                        zoomScale = 1.0,
-                        immediate = true,
-                    )
-                }
+                startPinchSettleMonitoring()
                 applyToView()
 
                 resetPanFilters(detector.focusX, detector.focusY, SystemClock.uptimeMillis())
@@ -168,16 +181,17 @@ internal class VideoZoomGestures(
                 tx = (k * tx) + ((1.0 - k) * fx)
                 ty = (k * ty) + ((1.0 - k) * fy)
                 scale = newScale
+                recordPinchSettleMovement(newScale)
 
                 clampTranslationToVideoContent()
                 resetPanFilters(detector.focusX, detector.focusY, SystemClock.uptimeMillis())
-                requestLiveRenderSurfaceUpdate(zoomScale = newScale.toDouble(), immediate = false)
                 scheduleApply()
                 return true
             }
 
             override fun onScaleEnd(detector: ScaleGestureDetector) {
                 pinchInProgress = false
+                stopPinchSettleMonitoring()
                 if (pendingPinchDoubleTapReset || scale <= PINCH_DOUBLE_TAP_RESET_SCALE) {
                     pendingPinchDoubleTapReset = true
                     resetLikeDoubleTapAfterPinch()
@@ -282,15 +296,20 @@ internal class VideoZoomGestures(
     fun isZoomed(): Boolean = scale > 1f + EPS
 
     fun onSurfaceTextureFrameAvailable() {
-        val completedMode = surfaceModeTransitionInFlight ?: return
-        displayedRenderSurfaceMode = completedMode
-        surfaceModeTransitionInFlight = null
-        clampTranslationToVideoContent()
-        applyToView()
+        if (!surfaceResizeInFlight)
+            return
+
+        surfaceResizeInFlight = false
+        surfaceModeTransitionInFlight?.let {
+            displayedRenderSurfaceMode = it
+            surfaceModeTransitionInFlight = null
+            clampTranslationToVideoContent()
+            applyToView()
+        }
 
         if (queuedRenderSurfaceUpdate) {
             queuedRenderSurfaceUpdate = false
-            updateRenderSurfaceForCurrentState(force = true)
+            updateRenderSurfaceForCurrentState(force = false, allowShrink = !pinchInProgress)
         }
     }
 
@@ -315,8 +334,7 @@ internal class VideoZoomGestures(
         panscan = 0.0
         normalCompactSurfacePrepared = false
         cancelPendingRenderSurfaceUpdates()
-        requestBaseRenderSurfaceSize(force = true)
-        commitHiddenBaseRenderSurfaceMode()
+        requestHiddenBaseRenderSurfaceSize()
         applyToView()
     }
 
@@ -334,8 +352,7 @@ internal class VideoZoomGestures(
         normalCompactSurfacePrepared = false
         cancelPendingRenderSurfaceUpdates()
         target.alpha = 0f
-        requestBaseRenderSurfaceSize(force = true)
-        commitHiddenBaseRenderSurfaceMode()
+        requestHiddenBaseRenderSurfaceSize()
         applyToView()
     }
 
@@ -674,7 +691,10 @@ internal class VideoZoomGestures(
         )
     }
 
-    private fun updateRenderSurfaceForCurrentState(force: Boolean) {
+    private fun updateRenderSurfaceForCurrentState(
+        force: Boolean,
+        allowShrink: Boolean = true,
+    ) {
         refreshMetricsFromTarget()
         val zooming = isZoomed() || pinchInProgress || scaleDetector.isInProgress
 
@@ -686,10 +706,18 @@ internal class VideoZoomGestures(
             return
         }
 
-        val requiredScale = if (pinchInProgress || scaleDetector.isInProgress)
-            liveBufferScaleForZoom(scale.toDouble())
+        val requiredScale = settledBufferScaleForZoom(scale.toDouble())
+        val expectedMode = if (isPanscanActive())
+            RenderSurfaceMode.VIEW_ASPECT_DYNAMIC
         else
-            settledBufferScaleForZoom(scale.toDouble())
+            RenderSurfaceMode.MEDIA_ASPECT_DYNAMIC
+
+        if (!force && expectedMode == requestedRenderSurfaceMode) {
+            if (!allowShrink && requiredScale <= requestedRenderSurfaceScale + BUFFER_SCALE_EPS)
+                return
+            if (allowShrink && shouldKeepCurrentBufferFor(requiredScale))
+                return
+        }
 
         if (isPanscanActive())
             requestViewAspectRenderSurfaceSize(requiredScale, force)
@@ -697,59 +725,70 @@ internal class VideoZoomGestures(
             requestMediaAspectRenderSurfaceSize(requiredScale, force)
     }
 
-    private fun requestLiveRenderSurfaceUpdate(zoomScale: Double, immediate: Boolean) {
-        pendingLiveZoomScale = max(pendingLiveZoomScale, zoomScale)
-        val desired = liveBufferScaleForZoom(max(scale.toDouble(), pendingLiveZoomScale))
-        val needsImmediateGrowth = desired >
-            requestedRenderSurfaceScale * LIVE_IMMEDIATE_GROWTH_RATIO + BUFFER_SCALE_EPS
-        if (immediate || needsImmediateGrowth) {
-            liveResizeScheduled = false
-            renderResizeGeneration += 1
-            performLiveRenderSurfaceUpdate()
-            return
-        }
-        if (liveResizeScheduled)
-            return
-
-        liveResizeScheduled = true
-        val now = SystemClock.uptimeMillis()
-        val elapsed = if (lastLiveResizeRequestUptimeMs == Long.MIN_VALUE)
-            LIVE_RESIZE_MIN_INTERVAL_MS
-        else
-            now - lastLiveResizeRequestUptimeMs
-        val delay = (LIVE_RESIZE_MIN_INTERVAL_MS - elapsed).coerceAtLeast(0L)
-        val generation = ++renderResizeGeneration
-        target.postDelayed({
-            if (generation != renderResizeGeneration)
-                return@postDelayed
-            liveResizeScheduled = false
-            performLiveRenderSurfaceUpdate()
-        }, delay)
+    private fun startPinchSettleMonitoring() {
+        pinchSettleProbeScale = scale
+        schedulePinchSettleCheck(restart = true)
     }
 
-    private fun performLiveRenderSurfaceUpdate() {
-        val requestedZoom = max(scale.toDouble(), pendingLiveZoomScale)
-        pendingLiveZoomScale = 1.0
-        lastLiveResizeRequestUptimeMs = SystemClock.uptimeMillis()
+    private fun recordPinchSettleMovement(currentScale: Float) {
+        if (!pinchInProgress)
+            return
 
-        val required = liveBufferScaleForZoom(requestedZoom)
-        val expectedMode = if (isPanscanActive())
-            RenderSurfaceMode.VIEW_ASPECT_DYNAMIC
-        else
-            RenderSurfaceMode.MEDIA_ASPECT_DYNAMIC
-        if (required <= requestedRenderSurfaceScale + BUFFER_SCALE_EPS &&
-            requestedRenderSurfaceMode == expectedMode
-        ) return
+        if (relativeScaleMovement(currentScale, pinchSettleProbeScale) >
+            PINCH_SETTLE_RELATIVE_TOLERANCE
+        ) {
+            pinchSettleProbeScale = currentScale
+            schedulePinchSettleCheck(restart = true)
+        }
+    }
 
-        if (isPanscanActive())
-            requestViewAspectRenderSurfaceSize(required, force = false)
-        else
-            requestMediaAspectRenderSurfaceSize(required, force = false)
+    private fun relativeScaleMovement(a: Float, b: Float): Double {
+        return abs(
+            kotlin.math.ln(
+                (a.toDouble() / b.toDouble()).coerceAtLeast(1e-9),
+            ),
+        )
+    }
+
+    private fun schedulePinchSettleCheck(restart: Boolean) {
+        if (restart && pinchSettleScheduled) {
+            target.removeCallbacks(pinchSettleRunnable)
+            pinchSettleScheduled = false
+        }
+        if (pinchSettleScheduled)
+            return
+
+        pinchSettleScheduled = true
+        target.postDelayed(pinchSettleRunnable, PINCH_SETTLE_WINDOW_MS)
+    }
+
+    private fun stopPinchSettleMonitoring() {
+        if (pinchSettleScheduled) {
+            target.removeCallbacks(pinchSettleRunnable)
+            pinchSettleScheduled = false
+        }
+    }
+
+    private fun performSettledRenderSurfaceUpdate(zoomScale: Double) {
+        if (zoomScale <= PINCH_DOUBLE_TAP_RESET_SCALE.toDouble())
+            return
+
+        // While fingers remain down, only grow the backing surface. Shrinking during
+        // a temporary zoom-out pause wastes bandwidth and causes allocation ping-pong.
+        updateRenderSurfaceForCurrentState(force = false, allowShrink = false)
+    }
+
+    private fun shouldKeepCurrentBufferFor(requiredScale: Double): Boolean {
+        val current = requestedRenderSurfaceScale
+        if (requiredScale >= current - BUFFER_SCALE_EPS)
+            return abs(requiredScale - current) <= BUFFER_SCALE_EPS
+
+        val retainedFraction = (requiredScale / current).coerceIn(0.0, 1.0)
+        val pixelSavings = 1.0 - retainedFraction * retainedFraction
+        return pixelSavings < BUFFER_SHRINK_MIN_PIXEL_SAVINGS
     }
 
     private fun scheduleSettledRenderSurfaceUpdate() {
-        pendingLiveZoomScale = 1.0
-        liveResizeScheduled = false
         val generation = ++renderResizeGeneration
         target.postDelayed({
             if (generation == renderResizeGeneration && !pinchInProgress) {
@@ -760,18 +799,8 @@ internal class VideoZoomGestures(
 
     private fun cancelPendingRenderSurfaceUpdates() {
         renderResizeGeneration += 1
-        liveResizeScheduled = false
-        pendingLiveZoomScale = 1.0
-        lastLiveResizeRequestUptimeMs = Long.MIN_VALUE
-    }
-
-    private fun liveBufferScaleForZoom(zoomScale: Double): Double {
-        val maximum = maximumUsefulBufferScale()
-        if (maximum <= 1.0 + BUFFER_SCALE_EPS)
-            return 1.0
-
-        val minimumTarget = max(INITIAL_LIVE_BUFFER_SCALE, zoomScale * LIVE_BUFFER_HEADROOM)
-        return steppedBufferScale(minimumTarget, maximum)
+        stopPinchSettleMonitoring()
+        pinchSettleProbeScale = scale
     }
 
     private fun settledBufferScaleForZoom(zoomScale: Double): Double {
@@ -781,20 +810,6 @@ internal class VideoZoomGestures(
 
         return ceilToStep(zoomScale.coerceAtMost(maximum), SETTLED_BUFFER_SCALE_STEP)
             .coerceIn(1.0, maximum)
-    }
-
-    private fun steppedBufferScale(required: Double, maximum: Double): Double {
-        if (required >= maximum - BUFFER_SCALE_EPS)
-            return maximum
-
-        var level = INITIAL_LIVE_BUFFER_SCALE
-        while (level + BUFFER_SCALE_EPS < required && level < maximum) {
-            level = if (level < 2.0)
-                2.0
-            else
-                level * LIVE_BUFFER_GROWTH_FACTOR
-        }
-        return min(level, maximum).coerceAtLeast(1.0)
     }
 
     private fun maximumUsefulBufferScale(): Double {
@@ -815,11 +830,23 @@ internal class VideoZoomGestures(
 
     private fun requestBaseRenderSurfaceSize(force: Boolean) {
         val player = renderTarget ?: return
-        if (!force && requestedRenderSurfaceMode == RenderSurfaceMode.BASE)
+        refreshMetricsFromTarget()
+        val width = ceilToIntAtLeastOne(viewWidth.toDouble())
+        val height = ceilToIntAtLeastOne(viewHeight.toDouble())
+        if (!force &&
+            requestedRenderSurfaceMode == RenderSurfaceMode.BASE &&
+            requestedRenderSurfaceWidth == width &&
+            requestedRenderSurfaceHeight == height
+        ) return
+        if (surfaceResizeInFlight) {
+            queuedRenderSurfaceUpdate = true
             return
+        }
 
         player.resetRenderSurfaceSize()
         requestedRenderSurfaceScale = 1.0
+        requestedRenderSurfaceWidth = width
+        requestedRenderSurfaceHeight = height
         markRenderSurfaceModeRequested(RenderSurfaceMode.BASE)
     }
 
@@ -838,11 +865,18 @@ internal class VideoZoomGestures(
         )
         if (!force &&
             requestedRenderSurfaceMode == RenderSurfaceMode.VIEW_ASPECT_DYNAMIC &&
-            abs(requestedRenderSurfaceScale - surface.scale) <= BUFFER_SCALE_EPS
+            requestedRenderSurfaceWidth == surface.width &&
+            requestedRenderSurfaceHeight == surface.height
         ) return
+        if (surfaceResizeInFlight) {
+            queuedRenderSurfaceUpdate = true
+            return
+        }
 
         player.setRenderSurfaceSize(surface.width, surface.height)
         requestedRenderSurfaceScale = surface.scale
+        requestedRenderSurfaceWidth = surface.width
+        requestedRenderSurfaceHeight = surface.height
         markRenderSurfaceModeRequested(RenderSurfaceMode.VIEW_ASPECT_DYNAMIC)
     }
 
@@ -867,22 +901,24 @@ internal class VideoZoomGestures(
         )
         if (!force &&
             requestedRenderSurfaceMode == RenderSurfaceMode.MEDIA_ASPECT_DYNAMIC &&
-            abs(requestedRenderSurfaceScale - surface.scale) <= BUFFER_SCALE_EPS
+            requestedRenderSurfaceWidth == surface.width &&
+            requestedRenderSurfaceHeight == surface.height
         ) return
+        if (surfaceResizeInFlight) {
+            queuedRenderSurfaceUpdate = true
+            return
+        }
 
         player.setRenderSurfaceSize(surface.width, surface.height)
         requestedRenderSurfaceScale = surface.scale
+        requestedRenderSurfaceWidth = surface.width
+        requestedRenderSurfaceHeight = surface.height
         markRenderSurfaceModeRequested(RenderSurfaceMode.MEDIA_ASPECT_DYNAMIC)
     }
 
     private fun markRenderSurfaceModeRequested(mode: RenderSurfaceMode) {
         requestedRenderSurfaceMode = mode
-        val transition = surfaceModeTransitionInFlight
-        if (transition != null) {
-            if (mode.usesMediaAspectFit != transition.usesMediaAspectFit)
-                queuedRenderSurfaceUpdate = true
-            return
-        }
+        surfaceResizeInFlight = true
 
         if (mode.usesMediaAspectFit == displayedRenderSurfaceMode.usesMediaAspectFit) {
             displayedRenderSurfaceMode = mode
@@ -891,12 +927,26 @@ internal class VideoZoomGestures(
         }
     }
 
+    private fun requestHiddenBaseRenderSurfaceSize() {
+        // New-file and window-exit paths are already hidden. Discard any visible
+        // transition bookkeeping so the base reset cannot be stranded behind a
+        // previous resize that may never publish another frame.
+        surfaceResizeInFlight = false
+        surfaceModeTransitionInFlight = null
+        queuedRenderSurfaceUpdate = false
+        requestBaseRenderSurfaceSize(force = true)
+        commitHiddenBaseRenderSurfaceMode()
+    }
+
     private fun commitHiddenBaseRenderSurfaceMode() {
         requestedRenderSurfaceMode = RenderSurfaceMode.BASE
         displayedRenderSurfaceMode = RenderSurfaceMode.BASE
         surfaceModeTransitionInFlight = null
+        surfaceResizeInFlight = false
         queuedRenderSurfaceUpdate = false
         requestedRenderSurfaceScale = 1.0
+        requestedRenderSurfaceWidth = ceilToIntAtLeastOne(viewWidth.toDouble())
+        requestedRenderSurfaceHeight = ceilToIntAtLeastOne(viewHeight.toDouble())
     }
 
     private fun isPanscanActive(): Boolean = panscan > EPS.toDouble()
@@ -1079,13 +1129,11 @@ internal class VideoZoomGestures(
         private const val DOUBLE_TAP_TIMEOUT = 300L
         private const val MAX_RENDER_SURFACE_EDGE = 8192.0
         private const val MAX_RENDER_SURFACE_PIXELS = MAX_RENDER_SURFACE_EDGE * MAX_RENDER_SURFACE_EDGE
-        private const val INITIAL_LIVE_BUFFER_SCALE = 1.5
-        private const val LIVE_BUFFER_HEADROOM = 1.12
-        private const val LIVE_BUFFER_GROWTH_FACTOR = 1.5
-        private const val LIVE_IMMEDIATE_GROWTH_RATIO = 1.30
         private const val SETTLED_BUFFER_SCALE_STEP = 0.25
-        private const val BUFFER_SCALE_EPS = 0.001
-        private const val LIVE_RESIZE_MIN_INTERVAL_MS = 48L
+        private const val BUFFER_SCALE_EPS = 1e-9
+        private const val BUFFER_SHRINK_MIN_PIXEL_SAVINGS = 0.35
+        private const val PINCH_SETTLE_WINDOW_MS = 180L
+        private const val PINCH_SETTLE_RELATIVE_TOLERANCE = 0.0035
         private const val RENDER_RESIZE_AFTER_GESTURE_MS = 140L
 
         private const val DEFAULT_FRAME_DT = 1f / 60f
