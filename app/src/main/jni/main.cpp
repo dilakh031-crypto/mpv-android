@@ -26,6 +26,7 @@ extern "C" {
     jni_func(void, destroy);
 
     jni_func(void, command, jobjectArray jarray);
+    jni_func(jint, commandString, jstring jcommand);
     jni_func(jint, commandAsync, jobjectArray jarray, jlong userdata);
     jni_func(void, abortAsyncCommand, jlong userdata);
 };
@@ -108,6 +109,18 @@ jni_func(void, command, jobjectArray jarray) {
 
     for (int i = 0; i < len; ++i)
         env->ReleaseStringUTFChars((jstring)env->GetObjectArrayElement(jarray, i), arguments[i]);
+}
+
+jni_func(jint, commandString, jstring jcommand) {
+    CHECK_MPV_INIT();
+
+    const char *command = env->GetStringUTFChars(jcommand, NULL);
+    if (!command)
+        return MPV_ERROR_NOMEM;
+
+    int err = mpv_command_string(g_mpv, command);
+    env->ReleaseStringUTFChars(jcommand, command);
+    return err;
 }
 
 jni_func(jint, commandAsync, jobjectArray jarray, jlong userdata) {
