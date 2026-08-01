@@ -267,6 +267,22 @@ internal class VideoZoomGestures(
 
     fun isZoomed(): Boolean = scale > 1f + EPS
 
+    fun hasPendingRenderSurfaceTransition(): Boolean {
+        return surfaceModeTransitionInFlight != null || queuedRenderSurfaceUpdate
+    }
+
+    fun hasRecentContinuousSurfaceFrames(): Boolean {
+        val previous = previousSurfaceFrameUptimeMs
+        val latest = lastSurfaceFrameUptimeMs
+        if (previous == Long.MIN_VALUE || latest == Long.MIN_VALUE)
+            return false
+
+        val frameInterval = latest - previous
+        val frameAge = SystemClock.uptimeMillis() - latest
+        return frameInterval in 1..CONTINUOUS_SURFACE_FRAME_MAX_INTERVAL_MS &&
+            frameAge in 0..CONTINUOUS_SURFACE_FRAME_MAX_AGE_MS
+    }
+
     fun onSurfaceTextureFrameAvailable() {
         val now = SystemClock.uptimeMillis()
         previousSurfaceFrameUptimeMs = lastSurfaceFrameUptimeMs
@@ -715,15 +731,7 @@ internal class VideoZoomGestures(
         if (!currentTrackIsStillImage)
             return true
 
-        val previous = previousSurfaceFrameUptimeMs
-        val latest = lastSurfaceFrameUptimeMs
-        if (previous == Long.MIN_VALUE || latest == Long.MIN_VALUE)
-            return false
-
-        val frameInterval = latest - previous
-        val frameAge = SystemClock.uptimeMillis() - latest
-        return frameInterval in 1..CONTINUOUS_SURFACE_FRAME_MAX_INTERVAL_MS &&
-            frameAge in 0..CONTINUOUS_SURFACE_FRAME_MAX_AGE_MS
+        return hasRecentContinuousSurfaceFrames()
     }
 
     private fun requestBaseRenderSurfaceSize(force: Boolean) {

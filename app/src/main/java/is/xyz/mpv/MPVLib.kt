@@ -22,6 +22,7 @@ object MPVLib {
     external fun detachSurface()
 
     external fun command(cmd: Array<out String>)
+    external fun commandString(cmd: String): Int
     external fun commandAsync(cmd: Array<out String>, userdata: Long): Int
     external fun abortAsyncCommand(userdata: Long)
 
