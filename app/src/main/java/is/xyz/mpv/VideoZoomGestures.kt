@@ -4,10 +4,8 @@ import android.os.SystemClock
 import android.view.Choreographer
 import android.view.MotionEvent
 import android.view.ScaleGestureDetector
-import android.view.VelocityTracker
 import android.view.View
 import android.view.ViewConfiguration
-import android.widget.OverScroller
 import kotlin.math.PI
 import kotlin.math.abs
 import kotlin.math.ceil
@@ -35,6 +33,9 @@ import kotlin.math.sqrt
  *    the one-frame shrink/stretch tear. Because the zoom buffer has no oversized
  *    black bars, it keeps full source detail in both matching and opposite
  *    phone/media orientations.
+ *  - Still images whose rotated source dimensions exceed the Android viewport
+ *    use a CPU crop/scale filter while zooming. Only the visible source rectangle
+ *    reaches the GPU, while videos keep the original TextureView-only zoom path.
  *
  * We do not use mpv video-pan/video-zoom for finger movement.
  */
@@ -50,37 +51,20 @@ internal class VideoZoomGestures(
     private var videoAspect = 0.0
     private var videoPixelWidth = 0
     private var videoPixelHeight = 0
+    private var videoSourceWidth = 0
+    private var videoSourceHeight = 0
+    private var videoRotation = 0
+    private var currentTrackIsStillImage = false
+    private var hasVideoAspectOverride = false
     private var panscan = 0.0
 
-    private val viewConfiguration = ViewConfiguration.get(target.context)
-    private val touchSlop = viewConfiguration.scaledTouchSlop.toFloat()
-    private val panStartSlop = max(1f, min(2.5f, touchSlop * 0.22f))
-    private val minimumFlingVelocity = viewConfiguration.scaledMinimumFlingVelocity.toFloat()
-    private val maximumFlingVelocity = viewConfiguration.scaledMaximumFlingVelocity.toFloat()
-
-    // Android's own spline-based fling implementation. Translation is applied
-    // from its absolute scroll positions on each vsync, bounded to the visible
-    // video content so the image cannot coast beyond its legal pan range.
-    private val panScroller = OverScroller(target.context)
-    private var flingFramePosted = false
-    private val flingFrameCallback = Choreographer.FrameCallback {
-        flingFramePosted = false
-        if (panScroller.computeScrollOffset()) {
-            tx = panScroller.currX.toDouble()
-            ty = panScroller.currY.toDouble()
-            clampTranslationToVideoContent()
-            applyToView()
-
-            if (!panScroller.isFinished)
-                postFlingFrame()
-        }
+    private val stillImageCrop = StillImageViewportCropController(target) {
+        updateRenderSurfaceForCurrentState(force = false)
+        applyToView()
     }
 
-    // A synthetic one-pointer stream is supplied to VelocityTracker for
-    // one-finger dragging. Multi-touch is reserved exclusively for scaling and
-    // never contributes pan velocity.
-    private var panVelocityTracker: VelocityTracker? = null
-    private var velocityGestureDownTimeMs = 0L
+    private val touchSlop = ViewConfiguration.get(target.context).scaledTouchSlop.toFloat()
+    private val panStartSlop = max(1f, min(2.5f, touchSlop * 0.22f))
 
     // Linear scale factor (1.0 = normal). Translation is stored as Double so large
     // 20x offsets do not lose sub-pixel precision before being sent to the View.
@@ -98,19 +82,10 @@ internal class VideoZoomGestures(
 
     private var panFingerDown = false
     private var panActive = false
-    private var panMovedDuringTouch = false
     private var canBeTap = false
 
     private var tapStartTx = 0.0
     private var tapStartTy = 0.0
-
-    // The zoom anchor is captured when the second finger touches the screen and
-    // remains fixed until every finger has been lifted. ScaleGestureDetector's
-    // focus normally follows the moving midpoint, which unintentionally changes
-    // the part of the image being zoomed during the same gesture.
-    private var pinchTouchSessionActive = false
-    private var lockedPinchFocusX = 0f
-    private var lockedPinchFocusY = 0f
 
     private var lastTapTime = 0L
     private var lastTapX = 0f
@@ -189,20 +164,10 @@ internal class VideoZoomGestures(
         target.context,
         object : ScaleGestureDetector.SimpleOnScaleGestureListener() {
             override fun onScaleBegin(detector: ScaleGestureDetector): Boolean {
-                stopFling()
                 lastTapTime = 0L
                 pendingPinchDoubleTapReset = false
                 panActive = false
                 canBeTap = false
-
-                // Normally this was already captured on ACTION_POINTER_DOWN. Keep
-                // this fallback for unusual event streams that start the detector
-                // without delivering that pointer transition to this view.
-                if (!pinchTouchSessionActive) {
-                    pinchTouchSessionActive = true
-                    lockedPinchFocusX = detector.focusX
-                    lockedPinchFocusY = detector.focusY
-                }
 
                 // Switch to the original-detail buffer before the first visible zoom step.
                 // If the first-frame preparation was skipped (for example, a remote file
@@ -247,12 +212,10 @@ internal class VideoZoomGestures(
                 if (newScale == oldScale)
                     return true
 
-                // Keep the zoom focus fixed at the midpoint captured when the
-                // two-finger touch session started. Moving both fingers does not
-                // pan the image; multi-touch is reserved exclusively for zoom.
+                // Keep pinch focus stable.
                 // transform: screen = scale * content + translation
-                val fx = lockedPinchFocusX.toDouble()
-                val fy = lockedPinchFocusY.toDouble()
+                val fx = detector.focusX.toDouble()
+                val fy = detector.focusY.toDouble()
                 val k = (newScale / oldScale).toDouble()
                 tx = (k * tx) + ((1.0 - k) * fx)
                 ty = (k * ty) + ((1.0 - k) * fy)
@@ -280,7 +243,6 @@ internal class VideoZoomGestures(
     )
 
     fun setMetrics(width: Float, height: Float) {
-        stopFling()
         viewWidth = width
         viewHeight = height
         refreshMetricsFromTarget()
@@ -298,6 +260,10 @@ internal class VideoZoomGestures(
         setVideoGeometry(
             aspect = aspect,
             pixelSize = videoPixelSizeOrNull(),
+            sourcePixelSize = videoSourcePixelSizeOrNull(),
+            rotation = videoRotation,
+            isStillImage = currentTrackIsStillImage,
+            aspectOverrideActive = hasVideoAspectOverride,
             panscanValue = panscan,
             prepareNormalSurface = false,
             immediate = false,
@@ -308,6 +274,10 @@ internal class VideoZoomGestures(
         setVideoGeometry(
             aspect = videoAspect.takeIf { it > 0.001 },
             pixelSize = size,
+            sourcePixelSize = videoSourcePixelSizeOrNull(),
+            rotation = videoRotation,
+            isStillImage = currentTrackIsStillImage,
+            aspectOverrideActive = hasVideoAspectOverride,
             panscanValue = panscan,
             prepareNormalSurface = false,
             immediate = false,
@@ -318,6 +288,10 @@ internal class VideoZoomGestures(
         setVideoGeometry(
             aspect = videoAspect.takeIf { it > 0.001 },
             pixelSize = videoPixelSizeOrNull(),
+            sourcePixelSize = videoSourcePixelSizeOrNull(),
+            rotation = videoRotation,
+            isStillImage = currentTrackIsStillImage,
+            aspectOverrideActive = hasVideoAspectOverride,
             panscanValue = value,
             prepareNormalSurface = false,
             immediate = false,
@@ -327,14 +301,22 @@ internal class VideoZoomGestures(
     fun setVideoGeometry(
         aspect: Double?,
         pixelSize: Pair<Int, Int>?,
+        sourcePixelSize: Pair<Int, Int>?,
+        rotation: Int,
+        isStillImage: Boolean,
+        aspectOverrideActive: Boolean,
         panscanValue: Double?,
         prepareNormalSurface: Boolean = false,
         immediate: Boolean = false,
     ) {
-        stopFling()
         videoAspect = aspect ?: 0.0
         videoPixelWidth = pixelSize?.first ?: 0
         videoPixelHeight = pixelSize?.second ?: 0
+        videoSourceWidth = sourcePixelSize?.first ?: 0
+        videoSourceHeight = sourcePixelSize?.second ?: 0
+        videoRotation = ((rotation % 360) + 360) % 360
+        currentTrackIsStillImage = isStillImage
+        hasVideoAspectOverride = aspectOverrideActive
         panscan = panscanValue ?: 0.0
         zoomRenderSurfaceMode = null
 
@@ -359,6 +341,10 @@ internal class VideoZoomGestures(
         setVideoGeometry(
             aspect = aspect,
             pixelSize = pixelSize,
+            sourcePixelSize = videoSourcePixelSizeOrNull(),
+            rotation = videoRotation,
+            isStillImage = currentTrackIsStillImage,
+            aspectOverrideActive = hasVideoAspectOverride,
             panscanValue = panscanValue,
             prepareNormalSurface = true,
             immediate = true,
@@ -371,9 +357,16 @@ internal class VideoZoomGestures(
         return videoPixelWidth to videoPixelHeight
     }
 
+    private fun videoSourcePixelSizeOrNull(): Pair<Int, Int>? {
+        if (videoSourceWidth <= 0 || videoSourceHeight <= 0)
+            return null
+        return videoSourceWidth to videoSourceHeight
+    }
+
     fun isZoomed(): Boolean = scale > 1f + EPS
 
     fun onSurfaceTextureFrameAvailable() {
+        stillImageCrop.onSurfaceTextureFrameAvailable()
         val now = SystemClock.uptimeMillis()
         previousSurfaceFrameUptimeMs = lastSurfaceFrameUptimeMs
         lastSurfaceFrameUptimeMs = now
@@ -408,8 +401,14 @@ internal class VideoZoomGestures(
     fun resetForNewFile() {
         resetTransformState()
         videoAspect = 0.0
+        stillImageCrop.removeBlocking()
         videoPixelWidth = 0
         videoPixelHeight = 0
+        videoSourceWidth = 0
+        videoSourceHeight = 0
+        videoRotation = 0
+        currentTrackIsStillImage = false
+        hasVideoAspectOverride = false
         panscan = 0.0
         normalCompactSurfacePrepared = false
         previousSurfaceFrameUptimeMs = Long.MIN_VALUE
@@ -431,6 +430,7 @@ internal class VideoZoomGestures(
     }
 
     fun prepareForWindowExit() {
+        stillImageCrop.removeBlocking()
         resetTransformState()
         normalCompactSurfacePrepared = false
         target.alpha = 0f
@@ -439,9 +439,11 @@ internal class VideoZoomGestures(
         applyToView()
     }
 
+    fun release() {
+        stillImageCrop.release()
+    }
+
     private fun resetTransformState() {
-        stopFling()
-        recyclePanVelocityTracker()
         if (applyScheduled) {
             choreographer.removeFrameCallback(frameCallback)
             applyScheduled = false
@@ -452,7 +454,6 @@ internal class VideoZoomGestures(
         ty = 0.0
         panFingerDown = false
         panActive = false
-        panMovedDuringTouch = false
         canBeTap = false
         lastTapTime = 0L
         pendingPinchDoubleTapReset = false
@@ -491,47 +492,8 @@ internal class VideoZoomGestures(
     fun onTouchEvent(e: MotionEvent): Boolean {
         refreshMetricsFromTarget()
 
-        when (e.actionMasked) {
-            MotionEvent.ACTION_DOWN -> {
-                stopFling()
-                // ACTION_DOWN means the previous touch session is fully over.
-                endPinchTouchSession()
-                panMovedDuringTouch = false
-                beginPanVelocityTracking(e.x, e.y, e.eventTime)
-            }
-
-            MotionEvent.ACTION_POINTER_DOWN -> {
-                stopFling()
-
-                // Entering multi-touch must completely end the current one-finger
-                // fling candidate. Pinch motion never contributes velocity, and a
-                // drag performed before the second finger arrived must not launch
-                // a fling when the touch session eventually ends.
-                recyclePanVelocityTracker()
-                panMovedDuringTouch = false
-                panFingerDown = false
-                panActive = false
-                canBeTap = false
-                beginPinchTouchSession(e)
-            }
-        }
-
         // Always feed the scale detector first.
         scaleDetector.onTouchEvent(e)
-
-        if (e.actionMasked == MotionEvent.ACTION_UP || e.actionMasked == MotionEvent.ACTION_CANCEL)
-            endPinchTouchSession()
-
-        if (e.actionMasked == MotionEvent.ACTION_CANCEL) {
-            stopFling()
-            lastTapTime = 0L
-            panFingerDown = false
-            panActive = false
-            canBeTap = false
-            resetPanFilters(lastPointerX, lastPointerY, SystemClock.uptimeMillis())
-            recyclePanVelocityTracker()
-            return isZoomed() || pendingPinchDoubleTapReset
-        }
 
         // Pointer transitions during pinch:
         // If one finger lifts and another remains down, rebase pan input so there is no jump.
@@ -540,12 +502,9 @@ internal class VideoZoomGestures(
             panFingerDown = false
             panActive = false
             canBeTap = false
-            val remainingPointerCount = e.pointerCount - 1
-            if (remainingPointerCount == 1) {
+            if (e.pointerCount >= 2) {
                 val upIdx = e.actionIndex
-                val remainIdx = firstPointerIndexExcept(e, upIdx)
-                if (remainIdx < 0)
-                    return true
+                val remainIdx = if (upIdx == 0) 1 else 0
                 val x = e.getX(remainIdx)
                 val y = e.getY(remainIdx)
                 downX = x
@@ -557,13 +516,6 @@ internal class VideoZoomGestures(
                 downTime = SystemClock.uptimeMillis()
                 resetPanFilters(x, y, downTime)
 
-                // The remaining finger begins a brand-new one-finger drag segment
-                // immediately. Its velocity is measured from this pointer-up
-                // transition, so moving it can fling normally without first lifting
-                // every finger, while all preceding pinch motion remains excluded.
-                panMovedDuringTouch = false
-                rebasePanVelocityTracking(x, y, e.eventTime)
-
                 // Keep the remaining finger as an active one-finger pan.
                 // Previously this stayed false, so the following MOVE events were
                 // consumed while zoomed but ignored until every finger was lifted
@@ -573,29 +525,17 @@ internal class VideoZoomGestures(
             return true
         }
 
-        if (e.actionMasked == MotionEvent.ACTION_POINTER_UP) {
-            return true
-        }
-
-        // Multi-touch is consumed here and handled only by ScaleGestureDetector.
-        // It must never translate the image or retain any fling velocity. A new
-        // one-finger velocity stream is created above only after one pointer lifts
-        // and exactly one remains on the screen.
+        // Multi-touch, or an active pinch, is handled only by ScaleGestureDetector.
         if (e.pointerCount > 1 || scaleDetector.isInProgress) {
             lastTapTime = 0L
             panFingerDown = false
             panActive = false
-            panMovedDuringTouch = false
             canBeTap = false
-            recyclePanVelocityTracker()
             return true
         }
 
-        if (!isZoomed()) {
-            if (e.actionMasked == MotionEvent.ACTION_UP || e.actionMasked == MotionEvent.ACTION_CANCEL)
-                recyclePanVelocityTracker()
+        if (!isZoomed())
             return pendingPinchDoubleTapReset
-        }
 
         when (e.actionMasked) {
             MotionEvent.ACTION_DOWN -> {
@@ -639,9 +579,6 @@ internal class VideoZoomGestures(
                 val moveDist = hypot(e.x - downX, e.y - downY)
                 val wasTap = canBeTap && moveDist < touchSlop && (now - downTime) < DOUBLE_TAP_TIMEOUT
 
-                addPanVelocitySample(e.x, e.y, e.eventTime, MotionEvent.ACTION_UP)
-                val releaseVelocity = releasePanVelocity()
-
                 panFingerDown = false
                 panActive = false
                 canBeTap = false
@@ -649,9 +586,7 @@ internal class VideoZoomGestures(
                 if (!wasTap) {
                     lastTapTime = 0L
                     resetPanFilters(lastPointerX, lastPointerY, now)
-                    if (panMovedDuringTouch)
-                        startFling(releaseVelocity.x, releaseVelocity.y)
-                    recyclePanVelocityTracker()
+                    scheduleApply()
                     return true
                 }
 
@@ -661,7 +596,6 @@ internal class VideoZoomGestures(
                 if (lastTapTime != 0L && dt < DOUBLE_TAP_TIMEOUT && dist < touchSlop * 3f) {
                     reset()
                     lastTapTime = 0L
-                    recyclePanVelocityTracker()
                     return true
                 }
 
@@ -676,56 +610,24 @@ internal class VideoZoomGestures(
                 lastTapX = e.x
                 lastTapY = e.y
                 resetPanFilters(e.x, e.y, now)
-                recyclePanVelocityTracker()
                 return false
             }
 
+            MotionEvent.ACTION_CANCEL -> {
+                lastTapTime = 0L
+                panFingerDown = false
+                panActive = false
+                canBeTap = false
+                resetPanFilters(lastPointerX, lastPointerY, SystemClock.uptimeMillis())
+                scheduleApply()
+                return true
+            }
         }
 
         return true
     }
 
-    private fun beginPinchTouchSession(e: MotionEvent) {
-        val focus = pointerCentroid(e) ?: return
-
-        if (!pinchTouchSessionActive) {
-            pinchTouchSessionActive = true
-            lockedPinchFocusX = focus.x
-            lockedPinchFocusY = focus.y
-        }
-    }
-
-    private fun endPinchTouchSession() {
-        pinchTouchSessionActive = false
-        lockedPinchFocusX = 0f
-        lockedPinchFocusY = 0f
-    }
-
-    private fun pointerCentroid(e: MotionEvent): PointerCentroid? {
-        var sumX = 0f
-        var sumY = 0f
-        var count = 0
-        for (i in 0 until e.pointerCount) {
-            sumX += e.getX(i)
-            sumY += e.getY(i)
-            count++
-        }
-
-        if (count == 0)
-            return null
-        return PointerCentroid(sumX / count, sumY / count)
-    }
-
-    private fun firstPointerIndexExcept(e: MotionEvent, excludedPointerIndex: Int): Int {
-        for (i in 0 until e.pointerCount) {
-            if (i != excludedPointerIndex)
-                return i
-        }
-        return -1
-    }
-
     private fun processPanSample(x: Float, y: Float, timeMs: Long) {
-        addPanVelocitySample(x, y, timeMs)
         lastPointerX = x
         lastPointerY = y
 
@@ -772,111 +674,8 @@ internal class VideoZoomGestures(
 
         tx += dx.toDouble()
         ty += dy.toDouble()
-        panMovedDuringTouch = true
         clampTranslationToVideoContent()
         scheduleApply()
-    }
-
-    private fun beginPanVelocityTracking(x: Float, y: Float, timeMs: Long) {
-        recyclePanVelocityTracker()
-        panVelocityTracker = VelocityTracker.obtain()
-        velocityGestureDownTimeMs = timeMs
-        addPanVelocitySample(x, y, timeMs, MotionEvent.ACTION_DOWN)
-    }
-
-    private fun rebasePanVelocityTracking(x: Float, y: Float, timeMs: Long) {
-        val tracker = panVelocityTracker ?: VelocityTracker.obtain().also {
-            panVelocityTracker = it
-        }
-        tracker.clear()
-        velocityGestureDownTimeMs = timeMs
-        addPanVelocitySample(x, y, timeMs, MotionEvent.ACTION_DOWN)
-    }
-
-    private fun addPanVelocitySample(
-        x: Float,
-        y: Float,
-        timeMs: Long,
-        action: Int = MotionEvent.ACTION_MOVE,
-    ) {
-        val tracker = panVelocityTracker ?: return
-        val safeEventTime = max(timeMs, velocityGestureDownTimeMs)
-        val event = MotionEvent.obtain(
-            velocityGestureDownTimeMs,
-            safeEventTime,
-            action,
-            x,
-            y,
-            0,
-        )
-        tracker.addMovement(event)
-        event.recycle()
-    }
-
-    private fun currentPanVelocity(): PanVelocity {
-        val tracker = panVelocityTracker ?: return PanVelocity.ZERO
-        tracker.computeCurrentVelocity(1000, maximumFlingVelocity)
-        return PanVelocity(
-            x = tracker.getXVelocity(VELOCITY_POINTER_ID),
-            y = tracker.getYVelocity(VELOCITY_POINTER_ID),
-        )
-    }
-
-    private fun releasePanVelocity(): PanVelocity = currentPanVelocity()
-
-    private fun recyclePanVelocityTracker() {
-        panVelocityTracker?.recycle()
-        panVelocityTracker = null
-        velocityGestureDownTimeMs = 0L
-    }
-
-    private fun startFling(rawVelocityX: Float, rawVelocityY: Float) {
-        if (!isZoomed() || scaleDetector.isInProgress)
-            return
-
-        refreshMetricsFromTarget()
-        clampTranslationToVideoContent()
-        val bounds = translationBounds()
-
-        val velocityX = rawVelocityX
-            .takeIf { abs(it) >= minimumFlingVelocity }
-            ?.coerceIn(-maximumFlingVelocity, maximumFlingVelocity)
-            ?: 0f
-        val velocityY = rawVelocityY
-            .takeIf { abs(it) >= minimumFlingVelocity }
-            ?.coerceIn(-maximumFlingVelocity, maximumFlingVelocity)
-            ?: 0f
-
-        if (velocityX == 0f && velocityY == 0f)
-            return
-
-        panScroller.fling(
-            tx.roundToInt(),
-            ty.roundToInt(),
-            velocityX.roundToInt(),
-            velocityY.roundToInt(),
-            bounds.minX.roundToInt(),
-            bounds.maxX.roundToInt(),
-            bounds.minY.roundToInt(),
-            bounds.maxY.roundToInt(),
-        )
-        postFlingFrame()
-    }
-
-    private fun postFlingFrame() {
-        if (flingFramePosted)
-            return
-        flingFramePosted = true
-        choreographer.postFrameCallback(flingFrameCallback)
-    }
-
-    private fun stopFling() {
-        if (!panScroller.isFinished)
-            panScroller.forceFinished(true)
-        if (flingFramePosted) {
-            choreographer.removeFrameCallback(flingFrameCallback)
-            flingFramePosted = false
-        }
     }
 
     private fun scheduleApply() {
@@ -937,53 +736,105 @@ internal class VideoZoomGestures(
             return
         }
 
-        val bounds = translationBounds()
-        tx = tx.coerceIn(bounds.minX, bounds.maxX)
-        ty = ty.coerceIn(bounds.minY, bounds.maxY)
-    }
-
-    private fun translationBounds(): TranslationBounds {
-        if (viewWidth <= 1f || viewHeight <= 1f || scale <= 1f + EPS)
-            return TranslationBounds(0.0, 0.0, 0.0, 0.0)
-
         val c = contentRect()
         val contentWScaled = scale * c.w
         val contentHScaled = scale * c.h
 
-        val minX: Double
-        val maxX: Double
-        if (contentWScaled <= viewWidth + EPS) {
-            val centeredX = (((viewWidth - contentWScaled) * 0.5f) - scale * c.ox).toDouble()
-            minX = centeredX
-            maxX = centeredX
+        tx = if (contentWScaled <= viewWidth + EPS) {
+            (((viewWidth - contentWScaled) * 0.5f) - scale * c.ox).toDouble()
         } else {
-            minX = (viewWidth - scale * (c.ox + c.w)).toDouble()
-            maxX = (-scale * c.ox).toDouble()
+            val minTx = (viewWidth - scale * (c.ox + c.w)).toDouble()
+            val maxTx = (-scale * c.ox).toDouble()
+            tx.coerceIn(minTx, maxTx)
         }
 
-        val minY: Double
-        val maxY: Double
-        if (contentHScaled <= viewHeight + EPS) {
-            val centeredY = (((viewHeight - contentHScaled) * 0.5f) - scale * c.oy).toDouble()
-            minY = centeredY
-            maxY = centeredY
+        ty = if (contentHScaled <= viewHeight + EPS) {
+            (((viewHeight - contentHScaled) * 0.5f) - scale * c.oy).toDouble()
         } else {
-            minY = (viewHeight - scale * (c.oy + c.h)).toDouble()
-            maxY = (-scale * c.oy).toDouble()
+            val minTy = (viewHeight - scale * (c.oy + c.h)).toDouble()
+            val maxTy = (-scale * c.oy).toDouble()
+            ty.coerceIn(minTy, maxTy)
         }
-
-        return TranslationBounds(minX, maxX, minY, maxY)
     }
 
     private fun applyToView() {
-        val fit = renderSurfaceFitTransform()
+        val cropRequest = currentStillImageCropRequest()
+        stillImageCrop.setDesired(cropRequest)
 
         target.pivotX = 0f
         target.pivotY = 0f
+
+        if (stillImageCrop.hasDisplayedCrop) {
+            val predicted = stillImageCrop.currentPredictiveTransform()
+            target.scaleX = predicted.scaleX
+            target.scaleY = predicted.scaleY
+            target.translationX = predicted.translationX
+            target.translationY = predicted.translationY
+            return
+        }
+
+        val fit = renderSurfaceFitTransform()
         target.scaleX = scale * fit.scaleX
         target.scaleY = scale * fit.scaleY
         target.translationX = (tx + scale * fit.translationX).toFloat()
         target.translationY = (ty + scale * fit.translationY).toFloat()
+    }
+
+    private fun currentStillImageCropRequest(): StillImageViewportMath.Request? {
+        if (!shouldUseStillImageCropFilter())
+            return null
+        // First settle TextureView back to the compact base surface. Otherwise a
+        // late frame from an original-detail surface resize could be mistaken for
+        // the first frame produced by the CPU crop filter.
+        if (displayedRenderSurfaceMode != RenderSurfaceMode.BASE ||
+            surfaceModeTransitionInFlight != null
+        ) return null
+
+        refreshMetricsFromTarget()
+        val vw = viewWidth.roundToInt()
+        val vh = viewHeight.roundToInt()
+        val c = contentRect()
+        if (vw <= 1 || vh <= 1 || c.w <= 1f || c.h <= 1f)
+            return null
+
+        return StillImageViewportMath.compute(
+            StillImageViewportMath.Input(
+                viewWidth = vw,
+                viewHeight = vh,
+                contentLeft = c.ox.toDouble(),
+                contentTop = c.oy.toDouble(),
+                contentWidth = c.w.toDouble(),
+                contentHeight = c.h.toDouble(),
+                logicalScale = scale.toDouble(),
+                translationX = tx,
+                translationY = ty,
+                sourceWidth = videoSourceWidth,
+                sourceHeight = videoSourceHeight,
+                rotation = videoRotation,
+                fastScaling = scaleDetector.isInProgress || panFingerDown,
+            ),
+        )
+    }
+
+    private fun shouldUseStillImageCropFilter(): Boolean {
+        if (!stillImageCrop.isAvailable || !zoomHighQualityRequested || !isZoomed() ||
+            !currentTrackIsStillImage || hasVideoAspectOverride || isPanscanActive()
+        ) return false
+        if (videoSourceWidth <= 1 || videoSourceHeight <= 1)
+            return false
+        if (videoRotation !in SUPPORTED_CROP_ROTATIONS)
+            return false
+
+        refreshMetricsFromTarget()
+        val viewportWidth = viewWidth.roundToInt()
+        val viewportHeight = viewHeight.roundToInt()
+        return StillImageViewportMath.sourceExceedsViewport(
+            sourceWidth = videoSourceWidth,
+            sourceHeight = videoSourceHeight,
+            rotation = videoRotation,
+            viewportWidth = viewportWidth,
+            viewportHeight = viewportHeight,
+        )
     }
 
     private fun renderSurfaceFitTransform(): SurfaceFitTransform {
@@ -1004,7 +855,9 @@ internal class VideoZoomGestures(
 
     private fun updateRenderSurfaceForCurrentState(force: Boolean) {
         val zooming = isZoomed() || scaleDetector.isInProgress
-        val desiredMode = if (!zooming || !zoomHighQualityRequested) {
+        val desiredMode = if (!zooming || !zoomHighQualityRequested ||
+            shouldUseStillImageCropFilter() || stillImageCrop.wantsOrDisplaysCrop
+        ) {
             RenderSurfaceMode.BASE
         } else {
             zoomRenderSurfaceMode ?: selectZoomRenderSurfaceMode().also {
@@ -1037,13 +890,6 @@ internal class VideoZoomGestures(
     }
 
     private fun shouldKeepViewAspectWhileZooming(): Boolean {
-        val currentTrackIsStillImage = try {
-            MPVLib.getPropertyString("current-tracks/video/image")
-                ?.equals("yes", ignoreCase = true) == true
-        } catch (_: Throwable) {
-            false
-        }
-
         if (!currentTrackIsStillImage)
             return true
 
@@ -1171,13 +1017,18 @@ internal class VideoZoomGestures(
     }
 
     private fun requestZoomHighQuality() {
-        if (zoomHighQualityRequested || !isZoomed())
+        if (!isZoomed())
             return
 
-        zoomHighQualityRequested = true
-        zoomRenderSurfaceMode = null
-        stopZoomQualityMonitor()
-        updateRenderSurfaceForCurrentState(force = false)
+        if (!zoomHighQualityRequested) {
+            zoomHighQualityRequested = true
+            zoomRenderSurfaceMode = null
+            stopZoomQualityMonitor()
+            updateRenderSurfaceForCurrentState(force = false)
+        }
+        // Also refresh an already-active image crop from fast interaction scaling
+        // to the idle high-quality scaler after pinch/pan ends.
+        scheduleApply()
     }
 
     private fun postZoomQualityMonitor() {
@@ -1288,18 +1139,6 @@ internal class VideoZoomGestures(
     private fun lerp(a: Float, b: Float, t: Float): Float = a + (b - a) * t
 
     private data class ContentRect(val ox: Float, val oy: Float, val w: Float, val h: Float)
-    private data class PointerCentroid(val x: Float, val y: Float)
-    private data class PanVelocity(val x: Float, val y: Float) {
-        companion object {
-            val ZERO = PanVelocity(0f, 0f)
-        }
-    }
-    private data class TranslationBounds(
-        val minX: Double,
-        val maxX: Double,
-        val minY: Double,
-        val maxY: Double,
-    )
     private data class SurfaceFitTransform(
         val scaleX: Float,
         val scaleY: Float,
@@ -1396,7 +1235,6 @@ internal class VideoZoomGestures(
         private const val MAX_SCALE = 20f
         private const val PINCH_DOUBLE_TAP_RESET_SCALE = 1.001f
         private const val DOUBLE_TAP_TIMEOUT = 300L
-        private const val VELOCITY_POINTER_ID = 0
         private const val MEDIA_ORIENTATION_THRESHOLD = 1.08
         private const val VIEW_ORIENTATION_THRESHOLD = 1.08f
         private const val MEDIA_ASPECT_FALLBACK_WASTE_RATIO = 2.0
@@ -1415,6 +1253,7 @@ internal class VideoZoomGestures(
 
         private const val MAX_RENDER_SURFACE_EDGE = 8192.0
         private const val MAX_RENDER_SURFACE_PIXELS = MAX_RENDER_SURFACE_EDGE * MAX_RENDER_SURFACE_EDGE
+        private val SUPPORTED_CROP_ROTATIONS = setOf(0, 90, 180, 270)
 
         private const val DEFAULT_FRAME_DT = 1f / 60f
         private const val MIN_FILTER_DT = 1f / 240f

@@ -545,12 +545,32 @@ internal class MPVView(context: Context, attrs: AttributeSet) : BaseMPVView(cont
     }
 
     fun getVideoPixelSize(): Pair<Int, Int>? {
+        val source = getVideoSourcePixelSize() ?: return null
+        val rot = getVideoRotation()
+        return if (rot % 180 == 90) source.second to source.first else source
+    }
+
+    /** Source dimensions before mpv applies display rotation. */
+    fun getVideoSourcePixelSize(): Pair<Int, Int>? {
         val w = MPVLib.getPropertyInt("video-params/w") ?: return null
         val h = MPVLib.getPropertyInt("video-params/h") ?: return null
         if (w <= 0 || h <= 0)
             return null
-        val rot = MPVLib.getPropertyInt("video-params/rotate") ?: 0
-        return if (rot % 180 == 90) h to w else w to h
+        return w to h
+    }
+
+    fun getVideoRotation(): Int {
+        val rotation = MPVLib.getPropertyInt("video-params/rotate") ?: 0
+        return ((rotation % 360) + 360) % 360
+    }
+
+    fun isCurrentTrackStillImage(): Boolean {
+        return MPVLib.getPropertyString("current-tracks/video/image")
+            ?.equals("yes", ignoreCase = true) == true
+    }
+
+    fun hasVideoAspectOverride(): Boolean {
+        return parseAspectRatio(MPVLib.getPropertyString("video-aspect-override")) != null
     }
 
     fun setAudioSessionId(id: Int) {

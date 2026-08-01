@@ -694,12 +694,20 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
 
         val aspect = try { player.getEffectiveVideoAspect() } catch (_: Throwable) { null }
         val size = try { player.getVideoPixelSize() } catch (_: Throwable) { null }
+        val sourceSize = try { player.getVideoSourcePixelSize() } catch (_: Throwable) { null }
+        val rotation = try { player.getVideoRotation() } catch (_: Throwable) { 0 }
+        val isStillImage = try { player.isCurrentTrackStillImage() } catch (_: Throwable) { false }
+        val aspectOverrideActive = try { player.hasVideoAspectOverride() } catch (_: Throwable) { false }
         val pan = try { player.getPanscan() } catch (_: Throwable) { 0.0 }
 
         try {
             zoomGestures.setVideoGeometry(
                 aspect = aspect,
                 pixelSize = size,
+                sourcePixelSize = sourceSize,
+                rotation = rotation,
+                isStillImage = isStillImage,
+                aspectOverrideActive = aspectOverrideActive,
                 panscanValue = pan,
                 prepareNormalSurface = prepareNormalSurface,
                 immediate = immediate,
@@ -809,6 +817,9 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
         // take the background service with us
         stopServiceRunnable.run()
 
+        if (::zoomGestures.isInitialized) {
+            try { zoomGestures.release() } catch (_: Throwable) {}
+        }
         player.removeObserver(this)
         player.destroy()
         super.onDestroy()
@@ -3520,7 +3531,11 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
         if (!activityIsForeground) return
         when (property) {
             "track-list" -> player.loadTracks()
-            "current-tracks/audio/selected", "current-tracks/video/image" -> updateAudioUI()
+            "current-tracks/audio/selected" -> updateAudioUI()
+            "current-tracks/video/image" -> {
+                updateAudioUI()
+                syncZoomVideoGeometry()
+            }
             "hwdec-current" -> updateDecoderButton()
         }
         if (metaUpdated)
