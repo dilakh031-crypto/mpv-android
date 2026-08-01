@@ -11,8 +11,10 @@ import android.widget.OverScroller
 import kotlin.math.PI
 import kotlin.math.abs
 import kotlin.math.ceil
+import kotlin.math.exp
 import kotlin.math.floor
 import kotlin.math.hypot
+import kotlin.math.ln
 import kotlin.math.max
 import kotlin.math.min
 import kotlin.math.roundToInt
@@ -125,6 +127,72 @@ internal class VideoZoomGestures(
         }
     }
 
+    // Pinch inertia uses the same Android viscous-fluid fling implementation as
+    // panning. Scale is encoded logarithmically into a one-dimensional scroller:
+    // equal distances therefore represent equal multiplicative zoom changes.
+    private val zoomScroller = OverScroller(target.context)
+    private var zoomFlingPosted = false
+    private var zoomFlingUnitsPerLog = 1f
+    private var zoomFlingFocusX = 0f
+    private var zoomFlingFocusY = 0f
+    private var zoomReleaseVelocityLogPerSecond = 0f
+    private var zoomVelocitySampleTimeMs = 0L
+    private var hasZoomVelocitySample = false
+
+    // ScaleGestureDetector ends as soon as either pinch pointer lifts, while one
+    // pointer is usually still down. Keep the release velocity briefly and only
+    // launch the zoom fling when the final pointer lifts. If the remaining finger
+    // starts panning, or is held, the candidate is discarded.
+    private var pendingZoomFling = false
+    private var pendingZoomFlingVelocityLogPerSecond = 0f
+    private var pendingZoomFlingFocusX = 0f
+    private var pendingZoomFlingFocusY = 0f
+    private var pendingZoomFlingExpiryPosted = false
+    private val pendingZoomFlingExpiryRunnable = Runnable {
+        pendingZoomFlingExpiryPosted = false
+        discardPendingZoomFling(requestHighQuality = true)
+    }
+
+    private val zoomFlingRunnable = object : Runnable {
+        override fun run() {
+            zoomFlingPosted = false
+
+            if (scaleDetector.isInProgress || !isZoomed()) {
+                finishZoomFling(requestHighQuality = isZoomed())
+                return
+            }
+
+            if (!zoomScroller.computeScrollOffset()) {
+                finishZoomFling(requestHighQuality = true)
+                return
+            }
+
+            val oldScale = scale
+            val newScale = exp(
+                zoomScroller.currX.toDouble() / zoomFlingUnitsPerLog.toDouble(),
+            ).toFloat().coerceIn(MIN_SCALE, MAX_SCALE)
+
+            if (newScale <= PINCH_DOUBLE_TAP_RESET_SCALE) {
+                cancelZoomFling(requestHighQuality = false)
+                pendingPinchDoubleTapReset = true
+                resetLikeDoubleTapAfterPinch()
+                return
+            }
+
+            applyScaleAroundFocus(oldScale, newScale, zoomFlingFocusX, zoomFlingFocusY)
+            updateZoomMotionVelocity(oldScale, newScale, SystemClock.uptimeMillis())
+            clampTranslationToVideoContent()
+            applyToView()
+
+            if (zoomScroller.isFinished) {
+                finishZoomFling(requestHighQuality = true)
+            } else {
+                zoomFlingPosted = true
+                target.postOnAnimation(this)
+            }
+        }
+    }
+
     private var requestedRenderSurfaceMode = RenderSurfaceMode.BASE
     private var displayedRenderSurfaceMode = RenderSurfaceMode.BASE
     private var surfaceModeTransitionInFlight: RenderSurfaceMode? = null
@@ -196,6 +264,8 @@ internal class VideoZoomGestures(
         object : ScaleGestureDetector.SimpleOnScaleGestureListener() {
             override fun onScaleBegin(detector: ScaleGestureDetector): Boolean {
                 cancelPanFling()
+                cancelZoomFling(requestHighQuality = false)
+                discardPendingZoomFling(requestHighQuality = false)
                 recycleVelocityTracker()
                 lastTapTime = 0L
                 pendingPinchDoubleTapReset = false
@@ -220,6 +290,7 @@ internal class VideoZoomGestures(
 
                 val focusX = currentPinchFocusX(detector)
                 val focusY = currentPinchFocusY(detector)
+                resetZoomVelocityTracking(now)
                 resetPanFilters(focusX, focusY, now)
                 return true
             }
@@ -255,14 +326,10 @@ internal class VideoZoomGestures(
                 // transform: screen = scale * content + translation
                 val focusX = currentPinchFocusX(detector)
                 val focusY = currentPinchFocusY(detector)
-                val fx = focusX.toDouble()
-                val fy = focusY.toDouble()
-                val k = (newScale / oldScale).toDouble()
-                tx = (k * tx) + ((1.0 - k) * fx)
-                ty = (k * ty) + ((1.0 - k) * fy)
-                scale = newScale
+                applyScaleAroundFocus(oldScale, newScale, focusX, focusY)
 
                 val now = SystemClock.uptimeMillis()
+                updateZoomReleaseVelocity(oldScale, newScale, detector.timeDelta, now)
                 updateZoomMotionVelocity(oldScale, newScale, now)
                 clampTranslationToVideoContent()
                 resetPanFilters(focusX, focusY, now)
@@ -272,16 +339,23 @@ internal class VideoZoomGestures(
 
             override fun onScaleEnd(detector: ScaleGestureDetector) {
                 if (pendingPinchDoubleTapReset || scale <= PINCH_DOUBLE_TAP_RESET_SCALE) {
+                    discardPendingZoomFling(requestHighQuality = false)
                     pendingPinchDoubleTapReset = true
                     resetLikeDoubleTapAfterPinch()
                 } else {
                     stopZoomQualityMonitor()
-                    resetPanFilters(
-                        currentPinchFocusX(detector),
-                        currentPinchFocusY(detector),
-                        SystemClock.uptimeMillis(),
-                    )
-                    requestZoomHighQuality()
+                    val now = SystemClock.uptimeMillis()
+                    val focusX = currentPinchFocusX(detector)
+                    val focusY = currentPinchFocusY(detector)
+                    resetPanFilters(focusX, focusY, now)
+
+                    val releaseVelocity = currentZoomReleaseVelocity(now)
+                    if (releaseVelocity != null) {
+                        setPendingZoomFling(releaseVelocity, focusX, focusY)
+                    } else {
+                        discardPendingZoomFling(requestHighQuality = false)
+                        requestZoomHighQuality()
+                    }
                 }
             }
         }
@@ -289,6 +363,8 @@ internal class VideoZoomGestures(
 
     fun setMetrics(width: Float, height: Float) {
         cancelPanFling()
+        cancelZoomFling(requestHighQuality = true)
+        discardPendingZoomFling(requestHighQuality = true)
         viewWidth = width
         viewHeight = height
         refreshMetricsFromTarget()
@@ -340,6 +416,8 @@ internal class VideoZoomGestures(
         immediate: Boolean = false,
     ) {
         cancelPanFling()
+        cancelZoomFling(requestHighQuality = true)
+        discardPendingZoomFling(requestHighQuality = true)
         videoAspect = aspect ?: 0.0
         videoPixelWidth = pixelSize?.first ?: 0
         videoPixelHeight = pixelSize?.second ?: 0
@@ -449,6 +527,8 @@ internal class VideoZoomGestures(
 
     private fun resetTransformState() {
         cancelPanFling()
+        cancelZoomFling(requestHighQuality = false)
+        discardPendingZoomFling(requestHighQuality = false)
         recycleVelocityTracker()
 
         if (applyScheduled) {
@@ -471,6 +551,9 @@ internal class VideoZoomGestures(
         lastZoomMotionUptimeMs = 0L
         smoothedZoomVelocity = Float.POSITIVE_INFINITY
         slowZoomMotionSinceMs = 0L
+        zoomReleaseVelocityLogPerSecond = 0f
+        zoomVelocitySampleTimeMs = 0L
+        hasZoomVelocitySample = false
         resetPanFilters(0f, 0f, SystemClock.uptimeMillis())
         target.alpha = 1f
     }
@@ -500,8 +583,11 @@ internal class VideoZoomGestures(
     fun onTouchEvent(e: MotionEvent): Boolean {
         refreshMetricsFromTarget()
 
-        if (e.actionMasked == MotionEvent.ACTION_DOWN)
+        if (e.actionMasked == MotionEvent.ACTION_DOWN) {
             cancelPanFling()
+            cancelZoomFling(requestHighQuality = true)
+            discardPendingZoomFling(requestHighQuality = true)
+        }
 
         // Capture the raw two-finger midpoint before ScaleGestureDetector invokes
         // its callbacks. The detector's generic focus can include extra pointers,
@@ -511,6 +597,21 @@ internal class VideoZoomGestures(
 
         if (e.actionMasked == MotionEvent.ACTION_UP || e.actionMasked == MotionEvent.ACTION_CANCEL)
             hasPinchFocus = false
+
+        // ScaleGestureDetector ended when the other pinch pointer lifted. Launch
+        // the stored zoom velocity only when the final pointer leaves, so zoom
+        // inertia never fights a one-finger pan that follows the pinch.
+        if (e.actionMasked == MotionEvent.ACTION_UP && pendingZoomFling) {
+            panFingerDown = false
+            panActive = false
+            canBeTap = false
+            lastTapTime = 0L
+            recycleVelocityTracker()
+            val started = startPendingZoomFling()
+            if (!started)
+                requestZoomHighQuality()
+            return true
+        }
 
         // Pointer transitions during pinch:
         // If one finger lifts and another remains down, rebase pan input so there is no jump.
@@ -651,6 +752,8 @@ internal class VideoZoomGestures(
 
             MotionEvent.ACTION_CANCEL -> {
                 cancelPanFling()
+                cancelZoomFling(requestHighQuality = true)
+                discardPendingZoomFling(requestHighQuality = true)
                 recycleVelocityTracker()
                 lastTapTime = 0L
                 panFingerDown = false
@@ -703,6 +806,8 @@ internal class VideoZoomGestures(
     }
 
     private fun startPanFling(velocityX: Float, velocityY: Float) {
+        cancelZoomFling(requestHighQuality = true)
+        discardPendingZoomFling(requestHighQuality = true)
         val bounds = translationBounds()
         val minX = flingBoundMin(bounds.minTx)
         val maxX = flingBoundMax(bounds.maxTx)
@@ -748,6 +853,187 @@ internal class VideoZoomGestures(
         if (!panScroller.isFinished)
             panScroller.abortAnimation()
     }
+
+    private fun resetZoomVelocityTracking(now: Long) {
+        zoomReleaseVelocityLogPerSecond = 0f
+        zoomVelocitySampleTimeMs = now
+        hasZoomVelocitySample = false
+    }
+
+    private fun updateZoomReleaseVelocity(
+        oldScale: Float,
+        newScale: Float,
+        detectorTimeDeltaMs: Long,
+        now: Long,
+    ) {
+        if (oldScale <= 0f || newScale <= 0f || oldScale == newScale)
+            return
+
+        val fallbackDeltaMs = now - zoomVelocitySampleTimeMs
+        val deltaMs = if (detectorTimeDeltaMs > 0L) detectorTimeDeltaMs else fallbackDeltaMs
+        if (deltaMs <= 0L)
+            return
+
+        val dtSeconds = (deltaMs.toFloat() / 1000f)
+            .coerceIn(MIN_ZOOM_VELOCITY_DT_SECONDS, MAX_ZOOM_VELOCITY_DT_SECONDS)
+        val instantaneous = (ln(newScale.toDouble() / oldScale.toDouble()) / dtSeconds)
+            .toFloat()
+        if (!instantaneous.isFinite())
+            return
+
+        zoomReleaseVelocityLogPerSecond = if (!hasZoomVelocitySample) {
+            instantaneous
+        } else {
+            val sameDirection =
+                zoomReleaseVelocityLogPerSecond == 0f ||
+                    instantaneous == 0f ||
+                    (zoomReleaseVelocityLogPerSecond > 0f) == (instantaneous > 0f)
+            val previousWeight = if (sameDirection)
+                ZOOM_FLING_VELOCITY_PREVIOUS_WEIGHT
+            else
+                ZOOM_FLING_DIRECTION_CHANGE_PREVIOUS_WEIGHT
+            previousWeight * zoomReleaseVelocityLogPerSecond +
+                (1f - previousWeight) * instantaneous
+        }
+        zoomVelocitySampleTimeMs = now
+        hasZoomVelocitySample = true
+    }
+
+    private fun currentZoomReleaseVelocity(now: Long): Float? {
+        if (!hasZoomVelocitySample || now - zoomVelocitySampleTimeMs > ZOOM_FLING_SAMPLE_MAX_AGE_MS)
+            return null
+
+        val units = zoomFlingUnitsForView()
+        val minimumLogVelocity = max(
+            MIN_ZOOM_FLING_LOG_VELOCITY_PER_SECOND,
+            minimumFlingVelocity / units,
+        )
+        val maximumLogVelocity = min(
+            MAX_ZOOM_FLING_LOG_VELOCITY_PER_SECOND,
+            maximumFlingVelocity / units,
+        ).coerceAtLeast(minimumLogVelocity)
+
+        val velocity = zoomReleaseVelocityLogPerSecond
+            .coerceIn(-maximumLogVelocity, maximumLogVelocity)
+        if (abs(velocity) < minimumLogVelocity)
+            return null
+        if (velocity < 0f && scale <= MIN_SCALE + EPS)
+            return null
+        if (velocity > 0f && scale >= MAX_SCALE - EPS)
+            return null
+        return velocity
+    }
+
+    private fun setPendingZoomFling(velocityLogPerSecond: Float, focusX: Float, focusY: Float) {
+        discardPendingZoomFling(requestHighQuality = false)
+        pendingZoomFling = true
+        pendingZoomFlingVelocityLogPerSecond = velocityLogPerSecond
+        pendingZoomFlingFocusX = focusX
+        pendingZoomFlingFocusY = focusY
+        pendingZoomFlingExpiryPosted = true
+        target.postDelayed(pendingZoomFlingExpiryRunnable, ZOOM_FLING_RELEASE_GRACE_MS)
+    }
+
+    private fun discardPendingZoomFling(requestHighQuality: Boolean) {
+        val hadPendingFling = pendingZoomFling
+        if (pendingZoomFlingExpiryPosted) {
+            target.removeCallbacks(pendingZoomFlingExpiryRunnable)
+            pendingZoomFlingExpiryPosted = false
+        }
+        pendingZoomFling = false
+        pendingZoomFlingVelocityLogPerSecond = 0f
+
+        if (requestHighQuality && hadPendingFling && isZoomed() && !scaleDetector.isInProgress)
+            requestZoomHighQuality()
+    }
+
+    private fun startPendingZoomFling(): Boolean {
+        if (!pendingZoomFling)
+            return false
+
+        val velocity = pendingZoomFlingVelocityLogPerSecond
+        val focusX = pendingZoomFlingFocusX
+        val focusY = pendingZoomFlingFocusY
+        discardPendingZoomFling(requestHighQuality = false)
+        return startZoomFling(velocity, focusX, focusY)
+    }
+
+    private fun startZoomFling(
+        velocityLogPerSecond: Float,
+        focusX: Float,
+        focusY: Float,
+    ): Boolean {
+        if (!isZoomed() || velocityLogPerSecond == 0f)
+            return false
+
+        refreshMetricsFromTarget()
+        val units = zoomFlingUnitsForView()
+        val start = (ln(scale.toDouble()) * units).roundToInt()
+        val minimum = (ln(MIN_SCALE.toDouble()) * units).roundToInt()
+        val maximum = (ln(MAX_SCALE.toDouble()) * units).roundToInt()
+        val velocity = (velocityLogPerSecond * units)
+            .coerceIn(-maximumFlingVelocity, maximumFlingVelocity)
+            .roundToInt()
+
+        if (abs(velocity) < minimumFlingVelocity.roundToInt())
+            return false
+        if (velocity < 0 && start <= minimum)
+            return false
+        if (velocity > 0 && start >= maximum)
+            return false
+
+        cancelPanFling()
+        cancelZoomFling(requestHighQuality = false)
+        zoomFlingUnitsPerLog = units
+        zoomFlingFocusX = focusX
+        zoomFlingFocusY = focusY
+        zoomScroller.fling(
+            start.coerceIn(minimum, maximum),
+            0,
+            velocity,
+            0,
+            minimum,
+            maximum,
+            0,
+            0,
+        )
+
+        if (zoomScroller.isFinished)
+            return false
+
+        zoomFlingPosted = true
+        target.postOnAnimation(zoomFlingRunnable)
+        return true
+    }
+
+    private fun cancelZoomFling(requestHighQuality: Boolean) {
+        val wasRunning = zoomFlingPosted || !zoomScroller.isFinished
+        if (zoomFlingPosted) {
+            target.removeCallbacks(zoomFlingRunnable)
+            zoomFlingPosted = false
+        }
+        if (!zoomScroller.isFinished)
+            zoomScroller.abortAnimation()
+
+        if (requestHighQuality && wasRunning && isZoomed() && !scaleDetector.isInProgress)
+            requestZoomHighQuality()
+    }
+
+    private fun finishZoomFling(requestHighQuality: Boolean) {
+        if (zoomFlingPosted) {
+            target.removeCallbacks(zoomFlingRunnable)
+            zoomFlingPosted = false
+        }
+        if (!zoomScroller.isFinished)
+            zoomScroller.abortAnimation()
+        hasZoomVelocitySample = false
+
+        if (requestHighQuality && isZoomed())
+            requestZoomHighQuality()
+    }
+
+    private fun zoomFlingUnitsForView(): Float =
+        max(viewWidth, viewHeight).coerceAtLeast(MIN_ZOOM_FLING_UNITS)
 
     private fun flingPosition(value: Double): Int =
         value.coerceIn(Int.MIN_VALUE.toDouble(), Int.MAX_VALUE.toDouble()).roundToInt()
@@ -801,6 +1087,21 @@ internal class VideoZoomGestures(
     private fun currentPinchFocusY(detector: ScaleGestureDetector): Float =
         if (hasPinchFocus) pinchFocusY else detector.focusY
 
+    private fun applyScaleAroundFocus(
+        oldScale: Float,
+        newScale: Float,
+        focusX: Float,
+        focusY: Float,
+    ) {
+        if (oldScale <= 0f || newScale == oldScale)
+            return
+
+        val k = (newScale / oldScale).toDouble()
+        tx = (k * tx) + ((1.0 - k) * focusX.toDouble())
+        ty = (k * ty) + ((1.0 - k) * focusY.toDouble())
+        scale = newScale
+    }
+
     private fun processPanSample(x: Float, y: Float, timeMs: Long) {
         lastPointerX = x
         lastPointerY = y
@@ -820,6 +1121,7 @@ internal class VideoZoomGestures(
                 return
 
             panActive = true
+            discardPendingZoomFling(requestHighQuality = true)
             // Avoid the first slop-crossing jump.
             lastPanX = x
             lastPanY = y
@@ -1372,6 +1674,14 @@ internal class VideoZoomGestures(
         private const val ZOOM_VELOCITY_SMOOTHING = 0.58f
         private const val MIN_ZOOM_VELOCITY_DT_SECONDS = 1f / 240f
         private const val MAX_ZOOM_VELOCITY_DT_SECONDS = 1f / 8f
+
+        private const val ZOOM_FLING_SAMPLE_MAX_AGE_MS = 100L
+        private const val ZOOM_FLING_RELEASE_GRACE_MS = 180L
+        private const val ZOOM_FLING_VELOCITY_PREVIOUS_WEIGHT = 0.35f
+        private const val ZOOM_FLING_DIRECTION_CHANGE_PREVIOUS_WEIGHT = 0.12f
+        private const val MIN_ZOOM_FLING_LOG_VELOCITY_PER_SECOND = 0.12f
+        private const val MAX_ZOOM_FLING_LOG_VELOCITY_PER_SECOND = 4.0f
+        private const val MIN_ZOOM_FLING_UNITS = 320f
 
         private const val MAX_RENDER_SURFACE_EDGE = 8192.0
         private const val MAX_RENDER_SURFACE_PIXELS = MAX_RENDER_SURFACE_EDGE * MAX_RENDER_SURFACE_EDGE
