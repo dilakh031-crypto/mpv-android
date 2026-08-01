@@ -19,6 +19,7 @@ import kotlin.reflect.KProperty
 internal class MPVView(context: Context, attrs: AttributeSet) : BaseMPVView(context, attrs) {
     private var watchLaterOptionsBeforeDisable: String? = null
     private var watchLaterOptionsSuppressed = false
+    private var renderApiHwdec = "no"
 
     override fun initOptions() {
         val sharedPreferences = PreferenceManager.getDefaultSharedPreferences(context)
@@ -41,6 +42,7 @@ internal class MPVView(context: Context, attrs: AttributeSet) : BaseMPVView(cont
             HWDECS
         else
             "no"
+        renderApiHwdec = hwdec
 
         // vo: set display fps as reported by android
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
@@ -102,7 +104,6 @@ internal class MPVView(context: Context, attrs: AttributeSet) : BaseMPVView(cont
             MPVLib.setOptionString("vd-lavc-skiploopfilter", "nonkey")
         }
 
-        MPVLib.setOptionString("gpu-context", "android")
         MPVLib.setOptionString("opengl-es", "yes")
         MPVLib.setOptionString("hwdec", hwdec)
         MPVLib.setOptionString("hwdec-codecs", "h264,hevc,mpeg4,mpeg2video,vp8,vp9,av1")
@@ -127,6 +128,11 @@ internal class MPVView(context: Context, attrs: AttributeSet) : BaseMPVView(cont
     }
 
     override fun postInitOptions() {
+        // A user config can restore direct mediacodec. The OpenGL Render API path
+        // deliberately uses the copy variant so scaling, shaders and FBO output
+        // remain available on Android.
+        MPVLib.setPropertyString("hwdec", renderApiHwdec)
+
         // We call write-watch-later manually, including before every explicit playlist jump.
         MPVLib.setOptionString("save-position-on-quit", "no")
 
@@ -157,9 +163,13 @@ internal class MPVView(context: Context, attrs: AttributeSet) : BaseMPVView(cont
 
             // Saving is all-or-nothing for this app: position and every app-controlled per-file
             // option are stored together while the preference is enabled.
+            // hwdec is restored by the app's sanitized per-file store instead.
+            // Excluding it here also prevents old watch-later files from reviving
+            // the direct mediacodec mode that cannot feed this FBO renderer.
             mergeStringListProperty(
                 "watch-later-options",
-                PER_FILE_PLAYBACK_OPTIONS + "start"
+                WATCH_LATER_PLAYBACK_OPTIONS + "start",
+                remove = setOf("hwdec"),
             )
         } else {
             if (!watchLaterOptionsSuppressed) {
@@ -201,7 +211,20 @@ internal class MPVView(context: Context, attrs: AttributeSet) : BaseMPVView(cont
      * value is restored to the pre-file value when this file unloads.
      */
     fun setFileLocalString(name: String, value: String) {
-        MPVLib.setPropertyString("file-local-options/$name", value)
+        val compatibleValue = if (name == "hwdec")
+            renderApiCompatibleHwdec(value)
+        else
+            value
+        MPVLib.setPropertyString("file-local-options/$name", compatibleValue)
+    }
+
+    private fun renderApiCompatibleHwdec(value: String): String {
+        val modes = value.split(',').map { it.trim() }.filter { it.isNotEmpty() }
+        if (modes.none { it == "mediacodec" })
+            return value
+
+        val compatibleModes = modes.filterNot { it == "mediacodec" }
+        return if (compatibleModes.isEmpty()) HWDECS else compatibleModes.joinToString(",")
     }
 
     fun setFileLocalInt(name: String, value: Int) {
@@ -669,11 +692,14 @@ internal class MPVView(context: Context, attrs: AttributeSet) : BaseMPVView(cont
             "vid",
         )
 
+        private val WATCH_LATER_PLAYBACK_OPTIONS =
+            PER_FILE_PLAYBACK_OPTIONS - "hwdec"
+
         // Audio/subtitle IDs are restored together with external filenames by MPVActivity.
         private val APP_PERSISTED_PLAYBACK_OPTIONS =
             PER_FILE_PLAYBACK_OPTIONS - setOf("aid", "sid", "secondary-sid")
 
         // mpv option `hwdec` is set to this
-        private const val HWDECS = "mediacodec,mediacodec-copy"
+        private const val HWDECS = "mediacodec-copy"
     }
 }
