@@ -86,12 +86,6 @@ internal class VideoZoomGestures(
     // once at the transition boundary instead of querying mpv from every pinch MOVE.
     private var zoomRenderSurfaceMode: RenderSurfaceMode? = null
 
-    @Volatile
-    private var surfaceFrameSerial = 0L
-    private var renderedVideoAspect = 0.0
-    private var renderedPanscan = 0.0
-    private var aspectMenuTransition: AspectMenuTransition? = null
-
     // Tracks whether MPVActivity has completed the initial geometry hand-off.
     // Normal rendering remains on the plain view-sized mpv surface.
     private var normalSurfacePrepared = false
@@ -232,28 +226,27 @@ internal class VideoZoomGestures(
         prepareNormalSurface: Boolean = false,
         immediate: Boolean = false,
     ) {
-        val nextAspect = aspect ?: 0.0
-        val nextPanscan = panscanValue ?: 0.0
-
-        videoAspect = nextAspect
+        videoAspect = aspect ?: 0.0
         videoPixelWidth = pixelSize?.first ?: 0
         videoPixelHeight = pixelSize?.second ?: 0
-        panscan = nextPanscan
+        panscan = panscanValue ?: 0.0
         zoomRenderSurfaceMode = null
-
-        val transition = aspectMenuTransition
-        if (transition == null) {
-            renderedVideoAspect = nextAspect
-            renderedPanscan = nextPanscan
-        }
 
         if (prepareNormalSurface)
             normalSurfacePrepared = true
 
-        if (isZoomed() || scaleDetector.isInProgress)
+        val zooming = isZoomed() || scaleDetector.isInProgress
+        if (zooming)
             clampTranslationToVideoContent()
 
-        updateRenderSurfaceForCurrentState(force = true)
+        // Normal rendering always uses the view-sized BASE surface, regardless of
+        // video aspect. Property notifications for one aspect-menu selection can
+        // arrive several times; forcing BASE again for each one recreates the
+        // SurfaceTexture buffer and makes heavy media redraw unnecessarily.
+        // While zoomed, geometry does affect the high-detail surface, so retain the
+        // forced refresh there. At normal scale, request BASE only if it is not
+        // already the requested mode.
+        updateRenderSurfaceForCurrentState(force = zooming)
         if (immediate)
             applyToView()
         else
@@ -265,84 +258,13 @@ internal class VideoZoomGestures(
         pixelSize: Pair<Int, Int>?,
         panscanValue: Double?,
     ) {
-        refreshMetricsFromTarget()
-
-        val targetAspect = aspect ?: 0.0
-        val targetPanscan = panscanValue ?: 0.0
-        val existingTransition = aspectMenuTransition
-        val sourceAspect = existingTransition?.sourceAspect
-            ?: renderedVideoAspect.takeIf { it > 0.001 }
-            ?: videoAspect
-        val sourcePanscan = existingTransition?.sourcePanscan ?: renderedPanscan
-        val aspectActuallyChanges = !aspectValuesMatch(sourceAspect, targetAspect)
-
-        aspectMenuTransition = if (existingTransition != null || aspectActuallyChanges) {
-            AspectMenuTransition(
-                sourceAspect = sourceAspect,
-                sourcePanscan = sourcePanscan,
-                targetAspect = targetAspect,
-                targetPanscan = targetPanscan,
-                reconfigFrameFloor = Long.MAX_VALUE,
-            )
-        } else {
-            null
-        }
-
-        videoAspect = targetAspect
-        videoPixelWidth = pixelSize?.first ?: 0
-        videoPixelHeight = pixelSize?.second ?: 0
-        panscan = targetPanscan
-        zoomRenderSurfaceMode = null
-        normalSurfacePrepared = true
-        if (aspectMenuTransition == null) {
-            renderedVideoAspect = targetAspect
-            renderedPanscan = targetPanscan
-        }
-
-        if (isZoomed() || scaleDetector.isInProgress)
-            clampTranslationToVideoContent()
-
-        updateRenderSurfaceForCurrentState(force = true)
-        applyToView()
-    }
-
-    fun surfaceFrameSerialSnapshot(): Long = surfaceFrameSerial
-
-    fun onVideoReconfig(
-        aspect: Double?,
-        panscanValue: Double?,
-        reconfigFrameFloor: Long,
-    ) {
-        val transition = aspectMenuTransition ?: return
-        val actualAspect = aspect ?: 0.0
-        val actualPanscan = panscanValue ?: 0.0
-        if (!aspectValuesMatch(actualAspect, transition.targetAspect) ||
-            abs(actualPanscan - transition.targetPanscan) > ASPECT_TRANSITION_PANSCAN_EPS
-        ) return
-
-        aspectMenuTransition = transition.copy(reconfigFrameFloor = reconfigFrameFloor)
-        if (surfaceFrameSerial > reconfigFrameFloor)
-            completeAspectMenuTransitionIfReady()
-    }
-
-    private fun completeAspectMenuTransitionIfReady(): Boolean {
-        val transition = aspectMenuTransition ?: return false
-        if (transition.reconfigFrameFloor == Long.MAX_VALUE ||
-            surfaceFrameSerial <= transition.reconfigFrameFloor
-        ) return false
-
-        renderedVideoAspect = transition.targetAspect
-        renderedPanscan = transition.targetPanscan
-        aspectMenuTransition = null
-        clampTranslationToVideoContent()
-        applyToView()
-        return true
-    }
-
-    private fun aspectValuesMatch(a: Double, b: Double): Boolean {
-        if (a <= 0.001 || b <= 0.001)
-            return a <= 0.001 && b <= 0.001
-        return abs(a - b) <= ASPECT_TRANSITION_ASPECT_EPS
+        setVideoGeometry(
+            aspect = aspect,
+            pixelSize = pixelSize,
+            panscanValue = panscanValue,
+            prepareNormalSurface = true,
+            immediate = true,
+        )
     }
 
     private fun videoPixelSizeOrNull(): Pair<Int, Int>? {
@@ -354,26 +276,16 @@ internal class VideoZoomGestures(
     fun isZoomed(): Boolean = scale > 1f + EPS
 
     fun onSurfaceTextureFrameAvailable() {
-        surfaceFrameSerial += 1L
         val now = SystemClock.uptimeMillis()
         previousSurfaceFrameUptimeMs = lastSurfaceFrameUptimeMs
         lastSurfaceFrameUptimeMs = now
 
-        var viewNeedsApply = false
-        val completedMode = surfaceModeTransitionInFlight
-        if (completedMode != null) {
-            displayedRenderSurfaceMode = completedMode
-            surfaceModeTransitionInFlight = null
-            viewNeedsApply = true
-        }
+        val completedMode = surfaceModeTransitionInFlight ?: return
 
-        if (completeAspectMenuTransitionIfReady())
-            viewNeedsApply = false
-
-        if (viewNeedsApply) {
-            clampTranslationToVideoContent()
-            applyToView()
-        }
+        displayedRenderSurfaceMode = completedMode
+        surfaceModeTransitionInFlight = null
+        clampTranslationToVideoContent()
+        applyToView()
 
         if (queuedRenderSurfaceUpdate) {
             queuedRenderSurfaceUpdate = false
@@ -404,10 +316,6 @@ internal class VideoZoomGestures(
         previousSurfaceFrameUptimeMs = Long.MIN_VALUE
         lastSurfaceFrameUptimeMs = Long.MIN_VALUE
         zoomRenderSurfaceMode = null
-        renderedVideoAspect = 0.0
-        renderedPanscan = 0.0
-        aspectMenuTransition = null
-        surfaceFrameSerial = 0L
         commitHiddenBaseRenderSurfaceMode()
         requestBaseRenderSurfaceSize(force = true)
         applyToView()
@@ -689,21 +597,16 @@ internal class VideoZoomGestures(
     }
 
     /** Compute the content/video rect within the view at base scale. */
-    private fun contentRect(): ContentRect = contentRectFor(videoAspect, panscan)
-
-    private fun renderedContentRect(): ContentRect =
-        contentRectFor(renderedVideoAspect, renderedPanscan)
-
-    private fun contentRectFor(aspect: Double, panscanValue: Double): ContentRect {
+    private fun contentRect(): ContentRect {
         val w = viewWidth
         val h = viewHeight
         if (w <= 1f || h <= 1f)
             return ContentRect(0f, 0f, w, h)
 
-        if (panscanValue > EPS.toDouble())
+        if (isPanscanActive())
             return ContentRect(0f, 0f, w, h)
 
-        val ar = if (aspect > 0.001) aspect.toFloat() else (w / h)
+        val ar = if (videoAspect > 0.001) videoAspect.toFloat() else (w / h)
         val viewAr = w / h
         val cw: Float
         val ch: Float
@@ -752,27 +655,20 @@ internal class VideoZoomGestures(
 
     private fun applyToView() {
         val fit = renderSurfaceFitTransform()
-        val predictive = predictiveAspectTransform()
-        val composedScaleX = predictive.scaleX * fit.scaleX
-        val composedScaleY = predictive.scaleY * fit.scaleY
-        val composedTranslationX =
-            predictive.translationX + predictive.scaleX * fit.translationX
-        val composedTranslationY =
-            predictive.translationY + predictive.scaleY * fit.translationY
 
         target.pivotX = 0f
         target.pivotY = 0f
-        target.scaleX = scale * composedScaleX
-        target.scaleY = scale * composedScaleY
-        target.translationX = (tx + scale * composedTranslationX).toFloat()
-        target.translationY = (ty + scale * composedTranslationY).toFloat()
+        target.scaleX = scale * fit.scaleX
+        target.scaleY = scale * fit.scaleY
+        target.translationX = (tx + scale * fit.translationX).toFloat()
+        target.translationY = (ty + scale * fit.translationY).toFloat()
     }
 
     private fun renderSurfaceFitTransform(): SurfaceFitTransform {
         if (!displayedRenderSurfaceMode.usesMediaAspectFit || viewWidth <= 1f || viewHeight <= 1f)
             return SurfaceFitTransform.IDENTITY
 
-        val c = renderedContentRect()
+        val c = contentRect()
         if (c.w <= 1f || c.h <= 1f)
             return SurfaceFitTransform.IDENTITY
 
@@ -781,26 +677,6 @@ internal class VideoZoomGestures(
             scaleY = c.h / viewHeight,
             translationX = c.ox.toDouble(),
             translationY = c.oy.toDouble(),
-        )
-    }
-
-    private fun predictiveAspectTransform(): SurfaceFitTransform {
-        val transition = aspectMenuTransition ?: return SurfaceFitTransform.IDENTITY
-        if (viewWidth <= 1f || viewHeight <= 1f)
-            return SurfaceFitTransform.IDENTITY
-
-        val source = contentRectFor(transition.sourceAspect, transition.sourcePanscan)
-        val destination = contentRectFor(transition.targetAspect, transition.targetPanscan)
-        if (source.w <= 1f || source.h <= 1f || destination.w <= 1f || destination.h <= 1f)
-            return SurfaceFitTransform.IDENTITY
-
-        val scaleX = destination.w / source.w
-        val scaleY = destination.h / source.h
-        return SurfaceFitTransform(
-            scaleX = scaleX,
-            scaleY = scaleY,
-            translationX = destination.ox.toDouble() - scaleX * source.ox.toDouble(),
-            translationY = destination.oy.toDouble() - scaleY * source.oy.toDouble(),
         )
     }
 
@@ -1055,13 +931,6 @@ internal class VideoZoomGestures(
     private fun lerp(a: Float, b: Float, t: Float): Float = a + (b - a) * t
 
     private data class ContentRect(val ox: Float, val oy: Float, val w: Float, val h: Float)
-    private data class AspectMenuTransition(
-        val sourceAspect: Double,
-        val sourcePanscan: Double,
-        val targetAspect: Double,
-        val targetPanscan: Double,
-        val reconfigFrameFloor: Long,
-    )
     private data class SurfaceFitTransform(
         val scaleX: Float,
         val scaleY: Float,
@@ -1166,8 +1035,6 @@ internal class VideoZoomGestures(
         private const val CONTINUOUS_SURFACE_FRAME_MAX_AGE_MS = 250L
         private const val MAX_RENDER_SURFACE_EDGE = 8192.0
         private const val MAX_RENDER_SURFACE_PIXELS = MAX_RENDER_SURFACE_EDGE * MAX_RENDER_SURFACE_EDGE
-        private const val ASPECT_TRANSITION_ASPECT_EPS = 0.001
-        private const val ASPECT_TRANSITION_PANSCAN_EPS = 0.001
 
         private const val DEFAULT_FRAME_DT = 1f / 60f
         private const val MIN_FILTER_DT = 1f / 240f
