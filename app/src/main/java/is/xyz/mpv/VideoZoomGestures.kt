@@ -79,6 +79,8 @@ internal class VideoZoomGestures(
     private var displayedRenderSurfaceMode = RenderSurfaceMode.BASE
     private var surfaceModeTransitionInFlight: RenderSurfaceMode? = null
     private var queuedRenderSurfaceUpdate = false
+    private var previousSurfaceFrameUptimeMs = Long.MIN_VALUE
+    private var lastSurfaceFrameUptimeMs = Long.MIN_VALUE
 
     // Tracks whether MPVActivity has completed the initial geometry hand-off.
     // Normal rendering remains on the plain view-sized mpv surface.
@@ -262,6 +264,10 @@ internal class VideoZoomGestures(
     fun isZoomed(): Boolean = scale > 1f + EPS
 
     fun onSurfaceTextureFrameAvailable() {
+        val now = SystemClock.uptimeMillis()
+        previousSurfaceFrameUptimeMs = lastSurfaceFrameUptimeMs
+        lastSurfaceFrameUptimeMs = now
+
         val completedMode = surfaceModeTransitionInFlight ?: return
 
         displayedRenderSurfaceMode = completedMode
@@ -295,6 +301,8 @@ internal class VideoZoomGestures(
         videoPixelHeight = 0
         panscan = 0.0
         normalSurfacePrepared = false
+        previousSurfaceFrameUptimeMs = Long.MIN_VALUE
+        lastSurfaceFrameUptimeMs = Long.MIN_VALUE
         commitHiddenBaseRenderSurfaceMode()
         requestBaseRenderSurfaceSize(force = true)
         applyToView()
@@ -673,10 +681,35 @@ internal class VideoZoomGestures(
             return
         }
 
-        if (zooming)
-            requestMediaAspectOriginalRenderSurfaceSize(force)
-        else
+        if (zooming) {
+            if (shouldKeepViewAspectWhileZooming())
+                requestViewAspectOriginalRenderSurfaceSize(force)
+            else
+                requestMediaAspectOriginalRenderSurfaceSize(force)
+        } else {
             requestBaseRenderSurfaceSize(force)
+        }
+    }
+
+    private fun shouldKeepViewAspectWhileZooming(): Boolean {
+        val currentTrackIsStillImage = try {
+            MPVLib.getPropertyString("current-tracks/video/image")?.equals("yes", ignoreCase = true) == true
+        } catch (_: Throwable) {
+            false
+        }
+
+        if (!currentTrackIsStillImage)
+            return true
+
+        val previous = previousSurfaceFrameUptimeMs
+        val latest = lastSurfaceFrameUptimeMs
+        if (previous == Long.MIN_VALUE || latest == Long.MIN_VALUE)
+            return false
+
+        val frameInterval = latest - previous
+        val frameAge = SystemClock.uptimeMillis() - latest
+        return frameInterval in 1..CONTINUOUS_SURFACE_FRAME_MAX_INTERVAL_MS &&
+            frameAge in 0..CONTINUOUS_SURFACE_FRAME_MAX_AGE_MS
     }
 
     private fun requestBaseRenderSurfaceSize(force: Boolean) {
@@ -976,6 +1009,8 @@ internal class VideoZoomGestures(
         private const val VIEW_ORIENTATION_THRESHOLD = 1.08f
         private const val MEDIA_ASPECT_FALLBACK_WASTE_RATIO = 2.0
         private const val MEDIA_ASPECT_FALLBACK_MAX_EDGE = 8192.0
+        private const val CONTINUOUS_SURFACE_FRAME_MAX_INTERVAL_MS = 250L
+        private const val CONTINUOUS_SURFACE_FRAME_MAX_AGE_MS = 250L
         private const val MAX_RENDER_SURFACE_EDGE = 8192.0
         private const val MAX_RENDER_SURFACE_PIXELS = MAX_RENDER_SURFACE_EDGE * MAX_RENDER_SURFACE_EDGE
 
