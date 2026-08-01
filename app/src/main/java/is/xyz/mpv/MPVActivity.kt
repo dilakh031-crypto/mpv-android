@@ -423,7 +423,10 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
             binding = PlayerBinding.inflate(layoutInflater)
             gestures = TouchGestures(this)
             zoomGestures = VideoZoomGestures(binding.player)
-            binding.player.onSurfaceTextureFrameAvailable = { onPlayerSurfaceFrameAvailable() }
+            binding.player.onSurfaceTextureFrameAvailable = {
+                zoomGestures.onSurfaceTextureFrameAvailable()
+                onPlayerSurfaceFrameAvailable()
+            }
 
             // Do these here and not in MainActivity because mpv can be launched from a file browser.
             Utils.copyAssets(this)
