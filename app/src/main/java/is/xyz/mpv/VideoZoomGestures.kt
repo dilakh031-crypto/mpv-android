@@ -76,15 +76,11 @@ internal class VideoZoomGestures(
         }
     }
 
-    // A synthetic one-pointer stream is supplied to VelocityTracker. For a
-    // one-finger drag the sample is that finger; for multi-touch it is the
-    // centroid, matching the exact point that drives two-finger panning.
+    // A synthetic one-pointer stream is supplied to VelocityTracker for
+    // one-finger dragging. Multi-touch is reserved exclusively for scaling and
+    // never contributes pan velocity.
     private var panVelocityTracker: VelocityTracker? = null
     private var velocityGestureDownTimeMs = 0L
-    private var velocityTrackingStartedAtMs = 0L
-    private var pendingMultiTouchVelocityX = 0f
-    private var pendingMultiTouchVelocityY = 0f
-    private var pendingMultiTouchVelocityTimeMs = Long.MIN_VALUE
 
     // Linear scale factor (1.0 = normal). Translation is stored as Double so large
     // 20x offsets do not lose sub-pixel precision before being sent to the View.
@@ -115,12 +111,6 @@ internal class VideoZoomGestures(
     private var pinchTouchSessionActive = false
     private var lockedPinchFocusX = 0f
     private var lockedPinchFocusY = 0f
-
-    // Moving the midpoint of two (or more) fingers pans the already-zoomed image.
-    // This is tracked separately from the fixed zoom anchor above.
-    private var multiTouchPanActive = false
-    private var lastMultiTouchFocusX = 0f
-    private var lastMultiTouchFocusY = 0f
 
     private var lastTapTime = 0L
     private var lastTapX = 0f
@@ -258,8 +248,8 @@ internal class VideoZoomGestures(
                     return true
 
                 // Keep the zoom focus fixed at the midpoint captured when the
-                // two-finger touch session started. Midpoint movement is handled
-                // separately as an explicit two-finger pan.
+                // two-finger touch session started. Moving both fingers does not
+                // pan the image; multi-touch is reserved exclusively for zoom.
                 // transform: screen = scale * content + translation
                 val fx = lockedPinchFocusX.toDouble()
                 val fy = lockedPinchFocusY.toDouble()
@@ -512,8 +502,17 @@ internal class VideoZoomGestures(
 
             MotionEvent.ACTION_POINTER_DOWN -> {
                 stopFling()
-                clearPendingMultiTouchVelocity()
-                beginOrRebaseMultiTouch(e)
+
+                // Entering multi-touch must completely end the current one-finger
+                // fling candidate. Pinch motion never contributes velocity, and a
+                // drag performed before the second finger arrived must not launch
+                // a fling when the touch session eventually ends.
+                recyclePanVelocityTracker()
+                panMovedDuringTouch = false
+                panFingerDown = false
+                panActive = false
+                canBeTap = false
+                beginPinchTouchSession(e)
             }
         }
 
@@ -534,21 +533,14 @@ internal class VideoZoomGestures(
             return isZoomed() || pendingPinchDoubleTapReset
         }
 
-        if (e.actionMasked == MotionEvent.ACTION_MOVE && e.pointerCount > 1)
-            processMultiTouchPan(e)
-
         // Pointer transitions during pinch:
         // If one finger lifts and another remains down, rebase pan input so there is no jump.
         if (e.actionMasked == MotionEvent.ACTION_POINTER_UP && isZoomed()) {
-            addCurrentMultiTouchVelocitySample(e)
-            capturePendingMultiTouchVelocity(e.eventTime)
             lastTapTime = 0L
             panFingerDown = false
             panActive = false
             canBeTap = false
-            rebaseMultiTouchAfterPointerUp(e)
             val remainingPointerCount = e.pointerCount - 1
-            rebaseVelocityTrackingAfterPointerUp(e)
             if (remainingPointerCount == 1) {
                 val upIdx = e.actionIndex
                 val remainIdx = firstPointerIndexExcept(e, upIdx)
@@ -565,6 +557,13 @@ internal class VideoZoomGestures(
                 downTime = SystemClock.uptimeMillis()
                 resetPanFilters(x, y, downTime)
 
+                // The remaining finger begins a brand-new one-finger drag segment
+                // immediately. Its velocity is measured from this pointer-up
+                // transition, so moving it can fling normally without first lifting
+                // every finger, while all preceding pinch motion remains excluded.
+                panMovedDuringTouch = false
+                rebasePanVelocityTracking(x, y, e.eventTime)
+
                 // Keep the remaining finger as an active one-finger pan.
                 // Previously this stayed false, so the following MOVE events were
                 // consumed while zoomed but ignored until every finger was lifted
@@ -575,20 +574,20 @@ internal class VideoZoomGestures(
         }
 
         if (e.actionMasked == MotionEvent.ACTION_POINTER_UP) {
-            addCurrentMultiTouchVelocitySample(e)
-            capturePendingMultiTouchVelocity(e.eventTime)
-            rebaseMultiTouchAfterPointerUp(e)
-            rebaseVelocityTrackingAfterPointerUp(e)
             return true
         }
 
-        // Multi-touch is consumed here. Scaling is handled by ScaleGestureDetector,
-        // while midpoint movement has already been applied as two-finger pan above.
+        // Multi-touch is consumed here and handled only by ScaleGestureDetector.
+        // It must never translate the image or retain any fling velocity. A new
+        // one-finger velocity stream is created above only after one pointer lifts
+        // and exactly one remains on the screen.
         if (e.pointerCount > 1 || scaleDetector.isInProgress) {
             lastTapTime = 0L
             panFingerDown = false
             panActive = false
+            panMovedDuringTouch = false
             canBeTap = false
+            recyclePanVelocityTracker()
             return true
         }
 
@@ -641,7 +640,7 @@ internal class VideoZoomGestures(
                 val wasTap = canBeTap && moveDist < touchSlop && (now - downTime) < DOUBLE_TAP_TIMEOUT
 
                 addPanVelocitySample(e.x, e.y, e.eventTime, MotionEvent.ACTION_UP)
-                val releaseVelocity = releasePanVelocity(e.eventTime)
+                val releaseVelocity = releasePanVelocity()
 
                 panFingerDown = false
                 panActive = false
@@ -686,7 +685,7 @@ internal class VideoZoomGestures(
         return true
     }
 
-    private fun beginOrRebaseMultiTouch(e: MotionEvent) {
+    private fun beginPinchTouchSession(e: MotionEvent) {
         val focus = pointerCentroid(e) ?: return
 
         if (!pinchTouchSessionActive) {
@@ -694,85 +693,19 @@ internal class VideoZoomGestures(
             lockedPinchFocusX = focus.x
             lockedPinchFocusY = focus.y
         }
-
-        multiTouchPanActive = focus.count >= 2
-        lastMultiTouchFocusX = focus.x
-        lastMultiTouchFocusY = focus.y
-        rebasePanVelocityTracking(focus.x, focus.y, e.eventTime)
-    }
-
-    private fun processMultiTouchPan(e: MotionEvent) {
-        for (historyIndex in 0 until e.historySize) {
-            val historicalFocus = historicalPointerCentroid(e, historyIndex) ?: continue
-            processMultiTouchPanSample(
-                historicalFocus,
-                e.getHistoricalEventTime(historyIndex),
-            )
-        }
-
-        val focus = pointerCentroid(e) ?: return
-        processMultiTouchPanSample(focus, e.eventTime)
-    }
-
-    private fun processMultiTouchPanSample(focus: PointerCentroid, timeMs: Long) {
-        if (focus.count < 2)
-            return
-
-        addPanVelocitySample(focus.x, focus.y, timeMs)
-
-        if (!multiTouchPanActive) {
-            multiTouchPanActive = true
-            lastMultiTouchFocusX = focus.x
-            lastMultiTouchFocusY = focus.y
-            return
-        }
-
-        val dx = focus.x - lastMultiTouchFocusX
-        val dy = focus.y - lastMultiTouchFocusY
-        lastMultiTouchFocusX = focus.x
-        lastMultiTouchFocusY = focus.y
-
-        if ((!isZoomed() && !scaleDetector.isInProgress) || (dx == 0f && dy == 0f))
-            return
-
-        tx += dx.toDouble()
-        ty += dy.toDouble()
-        panMovedDuringTouch = true
-        clampTranslationToVideoContent()
-        scheduleApply()
-    }
-
-    private fun rebaseMultiTouchAfterPointerUp(e: MotionEvent) {
-        val focus = pointerCentroid(e, excludedPointerIndex = e.actionIndex)
-        if (focus == null || focus.count < 2) {
-            multiTouchPanActive = false
-            return
-        }
-
-        multiTouchPanActive = true
-        lastMultiTouchFocusX = focus.x
-        lastMultiTouchFocusY = focus.y
     }
 
     private fun endPinchTouchSession() {
         pinchTouchSessionActive = false
-        multiTouchPanActive = false
         lockedPinchFocusX = 0f
         lockedPinchFocusY = 0f
-        lastMultiTouchFocusX = 0f
-        lastMultiTouchFocusY = 0f
     }
 
-    private fun pointerCentroid(
-        e: MotionEvent,
-        excludedPointerIndex: Int = -1,
-    ): PointerCentroid? {
+    private fun pointerCentroid(e: MotionEvent): PointerCentroid? {
         var sumX = 0f
         var sumY = 0f
         var count = 0
         for (i in 0 until e.pointerCount) {
-            if (i == excludedPointerIndex)
-                continue
             sumX += e.getX(i)
             sumY += e.getY(i)
             count++
@@ -780,25 +713,7 @@ internal class VideoZoomGestures(
 
         if (count == 0)
             return null
-        return PointerCentroid(sumX / count, sumY / count, count)
-    }
-
-    private fun historicalPointerCentroid(
-        e: MotionEvent,
-        historyIndex: Int,
-    ): PointerCentroid? {
-        var sumX = 0f
-        var sumY = 0f
-        var count = 0
-        for (pointerIndex in 0 until e.pointerCount) {
-            sumX += e.getHistoricalX(pointerIndex, historyIndex)
-            sumY += e.getHistoricalY(pointerIndex, historyIndex)
-            count++
-        }
-
-        if (count == 0)
-            return null
-        return PointerCentroid(sumX / count, sumY / count, count)
+        return PointerCentroid(sumX / count, sumY / count)
     }
 
     private fun firstPointerIndexExcept(e: MotionEvent, excludedPointerIndex: Int): Int {
@@ -866,8 +781,6 @@ internal class VideoZoomGestures(
         recyclePanVelocityTracker()
         panVelocityTracker = VelocityTracker.obtain()
         velocityGestureDownTimeMs = timeMs
-        velocityTrackingStartedAtMs = timeMs
-        clearPendingMultiTouchVelocity()
         addPanVelocitySample(x, y, timeMs, MotionEvent.ACTION_DOWN)
     }
 
@@ -877,19 +790,7 @@ internal class VideoZoomGestures(
         }
         tracker.clear()
         velocityGestureDownTimeMs = timeMs
-        velocityTrackingStartedAtMs = timeMs
         addPanVelocitySample(x, y, timeMs, MotionEvent.ACTION_DOWN)
-    }
-
-    private fun rebaseVelocityTrackingAfterPointerUp(e: MotionEvent) {
-        val focus = pointerCentroid(e, excludedPointerIndex = e.actionIndex) ?: return
-        rebasePanVelocityTracking(focus.x, focus.y, e.eventTime)
-    }
-
-    private fun addCurrentMultiTouchVelocitySample(e: MotionEvent) {
-        val focus = pointerCentroid(e) ?: return
-        if (focus.count >= 2)
-            addPanVelocitySample(focus.x, focus.y, e.eventTime)
     }
 
     private fun addPanVelocitySample(
@@ -921,49 +822,12 @@ internal class VideoZoomGestures(
         )
     }
 
-    private fun capturePendingMultiTouchVelocity(timeMs: Long) {
-        val velocity = currentPanVelocity()
-        pendingMultiTouchVelocityX = velocity.x
-        pendingMultiTouchVelocityY = velocity.y
-        pendingMultiTouchVelocityTimeMs = timeMs
-    }
-
-    private fun releasePanVelocity(eventTimeMs: Long): PanVelocity {
-        val current = currentPanVelocity()
-        val trackingAge = eventTimeMs - velocityTrackingStartedAtMs
-        val pendingAge = eventTimeMs - pendingMultiTouchVelocityTimeMs
-        val pendingIsFresh = pendingMultiTouchVelocityTimeMs != Long.MIN_VALUE &&
-            pendingAge in 0..MULTI_TOUCH_RELEASE_VELOCITY_GRACE_MS
-        val currentSpeed = hypot(current.x, current.y)
-
-        // Android reports two-finger release as POINTER_UP followed by ACTION_UP.
-        // If those arrive back-to-back, the rebased final-finger tracker has too
-        // little history, so retain the centroid velocity measured just before
-        // the first finger lifted. A held or subsequently moved remaining finger
-        // naturally ages this fallback out.
-        return if (
-            pendingIsFresh &&
-            trackingAge <= MULTI_TOUCH_RELEASE_VELOCITY_GRACE_MS &&
-            currentSpeed < minimumFlingVelocity
-        ) {
-            PanVelocity(pendingMultiTouchVelocityX, pendingMultiTouchVelocityY)
-        } else {
-            current
-        }
-    }
-
-    private fun clearPendingMultiTouchVelocity() {
-        pendingMultiTouchVelocityX = 0f
-        pendingMultiTouchVelocityY = 0f
-        pendingMultiTouchVelocityTimeMs = Long.MIN_VALUE
-    }
+    private fun releasePanVelocity(): PanVelocity = currentPanVelocity()
 
     private fun recyclePanVelocityTracker() {
         panVelocityTracker?.recycle()
         panVelocityTracker = null
         velocityGestureDownTimeMs = 0L
-        velocityTrackingStartedAtMs = 0L
-        clearPendingMultiTouchVelocity()
     }
 
     private fun startFling(rawVelocityX: Float, rawVelocityY: Float) {
@@ -1424,7 +1288,7 @@ internal class VideoZoomGestures(
     private fun lerp(a: Float, b: Float, t: Float): Float = a + (b - a) * t
 
     private data class ContentRect(val ox: Float, val oy: Float, val w: Float, val h: Float)
-    private data class PointerCentroid(val x: Float, val y: Float, val count: Int)
+    private data class PointerCentroid(val x: Float, val y: Float)
     private data class PanVelocity(val x: Float, val y: Float) {
         companion object {
             val ZERO = PanVelocity(0f, 0f)
@@ -1532,7 +1396,6 @@ internal class VideoZoomGestures(
         private const val MAX_SCALE = 20f
         private const val PINCH_DOUBLE_TAP_RESET_SCALE = 1.001f
         private const val DOUBLE_TAP_TIMEOUT = 300L
-        private const val MULTI_TOUCH_RELEASE_VELOCITY_GRACE_MS = 80L
         private const val VELOCITY_POINTER_ID = 0
         private const val MEDIA_ORIENTATION_THRESHOLD = 1.08
         private const val VIEW_ORIENTATION_THRESHOLD = 1.08f
