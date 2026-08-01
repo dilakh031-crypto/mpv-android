@@ -17,7 +17,6 @@ extern "C" {
 #include "log.h"
 #include "jni_utils.h"
 #include "event.h"
-#include "render_bridge.h"
 
 #define ARRAYLEN(a) (sizeof(a)/sizeof(a[0]))
 
@@ -85,14 +84,11 @@ jni_func(void, destroy) {
         return;
     }
 
-    // Stop Java/event callbacks before shutting down the renderer. Otherwise a
-    // late START_FILE event could enqueue render state after its thread was joined.
+    // poke event thread and wait for it to exit
     g_event_thread_request_exit = true;
     mpv_wakeup(g_mpv);
     pthread_join(event_thread_id, NULL);
 
-    // The Render API context must still be freed before the mpv core itself.
-    render_api_shutdown();
     mpv_terminate_destroy(g_mpv);
     g_mpv = NULL;
 }
