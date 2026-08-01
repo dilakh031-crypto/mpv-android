@@ -707,9 +707,7 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
         } catch (_: Throwable) {}
     }
 
-    private fun prepareZoomSurfaceAndRevealWhenReady(
-        geometryAlreadySynced: Boolean = false,
-    ) {
+    private fun prepareZoomSurfaceAndRevealWhenReady() {
         if (!::zoomGestures.isInitialized)
             return
 
@@ -718,12 +716,11 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
         if (!hasDisplayableVideoGeometry())
             return
 
-        // Property observers already synchronize geometry before entering here.
-        // Avoid doing the same JNI reads and surface decision twice for every
-        // aspect/panscan notification. Startup and VIDEO_RECONFIG callers still
-        // use the default path and perform the synchronization here.
-        if (!geometryAlreadySynced)
-            syncZoomVideoGeometry(prepareNormalSurface = true, immediate = true)
+        // Pull all geometry at once while the blackout is still covering mpv.
+        // The blackout is removed only after TextureView reports a real frame
+        // update with this geometry, which avoids revealing a stale fullscreen
+        // or old-aspect buffer on heavy images/videos.
+        syncZoomVideoGeometry(prepareNormalSurface = true, immediate = true)
         try { zoomGestures.prepareForVisibleMedia() } catch (_: Throwable) {}
         armVideoGeometryBlackoutReveal()
     }
@@ -2928,20 +2925,6 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
             setSingleChoiceItems(names, selectedIndex) { _, item ->
                 val ratio = ratios[item]
                 val targetPanscan = if (ratio == "panscan") 1.0 else 0.0
-                val targetOverride = if (ratio == "panscan") "-1" else ratio
-                val currentPanscanAtClick = MPVLib.getPropertyDouble("panscan") ?: 0.0
-                val currentOverrideAtClick =
-                    MPVLib.getPropertyString("video-aspect-override")?.trim() ?: ""
-                val overrideNeedsChange =
-                    !aspectRatioMatches(currentOverrideAtClick, targetOverride)
-                val panscanNeedsChange =
-                    abs(currentPanscanAtClick - targetPanscan) >= ASPECT_PROPERTY_EPS
-
-                // Selecting the already active item must not trigger a new mpv
-                // reconfiguration or rewrite watch-later state.
-                if (!overrideNeedsChange && !panscanNeedsChange)
-                    return@setSingleChoiceItems
-
                 val targetAspect = if (ratio == "panscan") {
                     try { player.getVideoAspect() } catch (_: Throwable) { null }
                 } else {
@@ -2949,10 +2932,9 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
                 }
                 val targetPixelSize = try { player.getVideoPixelSize() } catch (_: Throwable) { null }
 
-                // Keep the stable pre-existing prediction path. The zoom helper now
-                // avoids recreating the BASE surface when normal-size geometry alone
-                // changes, so this update is cheap and cannot introduce an extra
-                // aspect-transition state.
+                // Menu selections are the only transition where we already know the
+                // requested geometry. Apply it before asking mpv to redraw so the
+                // user never sees the temporary fullscreen/base layout.
                 if (::zoomGestures.isInitialized) {
                     try {
                         zoomGestures.applyPredictedAspectMenuGeometry(
@@ -2970,12 +2952,13 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
                         syncZoomVideoGeometry(prepareNormalSurface = true, immediate = true)
                 }, ASPECT_MENU_PREDICTIVE_SYNC_GRACE_MS + 20L)
 
-                // Preserve the original property order, but skip properties that are
-                // already at the requested value. This avoids redundant mpv reconfigs.
-                if (overrideNeedsChange)
-                    player.setFileLocalString("video-aspect-override", targetOverride)
-                if (panscanNeedsChange)
-                    player.setFileLocalDouble("panscan", targetPanscan)
+                if (ratio == "panscan") {
+                    player.setFileLocalString("video-aspect-override", "-1")
+                    player.setFileLocalDouble("panscan", 1.0)
+                } else {
+                    player.setFileLocalString("video-aspect-override", ratio)
+                    player.setFileLocalDouble("panscan", 0.0)
+                }
                 player.persistCurrentFileState()
                 // Keep dialog open (apply-in-place).
             }
@@ -3561,7 +3544,7 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
             "playlist-pos", "playlist-count" -> updatePlaylistButtons()
             "video-params/w", "video-params/h" -> {
                 syncZoomVideoGeometry()
-                prepareZoomSurfaceAndRevealWhenReady(geometryAlreadySynced = true)
+                prepareZoomSurfaceAndRevealWhenReady()
             }
         }
     }
@@ -3574,11 +3557,11 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
                 updateOrientation()
                 updatePiPParams()
                 syncZoomVideoGeometry()
-                prepareZoomSurfaceAndRevealWhenReady(geometryAlreadySynced = true)
+                prepareZoomSurfaceAndRevealWhenReady()
             }
             "panscan" -> {
                 syncZoomVideoGeometry()
-                prepareZoomSurfaceAndRevealWhenReady(geometryAlreadySynced = true)
+                prepareZoomSurfaceAndRevealWhenReady()
             }
         }
     }
@@ -3589,7 +3572,7 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
             "speed" -> updateSpeedButton()
             "video-aspect-override" -> {
                 syncZoomVideoGeometry()
-                prepareZoomSurfaceAndRevealWhenReady(geometryAlreadySynced = true)
+                prepareZoomSurfaceAndRevealWhenReady()
             }
         }
         if (metaUpdated)
@@ -4085,7 +4068,6 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
         // Predictive aspect-menu geometry is held briefly so asynchronous mpv
         // property notifications cannot momentarily restore an intermediate state.
         private const val ASPECT_MENU_PREDICTIVE_SYNC_GRACE_MS = 120L
-        private const val ASPECT_PROPERTY_EPS = 0.0001
 
         // Tap timing (must match TouchGestures.TAP_DURATION).
         // - Double-tap gestures: fast window (ms)

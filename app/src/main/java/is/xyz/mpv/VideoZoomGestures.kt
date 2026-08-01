@@ -17,13 +17,21 @@ import kotlin.math.sqrt
 /**
  * Pinch-to-zoom + pan for mpv output.
  *
- * Rendering behavior:
- *  - At normal scale, mpv renders into a view-sized surface exactly like the
- *    original mpv-android SurfaceView path. mpv therefore owns the final scaling
- *    to the display and all configured scaler/shader options remain effective.
- *  - While zooming, the backing surface is enlarged to retain source detail and
- *    the TextureView is transformed for interactive pinch/pan.
- *  - New-file and window-exit transitions return to the plain view-sized surface.
+ * Important quality detail:
+ *  - Unzoomed view uses a display-sized mpv-rendered compact surface, so mpv,
+ *    not Android's TextureView compositor, performs the huge downscale. This
+ *    avoids moire / false-color artifacts on high-frequency scans at 720p.
+ *  - After the first mpv frame is ready, the unzoomed view is prepared with the
+ *    same media-aspect fit that will be used while zoomed. At normal size it
+ *    uses only a display-sized compact buffer; when the user starts zooming it
+ *    upgrades the same geometry to an original-detail buffer.
+ *  - New-file and window-exit transitions are forced back to the plain mpv/base
+ *    surface so Android never animates a transformed TextureView while entering
+ *    or leaving the player.
+ *  - Because the geometry does not switch at zoom start/end, Android never shows
+ *    the one-frame shrink/stretch tear. Because the zoom buffer has no oversized
+ *    black bars, it keeps full source detail in both matching and opposite
+ *    phone/media orientations.
  *
  * We do not use mpv video-pan/video-zoom for finger movement.
  */
@@ -82,19 +90,22 @@ internal class VideoZoomGestures(
     private var previousSurfaceFrameUptimeMs = Long.MIN_VALUE
     private var lastSurfaceFrameUptimeMs = Long.MIN_VALUE
 
-    // The zoom backing-surface policy is invariant for one zoom session. Resolve it
-    // once at the transition boundary instead of querying mpv from every pinch MOVE.
-    private var zoomRenderSurfaceMode: RenderSurfaceMode? = null
-
-    // Tracks whether MPVActivity has completed the initial geometry hand-off.
-    // Normal rendering remains on the plain view-sized mpv surface.
-    private var normalSurfacePrepared = false
+    // Keep the startup/exit window transitions on the plain mpv surface. Once
+    // MPVActivity has a stable first frame hidden behind the startup preview, it
+    // enables the compact normal surface so zoom can start/stop without a tear.
+    private var normalCompactSurfacePrepared = false
 
     // When a pinch returns close enough to normal size, finish it through the
     // same delayed reset path as double-tap. Calling reset() directly from
     // onScaleEnd still sees ScaleGestureDetector as in-progress on some devices,
     // which keeps the original-detail Android surface selected for that frame.
     private var pendingPinchDoubleTapReset = false
+
+    // A pinch needs the original-detail surface as soon as the first real scale
+    // sample arrives. Once that request has been issued, later MOVE samples only
+    // change the View transform; repeating the same mpv/Surface decision cannot
+    // change the output and only adds work on heavy continuously playing videos.
+    private var zoomSurfaceActivatedForCurrentPinch = false
 
     // Coalesce view property updates to vsync. We do not animate here; we only avoid
     // writing View properties multiple times in one display frame.
@@ -112,13 +123,18 @@ internal class VideoZoomGestures(
             override fun onScaleBegin(detector: ScaleGestureDetector): Boolean {
                 lastTapTime = 0L
                 pendingPinchDoubleTapReset = false
+                zoomSurfaceActivatedForCurrentPinch = false
                 panActive = false
                 canBeTap = false
 
                 // Switch to the original-detail buffer before the first visible zoom step.
-                // If initial geometry preparation was skipped, mark it complete now.
-                normalSurfacePrepared = true
-                updateRenderSurfaceForCurrentState(force = false)
+                // If the first-frame preparation was skipped (for example, a remote file
+                // without startup preview), arm the compact normal geometry now as a fallback.
+                normalCompactSurfacePrepared = true
+                updateRenderSurfaceForCurrentState(force = true)
+                zoomSurfaceActivatedForCurrentPinch =
+                    requestedRenderSurfaceMode != RenderSurfaceMode.BASE ||
+                    surfaceModeTransitionInFlight != null
                 applyToView()
 
                 resetPanFilters(detector.focusX, detector.focusY, SystemClock.uptimeMillis())
@@ -159,6 +175,10 @@ internal class VideoZoomGestures(
 
                 clampTranslationToVideoContent()
                 resetPanFilters(detector.focusX, detector.focusY, SystemClock.uptimeMillis())
+                if (!zoomSurfaceActivatedForCurrentPinch) {
+                    updateRenderSurfaceForCurrentState(force = false)
+                    zoomSurfaceActivatedForCurrentPinch = true
+                }
                 scheduleApply()
                 return true
             }
@@ -169,8 +189,9 @@ internal class VideoZoomGestures(
                     resetLikeDoubleTapAfterPinch()
                 } else {
                     resetPanFilters(detector.focusX, detector.focusY, SystemClock.uptimeMillis())
-                    updateRenderSurfaceForCurrentState(force = false)
+                    updateRenderSurfaceForCurrentState(force = true)
                 }
+                zoomSurfaceActivatedForCurrentPinch = false
             }
         }
     )
@@ -230,23 +251,14 @@ internal class VideoZoomGestures(
         videoPixelWidth = pixelSize?.first ?: 0
         videoPixelHeight = pixelSize?.second ?: 0
         panscan = panscanValue ?: 0.0
-        zoomRenderSurfaceMode = null
 
         if (prepareNormalSurface)
-            normalSurfacePrepared = true
+            normalCompactSurfacePrepared = true
 
-        val zooming = isZoomed() || scaleDetector.isInProgress
-        if (zooming)
+        if (isZoomed() || scaleDetector.isInProgress)
             clampTranslationToVideoContent()
 
-        // Normal rendering always uses the view-sized BASE surface, regardless of
-        // video aspect. Property notifications for one aspect-menu selection can
-        // arrive several times; forcing BASE again for each one recreates the
-        // SurfaceTexture buffer and makes heavy media redraw unnecessarily.
-        // While zoomed, geometry does affect the high-detail surface, so retain the
-        // forced refresh there. At normal scale, request BASE only if it is not
-        // already the requested mode.
-        updateRenderSurfaceForCurrentState(force = zooming)
+        updateRenderSurfaceForCurrentState(force = true)
         if (immediate)
             applyToView()
         else
@@ -289,7 +301,7 @@ internal class VideoZoomGestures(
 
         if (queuedRenderSurfaceUpdate) {
             queuedRenderSurfaceUpdate = false
-            target.post { updateRenderSurfaceForCurrentState(force = true) }
+            updateRenderSurfaceForCurrentState(force = true)
         }
     }
 
@@ -300,8 +312,10 @@ internal class VideoZoomGestures(
     fun reset() {
         resetTransformState()
 
-        // Return normal display to mpv's view-sized output surface so mpv performs
-        // the final scaling with the user's configured rendering pipeline.
+        // Critical for scan quality: after returning to normal size, do not keep
+        // the original-resolution texture and let Android minify it. Return to
+        // the prepared compact normal surface so the next zoom starts from the
+        // same geometry, without a start/end tear.
         updateRenderSurfaceForCurrentState(force = true)
         applyToView()
     }
@@ -312,30 +326,29 @@ internal class VideoZoomGestures(
         videoPixelWidth = 0
         videoPixelHeight = 0
         panscan = 0.0
-        normalSurfacePrepared = false
+        normalCompactSurfacePrepared = false
         previousSurfaceFrameUptimeMs = Long.MIN_VALUE
         lastSurfaceFrameUptimeMs = Long.MIN_VALUE
-        zoomRenderSurfaceMode = null
-        commitHiddenBaseRenderSurfaceMode()
         requestBaseRenderSurfaceSize(force = true)
+        commitHiddenBaseRenderSurfaceMode()
         applyToView()
     }
 
     fun prepareForVisibleMedia() {
-        if (normalSurfacePrepared)
+        if (normalCompactSurfacePrepared)
             return
 
-        normalSurfacePrepared = true
+        normalCompactSurfacePrepared = true
         updateRenderSurfaceForCurrentState(force = true)
         applyToView()
     }
 
     fun prepareForWindowExit() {
         resetTransformState()
-        normalSurfacePrepared = false
+        normalCompactSurfacePrepared = false
         target.alpha = 0f
-        commitHiddenBaseRenderSurfaceMode()
         requestBaseRenderSurfaceSize(force = true)
+        commitHiddenBaseRenderSurfaceMode()
         applyToView()
     }
 
@@ -360,7 +373,7 @@ internal class VideoZoomGestures(
         canBeTap = false
         lastTapTime = 0L
         pendingPinchDoubleTapReset = false
-        zoomRenderSurfaceMode = null
+        zoomSurfaceActivatedForCurrentPinch = false
         resetPanFilters(0f, 0f, SystemClock.uptimeMillis())
         target.alpha = 1f
     }
@@ -682,35 +695,33 @@ internal class VideoZoomGestures(
 
     private fun updateRenderSurfaceForCurrentState(force: Boolean) {
         val zooming = isZoomed() || scaleDetector.isInProgress
-        if (!zooming) {
-            zoomRenderSurfaceMode = null
-            requestBaseRenderSurfaceSize(force)
+
+        if (surfaceModeTransitionInFlight != null) {
+            if (force || requestedRenderSurfaceMode.usesMediaAspectFit != zooming)
+                queuedRenderSurfaceUpdate = true
             return
         }
 
-        val mode = zoomRenderSurfaceMode ?: selectZoomRenderSurfaceMode().also {
-            zoomRenderSurfaceMode = it
-        }
-        when (mode) {
-            RenderSurfaceMode.VIEW_ASPECT_ORIGINAL ->
+        if (isPanscanActive()) {
+            // panscan needs a view-shaped mpv output window. A media-aspect surface
+            // has no letterbox area for mpv to crop into, so panscan would appear
+            // identical to the original aspect. While zoomed, keep source detail by
+            // using the same high-resolution sizing strategy on the view-shaped window.
+            if (zooming)
                 requestViewAspectOriginalRenderSurfaceSize(force)
-            RenderSurfaceMode.MEDIA_ASPECT_ORIGINAL ->
-                requestMediaAspectOriginalRenderSurfaceSize(force)
-            RenderSurfaceMode.BASE ->
+            else
                 requestBaseRenderSurfaceSize(force)
+            return
         }
-    }
 
-    private fun selectZoomRenderSurfaceMode(): RenderSurfaceMode {
-        // panscan needs a view-shaped mpv output window. A media-aspect surface has
-        // no letterbox area for mpv to crop into.
-        if (isPanscanActive())
-            return RenderSurfaceMode.VIEW_ASPECT_ORIGINAL
-
-        return if (shouldKeepViewAspectWhileZooming())
-            RenderSurfaceMode.VIEW_ASPECT_ORIGINAL
-        else
-            RenderSurfaceMode.MEDIA_ASPECT_ORIGINAL
+        if (zooming) {
+            if (shouldKeepViewAspectWhileZooming())
+                requestViewAspectOriginalRenderSurfaceSize(force)
+            else
+                requestMediaAspectOriginalRenderSurfaceSize(force)
+        } else {
+            requestBaseRenderSurfaceSize(force)
+        }
     }
 
     private fun shouldKeepViewAspectWhileZooming(): Boolean {
@@ -736,8 +747,6 @@ internal class VideoZoomGestures(
 
     private fun requestBaseRenderSurfaceSize(force: Boolean) {
         val player = renderTarget ?: return
-        if (shouldDeferRenderSurfaceRequest(RenderSurfaceMode.BASE, force))
-            return
         if (!force && requestedRenderSurfaceMode == RenderSurfaceMode.BASE)
             return
 
@@ -749,8 +758,6 @@ internal class VideoZoomGestures(
         val player = renderTarget ?: return
         refreshMetricsFromTarget()
 
-        if (shouldDeferRenderSurfaceRequest(RenderSurfaceMode.VIEW_ASPECT_ORIGINAL, force))
-            return
         if (!force && requestedRenderSurfaceMode == RenderSurfaceMode.VIEW_ASPECT_ORIGINAL)
             return
 
@@ -784,8 +791,6 @@ internal class VideoZoomGestures(
         val player = renderTarget ?: return
         refreshMetricsFromTarget()
 
-        if (shouldDeferRenderSurfaceRequest(RenderSurfaceMode.MEDIA_ASPECT_ORIGINAL, force))
-            return
         if (!force && requestedRenderSurfaceMode == RenderSurfaceMode.MEDIA_ASPECT_ORIGINAL)
             return
 
@@ -815,16 +820,6 @@ internal class VideoZoomGestures(
         val bufferHeight = ceilToIntAtLeastOne(c.h.toDouble() * bufferScale)
         player.setRenderSurfaceSize(bufferWidth, bufferHeight)
         markRenderSurfaceModeRequested(RenderSurfaceMode.MEDIA_ASPECT_ORIGINAL)
-    }
-
-    private fun shouldDeferRenderSurfaceRequest(
-        mode: RenderSurfaceMode,
-        force: Boolean,
-    ): Boolean {
-        val inFlight = surfaceModeTransitionInFlight ?: return false
-        if (force || mode != inFlight)
-            queuedRenderSurfaceUpdate = true
-        return true
     }
 
     private fun markRenderSurfaceModeRequested(mode: RenderSurfaceMode) {
