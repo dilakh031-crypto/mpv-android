@@ -17,21 +17,13 @@ import kotlin.math.sqrt
 /**
  * Pinch-to-zoom + pan for mpv output.
  *
- * Important quality detail:
- *  - Unzoomed view uses a display-sized mpv-rendered compact surface, so mpv,
- *    not Android's TextureView compositor, performs the huge downscale. This
- *    avoids moire / false-color artifacts on high-frequency scans at 720p.
- *  - After the first mpv frame is ready, the unzoomed view is prepared with the
- *    same media-aspect fit that will be used while zoomed. At normal size it
- *    uses only a display-sized compact buffer; when the user starts zooming it
- *    upgrades the same geometry to an original-detail buffer.
- *  - New-file and window-exit transitions are forced back to the plain mpv/base
- *    surface so Android never animates a transformed TextureView while entering
- *    or leaving the player.
- *  - Because the geometry does not switch at zoom start/end, Android never shows
- *    the one-frame shrink/stretch tear. Because the zoom buffer has no oversized
- *    black bars, it keeps full source detail in both matching and opposite
- *    phone/media orientations.
+ * Rendering behavior:
+ *  - At normal scale, mpv renders into a view-sized surface exactly like the
+ *    original mpv-android SurfaceView path. mpv therefore owns the final scaling
+ *    to the display and all configured scaler/shader options remain effective.
+ *  - While zooming, the backing surface is enlarged to retain source detail and
+ *    the TextureView is transformed for interactive pinch/pan.
+ *  - New-file and window-exit transitions return to the plain view-sized surface.
  *
  * We do not use mpv video-pan/video-zoom for finger movement.
  */
@@ -82,10 +74,9 @@ internal class VideoZoomGestures(
 
     private var renderSurfaceMode = RenderSurfaceMode.BASE
 
-    // Keep the startup/exit window transitions on the plain mpv surface. Once
-    // MPVActivity has a stable first frame hidden behind the startup preview, it
-    // enables the compact normal surface so zoom can start/stop without a tear.
-    private var normalCompactSurfacePrepared = false
+    // Tracks whether MPVActivity has completed the initial geometry hand-off.
+    // Normal rendering remains on the plain view-sized mpv surface.
+    private var normalSurfacePrepared = false
 
     // When a pinch returns close enough to normal size, finish it through the
     // same delayed reset path as double-tap. Calling reset() directly from
@@ -113,9 +104,8 @@ internal class VideoZoomGestures(
                 canBeTap = false
 
                 // Switch to the original-detail buffer before the first visible zoom step.
-                // If the first-frame preparation was skipped (for example, a remote file
-                // without startup preview), arm the compact normal geometry now as a fallback.
-                normalCompactSurfacePrepared = true
+                // If initial geometry preparation was skipped, mark it complete now.
+                normalSurfacePrepared = true
                 updateRenderSurfaceForCurrentState(force = true)
                 applyToView()
 
@@ -231,7 +221,7 @@ internal class VideoZoomGestures(
         panscan = panscanValue ?: 0.0
 
         if (prepareNormalSurface)
-            normalCompactSurfacePrepared = true
+            normalSurfacePrepared = true
 
         if (isZoomed() || scaleDetector.isInProgress)
             clampTranslationToVideoContent()
@@ -265,9 +255,6 @@ internal class VideoZoomGestures(
 
     fun isZoomed(): Boolean = scale > 1f + EPS
 
-    fun isUsingBaseRenderSurface(): Boolean =
-        renderSurfaceMode == RenderSurfaceMode.BASE && !isZoomed() && !scaleDetector.isInProgress
-
     fun shouldBlockOtherGestures(e: MotionEvent): Boolean {
         return isZoomed() || pendingPinchDoubleTapReset || scaleDetector.isInProgress || e.pointerCount > 1
     }
@@ -275,10 +262,8 @@ internal class VideoZoomGestures(
     fun reset() {
         resetTransformState()
 
-        // Critical for scan quality: after returning to normal size, do not keep
-        // the original-resolution texture and let Android minify it. Return to
-        // the prepared compact normal surface so the next zoom starts from the
-        // same geometry, without a start/end tear.
+        // Return normal display to mpv's view-sized output surface so mpv performs
+        // the final scaling with the user's configured rendering pipeline.
         updateRenderSurfaceForCurrentState(force = true)
         applyToView()
     }
@@ -289,23 +274,23 @@ internal class VideoZoomGestures(
         videoPixelWidth = 0
         videoPixelHeight = 0
         panscan = 0.0
-        normalCompactSurfacePrepared = false
+        normalSurfacePrepared = false
         requestBaseRenderSurfaceSize(force = true)
         applyToView()
     }
 
     fun prepareForVisibleMedia() {
-        if (normalCompactSurfacePrepared)
+        if (normalSurfacePrepared)
             return
 
-        normalCompactSurfacePrepared = true
+        normalSurfacePrepared = true
         updateRenderSurfaceForCurrentState(force = true)
         applyToView()
     }
 
     fun prepareForWindowExit() {
         resetTransformState()
-        normalCompactSurfacePrepared = false
+        normalSurfacePrepared = false
         target.alpha = 0f
         requestBaseRenderSurfaceSize(force = true)
         applyToView()
@@ -659,10 +644,6 @@ internal class VideoZoomGestures(
             return
         }
 
-        // Keep the same effective-aspect fit in every orientation. The only thing
-        // that changes at zoom start/end is the backing buffer resolution, not
-        // the on-screen rectangle, so there is no transient aspect jump. The aspect
-        // can come from mpv.conf / video-aspect-override, not only from the file.
         if (zooming)
             requestMediaAspectOriginalRenderSurfaceSize(force)
         else

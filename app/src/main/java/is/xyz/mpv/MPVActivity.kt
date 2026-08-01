@@ -694,25 +694,6 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
         syncZoomVideoGeometry(prepareNormalSurface = true, immediate = true)
         try { zoomGestures.prepareForVisibleMedia() } catch (_: Throwable) {}
         armVideoGeometryBlackoutReveal()
-
-        val baseSurface = try { zoomGestures.isUsingBaseRenderSurface() } catch (_: Throwable) { false }
-        if (baseSurface) {
-            val generation = videoGeometryBlackoutGeneration
-            ViewCompat.postOnAnimation(binding.player) {
-                val stillUsingBaseSurface =
-                    try { zoomGestures.isUsingBaseRenderSurface() } catch (_: Throwable) { false }
-                if (videoGeometryBlackoutActive &&
-                    videoGeometryBlackoutRevealArmed &&
-                    generation == videoGeometryBlackoutGeneration &&
-                    videoGeometryBlackoutFileLoadedSeen &&
-                    hasDisplayableVideoGeometry() &&
-                    stillUsingBaseSurface
-                ) {
-                    videoGeometryBlackoutRevealArmed = false
-                    setVideoGeometryBlackout(false)
-                }
-            }
-        }
     }
 
     private fun prepareZoomSurfaceForWindowExit() {
