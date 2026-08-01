@@ -82,6 +82,10 @@ internal class VideoZoomGestures(
     private var previousSurfaceFrameUptimeMs = Long.MIN_VALUE
     private var lastSurfaceFrameUptimeMs = Long.MIN_VALUE
 
+    // The zoom backing-surface policy is invariant for one zoom session. Resolve it
+    // once at the transition boundary instead of querying mpv from every pinch MOVE.
+    private var zoomRenderSurfaceMode: RenderSurfaceMode? = null
+
     // Tracks whether MPVActivity has completed the initial geometry hand-off.
     // Normal rendering remains on the plain view-sized mpv surface.
     private var normalSurfacePrepared = false
@@ -114,7 +118,7 @@ internal class VideoZoomGestures(
                 // Switch to the original-detail buffer before the first visible zoom step.
                 // If initial geometry preparation was skipped, mark it complete now.
                 normalSurfacePrepared = true
-                updateRenderSurfaceForCurrentState(force = true)
+                updateRenderSurfaceForCurrentState(force = false)
                 applyToView()
 
                 resetPanFilters(detector.focusX, detector.focusY, SystemClock.uptimeMillis())
@@ -155,7 +159,6 @@ internal class VideoZoomGestures(
 
                 clampTranslationToVideoContent()
                 resetPanFilters(detector.focusX, detector.focusY, SystemClock.uptimeMillis())
-                updateRenderSurfaceForCurrentState(force = false)
                 scheduleApply()
                 return true
             }
@@ -166,7 +169,7 @@ internal class VideoZoomGestures(
                     resetLikeDoubleTapAfterPinch()
                 } else {
                     resetPanFilters(detector.focusX, detector.focusY, SystemClock.uptimeMillis())
-                    updateRenderSurfaceForCurrentState(force = true)
+                    updateRenderSurfaceForCurrentState(force = false)
                 }
             }
         }
@@ -227,6 +230,7 @@ internal class VideoZoomGestures(
         videoPixelWidth = pixelSize?.first ?: 0
         videoPixelHeight = pixelSize?.second ?: 0
         panscan = panscanValue ?: 0.0
+        zoomRenderSurfaceMode = null
 
         if (prepareNormalSurface)
             normalSurfacePrepared = true
@@ -303,6 +307,7 @@ internal class VideoZoomGestures(
         normalSurfacePrepared = false
         previousSurfaceFrameUptimeMs = Long.MIN_VALUE
         lastSurfaceFrameUptimeMs = Long.MIN_VALUE
+        zoomRenderSurfaceMode = null
         commitHiddenBaseRenderSurfaceMode()
         requestBaseRenderSurfaceSize(force = true)
         applyToView()
@@ -347,6 +352,7 @@ internal class VideoZoomGestures(
         canBeTap = false
         lastTapTime = 0L
         pendingPinchDoubleTapReset = false
+        zoomRenderSurfaceMode = null
         resetPanFilters(0f, 0f, SystemClock.uptimeMillis())
         target.alpha = 1f
     }
@@ -668,27 +674,35 @@ internal class VideoZoomGestures(
 
     private fun updateRenderSurfaceForCurrentState(force: Boolean) {
         val zooming = isZoomed() || scaleDetector.isInProgress
-
-        if (isPanscanActive()) {
-            // panscan needs a view-shaped mpv output window. A media-aspect surface
-            // has no letterbox area for mpv to crop into, so panscan would appear
-            // identical to the original aspect. While zoomed, keep source detail by
-            // using the same high-resolution sizing strategy on the view-shaped window.
-            if (zooming)
-                requestViewAspectOriginalRenderSurfaceSize(force)
-            else
-                requestBaseRenderSurfaceSize(force)
+        if (!zooming) {
+            zoomRenderSurfaceMode = null
+            requestBaseRenderSurfaceSize(force)
             return
         }
 
-        if (zooming) {
-            if (shouldKeepViewAspectWhileZooming())
-                requestViewAspectOriginalRenderSurfaceSize(force)
-            else
-                requestMediaAspectOriginalRenderSurfaceSize(force)
-        } else {
-            requestBaseRenderSurfaceSize(force)
+        val mode = zoomRenderSurfaceMode ?: selectZoomRenderSurfaceMode().also {
+            zoomRenderSurfaceMode = it
         }
+        when (mode) {
+            RenderSurfaceMode.VIEW_ASPECT_ORIGINAL ->
+                requestViewAspectOriginalRenderSurfaceSize(force)
+            RenderSurfaceMode.MEDIA_ASPECT_ORIGINAL ->
+                requestMediaAspectOriginalRenderSurfaceSize(force)
+            RenderSurfaceMode.BASE ->
+                requestBaseRenderSurfaceSize(force)
+        }
+    }
+
+    private fun selectZoomRenderSurfaceMode(): RenderSurfaceMode {
+        // panscan needs a view-shaped mpv output window. A media-aspect surface has
+        // no letterbox area for mpv to crop into.
+        if (isPanscanActive())
+            return RenderSurfaceMode.VIEW_ASPECT_ORIGINAL
+
+        return if (shouldKeepViewAspectWhileZooming())
+            RenderSurfaceMode.VIEW_ASPECT_ORIGINAL
+        else
+            RenderSurfaceMode.MEDIA_ASPECT_ORIGINAL
     }
 
     private fun shouldKeepViewAspectWhileZooming(): Boolean {
