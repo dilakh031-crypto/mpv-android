@@ -17,6 +17,7 @@ extern "C" {
 #include "log.h"
 #include "jni_utils.h"
 #include "event.h"
+#include "render_bridge.h"
 
 #define ARRAYLEN(a) (sizeof(a)/sizeof(a[0]))
 
@@ -26,7 +27,6 @@ extern "C" {
     jni_func(void, destroy);
 
     jni_func(void, command, jobjectArray jarray);
-    jni_func(jint, commandString, jstring jcommand);
     jni_func(jint, commandAsync, jobjectArray jarray, jlong userdata);
     jni_func(void, abortAsyncCommand, jlong userdata);
 };
@@ -85,11 +85,14 @@ jni_func(void, destroy) {
         return;
     }
 
-    // poke event thread and wait for it to exit
+    // Stop Java/event callbacks before shutting down the renderer. Otherwise a
+    // late START_FILE event could enqueue render state after its thread was joined.
     g_event_thread_request_exit = true;
     mpv_wakeup(g_mpv);
     pthread_join(event_thread_id, NULL);
 
+    // The Render API context must still be freed before the mpv core itself.
+    render_api_shutdown();
     mpv_terminate_destroy(g_mpv);
     g_mpv = NULL;
 }
@@ -109,18 +112,6 @@ jni_func(void, command, jobjectArray jarray) {
 
     for (int i = 0; i < len; ++i)
         env->ReleaseStringUTFChars((jstring)env->GetObjectArrayElement(jarray, i), arguments[i]);
-}
-
-jni_func(jint, commandString, jstring jcommand) {
-    CHECK_MPV_INIT();
-
-    const char *command = env->GetStringUTFChars(jcommand, NULL);
-    if (!command)
-        return MPV_ERROR_NOMEM;
-
-    int err = mpv_command_string(g_mpv, command);
-    env->ReleaseStringUTFChars(jcommand, command);
-    return err;
 }
 
 jni_func(jint, commandAsync, jobjectArray jarray, jlong userdata) {
