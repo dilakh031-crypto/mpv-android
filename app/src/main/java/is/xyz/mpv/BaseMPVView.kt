@@ -7,72 +7,71 @@ import android.util.Log
 import android.view.Surface
 import android.view.TextureView
 
-// Contains only the essential code needed to get a picture on the screen.
+// Contains only the essential code needed to get a picture on the screen
 
-abstract class BaseMPVView(context: Context, attrs: AttributeSet) :
-    TextureView(context, attrs), TextureView.SurfaceTextureListener {
-
+abstract class BaseMPVView(context: Context, attrs: AttributeSet) : TextureView(context, attrs), TextureView.SurfaceTextureListener {
     init {
+        // TextureView is part of the normal View hierarchy. This makes high-zoom
+        // scale/translation much smoother than transforming a SurfaceView layer,
+        // especially on older Android devices where SurfaceView composition is
+        // quantized by SurfaceFlinger/HWC.
         isOpaque = true
     }
 
-    /** Initialize libmpv. Call this once before the view is shown. */
+    /**
+     * Initialize libmpv.
+     *
+     * Call this once before the view is shown.
+     */
     fun initialize(configDir: String, cacheDir: String) {
         MPVLib.create(context)
 
+        /* set normal options (user-supplied config can override) */
         MPVLib.setOptionString("config", "yes")
         MPVLib.setOptionString("config-dir", configDir)
         for (opt in arrayOf("gpu-shader-cache-dir", "icc-cache-dir"))
             MPVLib.setOptionString(opt, cacheDir)
         initOptions()
-        MPVLib.setOptionString("vo", RENDER_API_VO)
-        // The Render API context is created only after TextureView supplies its
-        // Surface. Prevent mpv.conf from creating a VO during mpv_initialize().
-        MPVLib.setOptionString("force-window", "no")
 
         MPVLib.init()
 
+        /* set hardcoded options */
         postInitOptions()
-        // mpv.conf is loaded during initialization and may contain its own VO.
-        // Reassert libmpv before any file can start so the Render API remains the
-        // sole owner of video output.
-        MPVLib.setPropertyString("vo", RENDER_API_VO)
-        MPVLib.setPropertyString("force-window", "no")
+        // could mess up VO init before surfaceCreated() is called
+        MPVLib.setOptionString("force-window", "no")
+        // need to idle at least once for playFile() logic to work
         MPVLib.setOptionString("idle", "once")
 
         surfaceTextureListener = this
-        if (isAvailable)
+        if (isAvailable) {
             surfaceTexture?.let { attachSurfaceTexture(it, width, height) }
+        }
         observeProperties()
     }
 
-    /** Deinitialize libmpv. Call this once before the view is destroyed. */
+    /**
+     * Deinitialize libmpv.
+     *
+     * Call this once before the view is destroyed.
+     */
     fun destroy() {
+        // Disable texture callbacks to avoid using uninitialized mpv state.
         surfaceTextureListener = null
         detachSurfaceTexture()
+
         MPVLib.destroy()
     }
 
     protected abstract fun initOptions()
     protected abstract fun postInitOptions()
+
     protected abstract fun observeProperties()
 
     private var filePath: String? = null
-    private var attachedSurface: Surface? = null
-    private var attachRetryCount = 0
-
-    var onSurfaceTextureFrameAvailable: (() -> Unit)? = null
 
     /**
-     * Keep the existing preference entry point, but the embedded Render API must
-     * always use vo=libmpv. The selected gpu/gpu-next value cannot own a second
-     * Android window while this renderer is active.
+     * Set the first file to be played once the player is ready.
      */
-    fun setVo(@Suppress("UNUSED_PARAMETER") vo: String) {
-        MPVLib.setOptionString("vo", RENDER_API_VO)
-    }
-
-    /** Set the first file to be played once the render context is ready. */
     fun playFile(filePath: String) {
         if (attachedSurface != null) {
             MPVLib.command(arrayOf("loadfile", filePath))
@@ -82,98 +81,128 @@ abstract class BaseMPVView(context: Context, attrs: AttributeSet) :
         }
     }
 
+    private var voInUse: String = "gpu"
+
     /**
-     * Update the two off-screen mpv targets and the final on-screen rectangle.
-     * The TextureView/Android surface itself always stays at the window size.
+     * Sets the VO to use.
+     * It is automatically disabled/enabled when the surface dis-/appears.
      */
-    fun setRenderState(
-        normalWidth: Int,
-        normalHeight: Int,
-        detailWidth: Int,
-        detailHeight: Int,
-        useDetail: Boolean,
-        left: Float,
-        top: Float,
-        right: Float,
-        bottom: Float,
-    ): Long {
-        return MPVLib.setRenderState(
-            normalWidth.coerceAtLeast(1),
-            normalHeight.coerceAtLeast(1),
-            detailWidth.coerceAtLeast(1),
-            detailHeight.coerceAtLeast(1),
-            useDetail,
-            left,
-            top,
-            right,
-            bottom,
-        )
+    fun setVo(vo: String) {
+        voInUse = vo
+        MPVLib.setOptionString("vo", vo)
     }
 
+    private var attachedSurface: Surface? = null
+    private var attachedTexture: SurfaceTexture? = null
 
-    fun getPresentedRenderStateSerial(): Long = MPVLib.getPresentedRenderStateSerial()
+    private var renderSurfaceWidth = 0
+    private var renderSurfaceHeight = 0
+    private var customRenderSurfaceSize = false
 
-    /** Invalidate retained FBO pixels before mpv starts decoding a new file. */
-    fun beginNewMediaRenderState(): Long = MPVLib.beginNewMediaRenderState()
+    var onSurfaceTextureFrameAvailable: (() -> Unit)? = null
+
+    /**
+     * Set the real SurfaceTexture buffer size used by mpv without changing the
+     * TextureView's on-screen size.
+     *
+     * This intentionally accepts the requested size as-is. The caller decides the
+     * size, so high-resolution media can be rendered at its original resolution
+     * instead of being reduced to the display resolution before Android zooms it.
+     */
+    fun setRenderSurfaceSize(width: Int, height: Int) {
+        val safeWidth = width.coerceAtLeast(1)
+        val safeHeight = height.coerceAtLeast(1)
+        customRenderSurfaceSize = true
+
+        if (safeWidth == renderSurfaceWidth && safeHeight == renderSurfaceHeight)
+            return
+
+        renderSurfaceWidth = safeWidth
+        renderSurfaceHeight = safeHeight
+        applyRenderSurfaceSize()
+    }
+
+    fun resetRenderSurfaceSize() {
+        customRenderSurfaceSize = false
+        val safeWidth = width.coerceAtLeast(1)
+        val safeHeight = height.coerceAtLeast(1)
+
+        if (safeWidth == renderSurfaceWidth && safeHeight == renderSurfaceHeight)
+            return
+
+        renderSurfaceWidth = safeWidth
+        renderSurfaceHeight = safeHeight
+        applyRenderSurfaceSize()
+    }
+
+    private fun ensureRenderSurfaceSize(width: Int, height: Int) {
+        if (customRenderSurfaceSize)
+            return
+
+        renderSurfaceWidth = width.coerceAtLeast(1)
+        renderSurfaceHeight = height.coerceAtLeast(1)
+    }
+
+    private fun applyRenderSurfaceSize() {
+        val texture = attachedTexture ?: return
+        if (renderSurfaceWidth <= 0 || renderSurfaceHeight <= 0)
+            return
+
+        texture.setDefaultBufferSize(renderSurfaceWidth, renderSurfaceHeight)
+        MPVLib.setPropertyString("android-surface-size", "${renderSurfaceWidth}x${renderSurfaceHeight}")
+    }
 
     private fun attachSurfaceTexture(texture: SurfaceTexture, width: Int, height: Int) {
-        if (attachedSurface != null || width <= 0 || height <= 0)
+        if (attachedSurface != null)
             return
 
-        MPVLib.setRenderState(
-            width, height, width, height, false,
-            0f, 0f, width.toFloat(), height.toFloat(),
-        )
+        attachedTexture = texture
+        ensureRenderSurfaceSize(width, height)
+        texture.setDefaultBufferSize(renderSurfaceWidth, renderSurfaceHeight)
+
+        Log.w(TAG, "attaching texture surface ${renderSurfaceWidth}x${renderSurfaceHeight}")
         val surface = Surface(texture)
-        Log.w(TAG, "attaching Render API surface ${width}x${height}")
-        val attached = MPVLib.attachSurface(surface, width, height)
-        if (!attached) {
-            Log.e(TAG, "failed to attach Render API surface")
-            surface.release()
-            scheduleAttachRetry(texture)
-            return
-        }
-
-        attachRetryCount = 0
         attachedSurface = surface
-        filePath?.let {
-            MPVLib.command(arrayOf("loadfile", it))
+
+        MPVLib.attachSurface(surface)
+        MPVLib.setPropertyString("android-surface-size", "${renderSurfaceWidth}x${renderSurfaceHeight}")
+        // This forces mpv to render subs/osd/whatever into our surface even if it would ordinarily not
+        MPVLib.setOptionString("force-window", "yes")
+
+        if (filePath != null) {
+            MPVLib.command(arrayOf("loadfile", filePath as String))
             filePath = null
+        } else {
+            // We disable video output when the context disappears, enable it back
+            MPVLib.setPropertyString("vo", voInUse)
         }
-    }
-
-
-    private fun scheduleAttachRetry(texture: SurfaceTexture) {
-        if (attachRetryCount >= MAX_ATTACH_RETRIES)
-            return
-        val attempt = ++attachRetryCount
-        postDelayed({
-            if (
-                attachedSurface == null &&
-                surfaceTextureListener === this &&
-                isAvailable &&
-                surfaceTexture === texture
-            ) {
-                attachSurfaceTexture(texture, width, height)
-            }
-        }, ATTACH_RETRY_DELAY_MS * attempt)
     }
 
     private fun detachSurfaceTexture() {
         val surface = attachedSurface ?: return
-        Log.w(TAG, "detaching Render API surface")
+
+        Log.w(TAG, "detaching texture surface")
+        MPVLib.setPropertyString("vo", "null")
+        MPVLib.setPropertyString("force-window", "no")
+        // Note that before calling detachSurface() we need to be sure that libmpv
+        // is done using the surface.
+        // FIXME: There could be a race condition here, because I don't think
+        // setting a property will wait for VO deinit.
         MPVLib.detachSurface()
         surface.release()
         attachedSurface = null
+        attachedTexture = null
     }
+
+    // Texture callbacks
 
     override fun onSurfaceTextureAvailable(surface: SurfaceTexture, width: Int, height: Int) {
         attachSurfaceTexture(surface, width, height)
     }
 
     override fun onSurfaceTextureSizeChanged(surface: SurfaceTexture, width: Int, height: Int) {
-        if (attachedSurface != null && width > 0 && height > 0)
-            MPVLib.resizeSurface(width, height)
+        ensureRenderSurfaceSize(width, height)
+        applyRenderSurfaceSize()
     }
 
     override fun onSurfaceTextureDestroyed(surface: SurfaceTexture): Boolean {
@@ -187,8 +216,5 @@ abstract class BaseMPVView(context: Context, attrs: AttributeSet) :
 
     companion object {
         private const val TAG = "mpv"
-        private const val RENDER_API_VO = "libmpv"
-        private const val MAX_ATTACH_RETRIES = 3
-        private const val ATTACH_RETRY_DELAY_MS = 100L
     }
 }
