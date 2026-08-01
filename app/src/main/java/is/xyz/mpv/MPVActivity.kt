@@ -175,7 +175,15 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
     private var videoGeometryBlackoutActive = true
     private var videoGeometryBlackoutGeneration = 0
     private var videoGeometryBlackoutRevealArmed = false
+    private var videoGeometryBlackoutRevealPosted = false
     private var videoGeometryBlackoutFileLoadedSeen = false
+
+    @Volatile
+    private var playerSurfaceFrameSerial = 0L
+
+    @Volatile
+    private var fileLoadedSurfaceFrameFloor = Long.MAX_VALUE
+
     private var suppressAspectMenuGeometrySyncUntilMs = 0L
 
     private val psc = Utils.PlaybackStateCache()
@@ -424,6 +432,7 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
             gestures = TouchGestures(this)
             zoomGestures = VideoZoomGestures(binding.player)
             binding.player.onSurfaceTextureFrameAvailable = {
+                playerSurfaceFrameSerial += 1L
                 zoomGestures.onSurfaceTextureFrameAvailable()
                 onPlayerSurfaceFrameAvailable()
             }
@@ -599,7 +608,10 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
         if (visible) {
             videoGeometryBlackoutGeneration += 1
             videoGeometryBlackoutRevealArmed = false
+            videoGeometryBlackoutRevealPosted = false
             videoGeometryBlackoutFileLoadedSeen = false
+        } else {
+            videoGeometryBlackoutRevealPosted = false
         }
         videoGeometryBlackoutActive = visible
         if (!::binding.isInitialized || !uiInitialized)
@@ -616,9 +628,10 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
     }
 
     private fun armVideoGeometryBlackoutReveal() {
-        if (!videoGeometryBlackoutActive || videoGeometryBlackoutRevealArmed)
+        if (!videoGeometryBlackoutActive)
             return
         videoGeometryBlackoutRevealArmed = true
+        revealVideoGeometryBlackoutIfReady()
     }
 
     private fun onPlayerSurfaceFrameAvailable() {
@@ -627,19 +640,32 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
             return
         }
 
-        if (!videoGeometryBlackoutActive || !videoGeometryBlackoutRevealArmed)
-            return
-        if (videoGeometryBlackoutActive && !videoGeometryBlackoutFileLoadedSeen)
-            return
-        if (!hasDisplayableVideoGeometry())
-            return
+        revealVideoGeometryBlackoutIfReady()
+    }
 
+    private fun hasSurfaceFrameForLoadedFile(): Boolean {
+        val floor = fileLoadedSurfaceFrameFloor
+        return floor != Long.MAX_VALUE && playerSurfaceFrameSerial > floor
+    }
+
+    private fun revealVideoGeometryBlackoutIfReady() {
+        if (!videoGeometryBlackoutActive ||
+            !videoGeometryBlackoutRevealArmed ||
+            videoGeometryBlackoutRevealPosted ||
+            !videoGeometryBlackoutFileLoadedSeen ||
+            !hasSurfaceFrameForLoadedFile() ||
+            !hasDisplayableVideoGeometry()
+        ) return
+
+        videoGeometryBlackoutRevealPosted = true
         val generation = videoGeometryBlackoutGeneration
         ViewCompat.postOnAnimation(binding.player) {
+            videoGeometryBlackoutRevealPosted = false
             if (videoGeometryBlackoutActive &&
                 videoGeometryBlackoutRevealArmed &&
                 generation == videoGeometryBlackoutGeneration &&
                 videoGeometryBlackoutFileLoadedSeen &&
+                hasSurfaceFrameForLoadedFile() &&
                 hasDisplayableVideoGeometry()
             ) {
                 videoGeometryBlackoutRevealArmed = false
@@ -3683,6 +3709,12 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
         }
 
         if (eventId == MpvEvent.MPV_EVENT_FILE_LOADED) {
+            // FILE_LOADED is delivered on mpv's event thread. Capture the current
+            // TextureView frame serial here, before posting work to the UI thread.
+            // A static image can publish its only frame while that UI work is still
+            // queued; that frame must remain eligible to remove the blackout.
+            fileLoadedSurfaceFrameFloor = playerSurfaceFrameSerial
+
             currentWatchLaterPath = MPVLib.getPropertyString("path")
             completedWatchLaterPath = null
             val persistFileState = fileStatePersistenceEnabled()
@@ -3726,6 +3758,11 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
         }
 
         if (eventId == MpvEvent.MPV_EVENT_START_FILE) {
+            // Invalidate any frame accepted for the previous playlist entry before
+            // the UI-thread blackout reset is posted. This keeps old frames from
+            // satisfying the next file's reveal condition.
+            fileLoadedSurfaceFrameFloor = Long.MAX_VALUE
+
             currentWatchLaterPath = null
             completedWatchLaterPath = null
             // Reset any view-level zoom/pan when a new file starts.
