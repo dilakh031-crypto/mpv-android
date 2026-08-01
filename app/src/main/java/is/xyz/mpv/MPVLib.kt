@@ -97,6 +97,14 @@ object MPVLib {
     }
 
     @JvmStatic
+    fun eventCommandReply(userdata: Long, error: Int) {
+        synchronized(observers) {
+            for (o in observers)
+                o.eventCommandReply(userdata, error)
+        }
+    }
+
+    @JvmStatic
     fun event(eventId: Int) {
         synchronized(observers) {
             for (o in observers)
@@ -142,6 +150,7 @@ object MPVLib {
         fun eventProperty(property: String, value: Boolean)
         fun eventProperty(property: String, value: String)
         fun eventProperty(property: String, value: Double)
+        fun eventCommandReply(userdata: Long, error: Int) {}
         fun event(eventId: Int)
         fun eventEndFile(reachedEof: Boolean) {
             event(MpvEvent.MPV_EVENT_END_FILE)

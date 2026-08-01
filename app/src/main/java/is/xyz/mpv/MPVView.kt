@@ -361,6 +361,8 @@ internal class MPVView(context: Context, attrs: AttributeSet) : BaseMPVView(cont
         data class Property(val name: String, val format: Int = MPV_FORMAT_NONE)
         val p = arrayOf(
             Property("time-pos", MPV_FORMAT_INT64),
+            // Seek state changes rarely and is used by the exact-scrub controller.
+            Property("seeking", MPV_FORMAT_FLAG),
             Property("duration/full", MPV_FORMAT_DOUBLE),
             Property("pause", MPV_FORMAT_FLAG),
             Property("paused-for-cache", MPV_FORMAT_FLAG),
