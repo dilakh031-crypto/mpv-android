@@ -372,6 +372,13 @@ internal class VideoZoomGestures(
 
     fun isZoomed(): Boolean = scale > 1f + EPS
 
+    /**
+     * True while the image is still coasting after a one-finger pan release.
+     * A tap that begins in this state is used only to stop the fling and must
+     * not also be interpreted by the Activity as a controls-toggle tap.
+     */
+    fun isFlingInProgress(): Boolean = !panScroller.isFinished || flingFramePosted
+
     fun onSurfaceTextureFrameAvailable() {
         val now = SystemClock.uptimeMillis()
         previousSurfaceFrameUptimeMs = lastSurfaceFrameUptimeMs

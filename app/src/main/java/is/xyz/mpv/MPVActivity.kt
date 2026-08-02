@@ -1440,12 +1440,18 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
         // actually confirms and handles a double-tap (see onPropertyChange for PlayPause/SeekFixed/Custom).
         when (ev.actionMasked) {
             MotionEvent.ACTION_DOWN -> {
+                // Read this before the event reaches VideoZoomGestures, because its ACTION_DOWN
+                // handler immediately stops the fling. The touch that interrupts a coasting image
+                // is consumed only for stopping that motion; it must not also toggle controls on UP.
+                val stoppingZoomFling = ::zoomGestures.isInitialized &&
+                    zoomGestures.isFlingInProgress()
+
                 // Zoom mode uses double-tap to reset zoom (handled by VideoZoomGestures), not TouchGestures.
                 // Cancel any pending single-tap toggle from the previous tap so the UI won't flash/appear.
                 if (::zoomGestures.isInitialized && zoomGestures.shouldBlockOtherGestures(ev)) {
                     cancelPendingTapToggle()
                 }
-                mightWantToToggleControls = true
+                mightWantToToggleControls = !stoppingZoomFling
                 tapDownX = ev.x
                 tapDownY = ev.y
 
