@@ -206,9 +206,9 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
         override fun onProgressChanged(seekBar: SeekBar, progress: Int, fromUser: Boolean) {
             if (!fromUser) return
 
-            // Keep the original whole-second seek behavior: integer division makes the value
-            // shown to the user exactly the same value sent to mpv.
-            val targetSec = (progress / SEEK_BAR_PRECISION).toDouble()
+            // SeekBar progress is the authoritative whole-second target. The same value is
+            // displayed to the user and sent to mpv as an absolute exact seek.
+            val targetSec = progress.toDouble()
             val previousTarget = pendingSeekbarSeekPos
             val targetChanged = previousTarget == null || !sameSeekTarget(previousTarget, targetSec)
             pendingSeekbarSeekPos = targetSec
@@ -235,7 +235,7 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
             userIsOperatingSeekbar = true
             seekbarScrubActive = true
             invalidateSeekbarStableTargetCheck()
-            initialSeekbarPosSec = seekBar.progress / SEEK_BAR_PRECISION
+            initialSeekbarPosSec = seekBar.progress
             pendingSeekbarSeekPos = null
             lastIssuedSeekbarSeekPos = null
 
@@ -3168,7 +3168,7 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
                 Utils.prettyTime(-diff, true)
         }
         if (!userIsOperatingSeekbar)
-            binding.playbackSeekbar.progress = position * SEEK_BAR_PRECISION
+            binding.playbackSeekbar.progress = position
 
         // Note: do NOT add other update functions here just because this is called every second.
         // Use property observation instead.
@@ -3179,7 +3179,7 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
         if (!useTimeRemaining)
             binding.playbackDurationTxt.text = Utils.prettyTime(duration)
         if (!userIsOperatingSeekbar)
-            binding.playbackSeekbar.max = duration * SEEK_BAR_PRECISION
+            binding.playbackSeekbar.max = duration
     }
 
     private fun updatePlaybackStatus(paused: Boolean) {
@@ -3739,8 +3739,8 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
 
     override fun eventProperty(property: String, value: Double) {
         // A double time-pos preserves the fraction that INT64 used to truncate. Dispatch UI and
-        // media-session work only when its rounded whole-second value changes, retaining the old
-        // once-per-second update cost while keeping the displayed time consistent after seeking.
+        // media-session work only when its rounded whole-second value changes, retaining
+        // once-per-second downstream updates while keeping displayed time consistent after seeking.
         val previousPositionSec = if (property == "time-pos") {
             if (psc.position < 0L) null else psc.positionSec
         } else {
@@ -4515,10 +4515,6 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
         private const val RESULT_INTENT = "is.xyz.mpv.MPVActivity.result"
         // stream type used with AudioManager
         private const val STREAM_TYPE = AudioManager.STREAM_MUSIC
-        // Preserve the original seekbar granularity. Integer division in the listener keeps
-        // the authoritative exact-seek target on whole seconds.
-        private const val SEEK_BAR_PRECISION = 2
-
         // Use 100% of the original zero-step width and 250% of the original
         // non-zero whole-second step width.
         private const val GESTURE_SEEK_ZERO_HALF_STEP = 0.5f
