@@ -31,10 +31,8 @@
         <item name="android:windowTranslucentNavigation">true</item>
         <item name="android:windowTranslucentStatus">true</item>
         <item name="android:windowLayoutInDisplayCutoutMode">shortEdges</item>
-        <!-- Keep the caller's last frame visible until MPVActivity is ready to draw in the
-             resolved orientation. This is essential for the startup draw gate on Android 9. -->
-        <item name="android:windowDisablePreview">true</item>
         <item name="android:windowBackground">#000000</item>
+        <item name="android:windowDisablePreview">true</item>
     </style>
 
     <!-- theme for preferences -->
