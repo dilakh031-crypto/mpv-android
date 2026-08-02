@@ -3615,7 +3615,6 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
     private fun eventPropertyUi(property: String, value: Long) {
         if (!activityIsForeground) return
         when (property) {
-            "time-pos" -> updatePlaybackPos(psc.positionSec)
             "playlist-pos", "playlist-count" -> {
                 updatePlaylistButtons()
                 prefetchAdjacentPlaylistOrientations()
@@ -3631,6 +3630,7 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
     private fun eventPropertyUi(property: String, value: Double) {
         if (!activityIsForeground) return
         when (property) {
+            "time-pos" -> updatePlaybackPos(psc.positionSec)
             "duration/full" -> updatePlaybackDuration(psc.durationSec)
             "video-params/aspect", "video-params/rotate" -> {
                 updateOrientation()
@@ -3738,10 +3738,22 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
     }
 
     override fun eventProperty(property: String, value: Double) {
-        if (psc.update(property, value))
+        // A double time-pos preserves the fraction that INT64 used to truncate. Dispatch UI and
+        // media-session work only when its rounded whole-second value changes, retaining the old
+        // once-per-second update cost while keeping the displayed time consistent after seeking.
+        val previousPositionSec = if (property == "time-pos") {
+            if (psc.position < 0L) null else psc.positionSec
+        } else {
+            null
+        }
+        val cacheUpdated = psc.update(property, value)
+        val roundedPositionChanged = property != "time-pos" ||
+                (cacheUpdated && (previousPositionSec == null || previousPositionSec != psc.positionSec))
+
+        if (cacheUpdated && roundedPositionChanged)
             updateMediaSession()
 
-        if (!activityIsForeground) return
+        if (!activityIsForeground || !roundedPositionChanged) return
         eventUiHandler.post { eventPropertyUi(property, value) }
     }
 

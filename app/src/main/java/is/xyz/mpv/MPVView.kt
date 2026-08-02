@@ -360,7 +360,9 @@ internal class MPVView(context: Context, attrs: AttributeSet) : BaseMPVView(cont
         // This observes all properties needed by MPVView, MPVActivity or other classes
         data class Property(val name: String, val format: Int = MPV_FORMAT_NONE)
         val p = arrayOf(
-            Property("time-pos", MPV_FORMAT_INT64),
+            // Preserve sub-second precision so the elapsed-time label and seekbar can use
+            // the same whole-second rounding as scrub targets.
+            Property("time-pos", MPV_FORMAT_DOUBLE),
             // Seek state changes rarely and is used by the exact-scrub controller.
             Property("seeking", MPV_FORMAT_FLAG),
             Property("duration/full", MPV_FORMAT_DOUBLE),
