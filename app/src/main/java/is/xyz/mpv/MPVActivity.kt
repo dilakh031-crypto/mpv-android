@@ -24,6 +24,7 @@ import android.media.AudioManager
 import android.net.Uri
 import android.os.*
 import android.preference.PreferenceManager.getDefaultSharedPreferences
+import android.provider.Settings
 import android.support.v4.media.session.MediaSessionCompat
 import android.support.v4.media.session.PlaybackStateCompat
 import android.util.Rational
@@ -3369,10 +3370,40 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
     }
 
     private fun resolveExitConfigurationOrientation(): Int {
+        val entryOrientation =
+            entryConfigOrientation.takeIf(::isConfigurationOrientation)
+
+        // Rotation lock and auto-rotate have deliberately different contracts:
+        //
+        // 1. Auto-rotate OFF / rotation lock ON (ACCELEROMETER_ROTATION == 0): restore
+        //    exactly the app configuration that was visible before the player opened. The physical
+        //    orientation sensor must not participate in this branch. This preserves a locked
+        //    portrait *or* locked landscape browser even though the player temporarily forced
+        //    the opposite family, including Samsung Android 9's mutable user-rotation preference.
+        //
+        // 2. Auto-rotate ON: return to the way the phone is currently being held. The saved entry
+        //    configuration is only a safe fallback for a flat device, an unavailable sensor, or an
+        //    exit before two stable readings have arrived.
+        if (!isSystemAutoRotateEnabled()) {
+            return entryOrientation
+                ?: Configuration.ORIENTATION_UNDEFINED
+        }
+
         return stablePhysicalOrientation.takeIf(::isConfigurationOrientation)
-            ?: entryConfigOrientation.takeIf(::isConfigurationOrientation)
-            ?: resources.configuration.orientation.takeIf(::isConfigurationOrientation)
+            ?: entryOrientation
             ?: Configuration.ORIENTATION_UNDEFINED
+    }
+
+    private fun isSystemAutoRotateEnabled(): Boolean {
+        return try {
+            Settings.System.getInt(
+                contentResolver,
+                Settings.System.ACCELEROMETER_ROTATION,
+                0,
+            ) == 1
+        } catch (_: Throwable) {
+            false
+        }
     }
 
     private fun oppositeConfigurationOrientation(orientation: Int): Int {
