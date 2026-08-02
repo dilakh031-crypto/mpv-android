@@ -164,8 +164,11 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
     private var audioFocusRestore: () -> Unit = {}
 
     
-    // Media-driven orientation. The launch request is made immediately and playback starts
-    // in the same onCreate pass; there is no deferred player initialization or blackout layer.
+    // Media-driven orientation. Remember the configuration that was visible before the player
+    // requested a media-specific orientation, so exit can restore it in the same event turn as
+    // finish(). There is no delayed finish, blackout, or hidden intermediate rotation.
+    private var entryConfigOrientation = Configuration.ORIENTATION_UNDEFINED
+    private var exitRequestedOrientation = ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
     private var lastOrientationProbePath: String? = null
     private var uiInitialized = false
 
@@ -408,6 +411,8 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
     override fun onCreate(icicle: Bundle?) {
         super.onCreate(icicle)
 
+        captureEntryOrientation(icicle)
+
         if (intent.action == Intent.ACTION_VIEW)
             parseIntentExtras(intent.extras)
         val filepath = parsePathFromIntent(intent)
@@ -571,11 +576,19 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
         }
         setResult(code, result)
 
-        // Keep the original clean exit behavior: closing the player immediately exposes the
-        // previous activity, whose own orientation is applied as part of the same transition.
-        // Do not rotate or hide the outgoing player first.
         prepareZoomSurfaceForWindowExit()
+
+        // Submit the orientation restoration before finish(), in this same main-thread turn.
+        // Android receives the orientation request first, then the close request immediately
+        // afterwards, so the return transition and rotation can be composed together. We do not
+        // wait for onConfigurationChanged(), rotate the visible player first, or hide the window.
+        requestEntryOrientationForExit()
         finish()
+    }
+
+    override fun onSaveInstanceState(outState: Bundle) {
+        outState.putInt(STATE_ENTRY_CONFIG_ORIENTATION, entryConfigOrientation)
+        super.onSaveInstanceState(outState)
     }
 
     override fun onDestroy() {
@@ -3130,6 +3143,31 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
         }
     }
 
+    private fun captureEntryOrientation(savedInstanceState: Bundle?) {
+        entryConfigOrientation = savedInstanceState?.getInt(
+            STATE_ENTRY_CONFIG_ORIENTATION,
+            Configuration.ORIENTATION_UNDEFINED,
+        )?.takeIf { it != Configuration.ORIENTATION_UNDEFINED }
+            ?: resources.configuration.orientation
+
+        exitRequestedOrientation = when (entryConfigOrientation) {
+            Configuration.ORIENTATION_LANDSCAPE ->
+                ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
+            Configuration.ORIENTATION_PORTRAIT ->
+                ActivityInfo.SCREEN_ORIENTATION_SENSOR_PORTRAIT
+            else -> ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
+        }
+    }
+
+    private fun requestEntryOrientationForExit() {
+        if (!packageManager.hasSystemFeature(PackageManager.FEATURE_SCREEN_PORTRAIT))
+            return
+        if (exitRequestedOrientation == ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED)
+            return
+        if (requestedOrientation != exitRequestedOrientation)
+            requestedOrientation = exitRequestedOrientation
+    }
+
     private fun applyLaunchOrientation(path: String) {
         if (!packageManager.hasSystemFeature(PackageManager.FEATURE_SCREEN_PORTRAIT))
             return
@@ -4314,6 +4352,8 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
         private const val RCODE_LOAD_FILE = 1002
         // action of result intent
         private const val RESULT_INTENT = "is.xyz.mpv.MPVActivity.result"
+        private const val STATE_ENTRY_CONFIG_ORIENTATION =
+            "is.xyz.mpv.MPVActivity.entryConfigOrientation"
         // stream type used with AudioManager
         private const val STREAM_TYPE = AudioManager.STREAM_MUSIC
         // Preserve the original seekbar granularity. Integer division in the listener keeps
