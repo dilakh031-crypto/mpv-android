@@ -164,9 +164,8 @@ internal class VideoZoomGestures(
         }
     }
 
-    // Keep the startup/exit window transitions on the plain mpv surface. Once
-    // MPVActivity has a stable first frame hidden behind the startup preview, it
-    // enables the compact normal surface so zoom can start/stop without a tear.
+    // The compact normal surface is prepared once reliable media geometry is available, so zoom
+    // can start and stop without a render-surface tear. No startup/exit cover view is required.
     private var normalCompactSurfacePrepared = false
 
     // When a pinch returns close enough to normal size, finish it through the
@@ -205,8 +204,8 @@ internal class VideoZoomGestures(
                 }
 
                 // Switch to the original-detail buffer before the first visible zoom step.
-                // If the first-frame preparation was skipped (for example, a remote file
-                // without startup preview), arm the compact normal geometry now as a fallback.
+                // If first-frame geometry preparation was unavailable (for example, a remote
+                // stream), arm the compact normal geometry now as a fallback.
                 normalCompactSurfacePrepared = true
                 val now = SystemClock.uptimeMillis()
                 if (!isZoomed()) {
@@ -431,11 +430,9 @@ internal class VideoZoomGestures(
     }
 
     fun prepareForWindowExit() {
+        // Reset only the Android view transform. Resizing or hiding the TextureView here would
+        // expose a black frame or a geometry jump while the activity close transition is visible.
         resetTransformState()
-        normalCompactSurfacePrepared = false
-        target.alpha = 0f
-        commitHiddenBaseRenderSurfaceMode()
-        requestBaseRenderSurfaceSize(force = true)
         applyToView()
     }
 
