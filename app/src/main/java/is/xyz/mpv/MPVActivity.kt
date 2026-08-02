@@ -173,7 +173,9 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
     private var mediaSwitchProbeGeneration = 0
     private var entryConfigOrientation: Int = Configuration.ORIENTATION_UNDEFINED
     private var finishTransitionStarted = false
-    private var orientationOwnedByPlayer = false
+    // Once this player session has imposed a portrait/landscape lock, keep that fact until exit.
+    // Releasing to UNSPECIFIED for a square item must not lose the original entry orientation.
+    private var playerForcedOrientation = false
     private var mediaGeometryReadyForOrientation = false
     private val orientationProbesInFlight = mutableSetOf<String>()
     private val orientationProbeCache = object : LinkedHashMap<String, MediaOrientationResolver.Orientation>(
@@ -431,6 +433,7 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
         entryConfigOrientation = icicle?.getInt(STATE_ENTRY_CONFIG_ORIENTATION)
             ?.takeIf { it != Configuration.ORIENTATION_UNDEFINED }
             ?: resources.configuration.orientation
+        playerForcedOrientation = icicle?.getBoolean(STATE_PLAYER_FORCED_ORIENTATION) ?: false
 
         if (intent.action == Intent.ACTION_VIEW)
             parseIntentExtras(intent.extras)
@@ -465,6 +468,7 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
 
     override fun onSaveInstanceState(outState: Bundle) {
         outState.putInt(STATE_ENTRY_CONFIG_ORIENTATION, entryConfigOrientation)
+        outState.putBoolean(STATE_PLAYER_FORCED_ORIENTATION, playerForcedOrientation)
         super.onSaveInstanceState(outState)
     }
 
@@ -686,17 +690,19 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
         Log.v(TAG, "onNewIntent($intent)")
         super.onNewIntent(intent)
 
-        // A singleTask player can be brought forward again by a later external VIEW intent. When
-        // it is the root of its task, refresh the fallback orientation from the display state that
-        // is active at this new entry rather than retaining a value from the very first launch.
-        if (!activityIsForeground && isTaskRoot)
-            entryConfigOrientation = resources.configuration.orientation
-
         // Happens when mpv is still running (not necessarily playing) and the user selects a new
-        // file to be played from another app
+        // file to be played from another app.
         val filepath = intent?.let { parsePathFromIntent(it) }
         if (filepath == null) {
             return
+        }
+
+        // MPVActivity is singleTask, so a stopped instance can become a new visible player session.
+        // Capture the display state that is actually visible now, regardless of task-root status.
+        // Do not reset a background-playback session that is intentionally kept behind another app.
+        if (!activityIsForeground && !didResumeBackgroundPlayback) {
+            entryConfigOrientation = resources.configuration.orientation
+            playerForcedOrientation = false
         }
 
         if (!activityIsForeground && didResumeBackgroundPlayback) {
@@ -3060,7 +3066,7 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
         else
             ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
         if (setRequestedOrientationSafely(desired))
-            orientationOwnedByPlayer = true
+            playerForcedOrientation = true
     }
 
     private var activityResultCallbacks: MutableMap<Int, ActivityResultCallback> = mutableMapOf()
@@ -3311,13 +3317,16 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
     private fun requestOrientationIfNeeded(desired: Int) {
         if (!supportsRequestedOrientation())
             return
-        val ownsOrientation = desired == ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE ||
+
+        val forcesOrientation = desired == ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE ||
             desired == ActivityInfo.SCREEN_ORIENTATION_SENSOR_PORTRAIT
-        if (requestedOrientation == desired) {
-            orientationOwnedByPlayer = ownsOrientation
-        } else if (setRequestedOrientationSafely(desired)) {
-            orientationOwnedByPlayer = ownsOrientation
-        }
+        val accepted = requestedOrientation == desired || setRequestedOrientationSafely(desired)
+
+        // This is deliberately sticky for the whole visible player session. A later square item
+        // may release requestedOrientation to UNSPECIFIED, but Android 9 can still remain in the
+        // portrait/landscape configuration imposed by the preceding item.
+        if (accepted && forcesOrientation)
+            playerForcedOrientation = true
     }
 
     private fun setRequestedOrientationSafely(desired: Int): Boolean {
@@ -3335,28 +3344,26 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
     private fun requestExitOrientationForTransition() {
         if (!packageManager.hasSystemFeature(PackageManager.FEATURE_SCREEN_PORTRAIT))
             return
+        if (!playerForcedOrientation)
+            return
 
-        val desired = if (!isTaskRoot) {
-            // Adopt the exact orientation policy of the in-task activity beneath the player. This
-            // is useful even in Device/square mode because the underlying activity may itself be
-            // fixed to portrait or landscape.
-            ActivityInfo.SCREEN_ORIENTATION_BEHIND
-        } else {
-            // External VIEW launches commonly make MPVActivity the root of its own task. With no
-            // in-task activity to inherit from, restore the entry configuration only when the
-            // player actually owned a portrait/landscape lock. Device/square mode must remain free
-            // to follow the current physical orientation.
-            if (!orientationOwnedByPlayer)
-                return
-            when (entryConfigOrientation) {
-                Configuration.ORIENTATION_LANDSCAPE ->
-                    ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
+        // Do not use SCREEN_ORIENTATION_BEHIND for a known entry orientation. On Android 9 the
+        // activity underneath has already received the player's portrait/landscape configuration
+        // while stopped, so BEHIND can simply preserve the wrong orientation. Explicitly restore
+        // the configuration that was visible immediately before this player session started.
+        val desired = when (entryConfigOrientation) {
+            Configuration.ORIENTATION_LANDSCAPE ->
+                ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
 
-                Configuration.ORIENTATION_PORTRAIT ->
-                    ActivityInfo.SCREEN_ORIENTATION_SENSOR_PORTRAIT
+            Configuration.ORIENTATION_PORTRAIT ->
+                ActivityInfo.SCREEN_ORIENTATION_SENSOR_PORTRAIT
 
-                else -> ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
-            }
+            // Only unusual displays can report UNDEFINED. In that case retain Android's native
+            // handoff when another in-task activity exists, otherwise release the player lock.
+            else -> if (!isTaskRoot)
+                ActivityInfo.SCREEN_ORIENTATION_BEHIND
+            else
+                ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
         }
 
         // Do not gate this through supportsRequestedOrientation(): during a close transition on
@@ -4485,6 +4492,7 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
         private const val ORIENTATION_ASYNC_PROBE_TIMEOUT_MS = 500L
         private const val ORIENTATION_CACHE_SIZE = 8
         private const val STATE_ENTRY_CONFIG_ORIENTATION = "entry_config_orientation"
+        private const val STATE_PLAYER_FORCED_ORIENTATION = "player_forced_orientation"
 
         // Reserve the very top portion of the screen for Android system gestures (notification
         // shade/status bar). We only suppress the tap-to-toggle if the finger *moves down*
