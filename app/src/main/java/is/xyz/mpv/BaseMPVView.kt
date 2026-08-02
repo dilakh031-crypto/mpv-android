@@ -81,6 +81,24 @@ abstract class BaseMPVView(context: Context, attrs: AttributeSet) : TextureView(
         }
     }
 
+    /**
+     * Start demuxing a file before the TextureView is allowed to draw.
+     *
+     * This is used only by MPVActivity's first-frame orientation gate. The null VO lets mpv/FFmpeg
+     * expose video-params without an Android Surface; when the gate opens, attachSurfaceTexture()
+     * restores [voInUse] and rendering continues on the real surface.
+     */
+    fun playFileHeadless(filePath: String) {
+        if (attachedSurface != null) {
+            playFile(filePath)
+            return
+        }
+
+        this.filePath = null
+        MPVLib.setPropertyString("vo", "null")
+        MPVLib.command(arrayOf("loadfile", filePath))
+    }
+
     private var voInUse: String = "gpu"
 
     /**
