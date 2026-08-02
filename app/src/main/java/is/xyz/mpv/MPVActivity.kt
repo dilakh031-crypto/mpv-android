@@ -18,7 +18,7 @@ import android.content.pm.PackageManager
 import android.content.res.ColorStateList
 import android.content.res.Configuration
 import android.graphics.drawable.Icon
-import android.graphics.Color
+import android.graphics.BitmapFactory
 import android.util.Log
 import android.media.AudioManager
 import android.media.MediaMetadataRetriever
@@ -164,57 +164,13 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
     private var audioFocusRestore: () -> Unit = {}
 
     
-    // Orientation smoothing / fast rotation
-    private var entryConfigOrientation: Int = Configuration.ORIENTATION_UNDEFINED
-    private var finishPending: Boolean = false
-    private var pendingFinishAfterRotate: Boolean = false
-    private var exitRequestedOrientation: Int = ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
+    // Media-driven orientation. The launch request is made immediately and playback starts
+    // in the same onCreate pass; there is no deferred player initialization or blackout layer.
     private var lastOrientationProbePath: String? = null
-
-    // When auto-rotation is enabled, mpv can briefly report an unknown/square aspect ratio
-    // (especially during startup / demuxer init). If we immediately react to that by setting
-    // SCREEN_ORIENTATION_UNSPECIFIED, Android may rotate back to portrait and "stick" there.
-    //
-    // We therefore keep a short "stability lock" where we *refuse* to change orientation
-    // away from a known desired orientation until we have a reliable aspect ratio.
-    private var orientationStabilityLockUntilMs: Long = 0L
-    private var orientationStabilityLockValue: Int = ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
-
-    private fun lockOrientationStability(desired: Int, durationMs: Long = 1600L) {
-        if (autoRotationMode != "auto")
-            return
-        if (desired != ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE &&
-            desired != ActivityInfo.SCREEN_ORIENTATION_SENSOR_PORTRAIT
-        ) return
-
-        orientationStabilityLockValue = desired
-        orientationStabilityLockUntilMs = SystemClock.uptimeMillis() + durationMs
-    }
-
-    private fun isWithinOrientationStabilityLock(): Boolean {
-        return SystemClock.uptimeMillis() < orientationStabilityLockUntilMs
-    }
-
-    // Startup orientation pre-probe / deferred player init
-    private var startupFilePath: String? = null
-    private var startupDesiredConfigOrientation: Int = Configuration.ORIENTATION_UNDEFINED
-    private var deferPlayerInit: Boolean = false
-    private var uiInitialized: Boolean = false
-
-    // One owner for hiding the mpv texture while a new file/reconfig is waiting
-    // for reliable video geometry. Aspect changes from the in-app menu bypass this
-    // blackout and use predictive geometry instead.
-    private var videoGeometryBlackoutActive = true
-    private var videoGeometryBlackoutGeneration = 0
-    private var videoGeometryBlackoutRevealArmed = false
-    private var videoGeometryBlackoutRevealPosted = false
-    private var videoGeometryBlackoutFileLoadedSeen = false
+    private var uiInitialized = false
 
     @Volatile
     private var playerSurfaceFrameSerial = 0L
-
-    @Volatile
-    private var fileLoadedSurfaceFrameFloor = Long.MAX_VALUE
 
     private var suppressAspectMenuGeometrySyncUntilMs = 0L
 
@@ -449,106 +405,42 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
 
     // Activity lifetime
 
-        override fun onCreate(icicle: Bundle?) {
-            super.onCreate(icicle)
+    override fun onCreate(icicle: Bundle?) {
+        super.onCreate(icicle)
 
-            // Remember the orientation we entered the player in, so we can restore it on exit.
-            entryConfigOrientation = resources.configuration.orientation
-            exitRequestedOrientation = when (entryConfigOrientation) {
-                Configuration.ORIENTATION_LANDSCAPE -> ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
-                Configuration.ORIENTATION_PORTRAIT -> ActivityInfo.SCREEN_ORIENTATION_SENSOR_PORTRAIT
-                else -> ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
-            }
-
-            // Prepare binding/gestures early so onConfigurationChanged is safe even if we change orientation immediately.
-            binding = PlayerBinding.inflate(layoutInflater)
-            gestures = TouchGestures(this)
-            zoomGestures = VideoZoomGestures(binding.player)
-            binding.player.onSurfaceTextureFrameAvailable = {
-                playerSurfaceFrameSerial += 1L
-                onScrubSurfaceFrameAvailable(playerSurfaceFrameSerial)
-                zoomGestures.onSurfaceTextureFrameAvailable()
-                onPlayerSurfaceFrameAvailable()
-            }
-
-            // Do these here and not in MainActivity because mpv can be launched from a file browser.
-            Utils.copyAssets(this)
-            BackgroundPlaybackService.createNotificationChannel(this)
-
-            // Parse intent early so we can force the correct orientation before mpv starts.
-            if (intent.action == Intent.ACTION_VIEW)
-                parseIntentExtras(intent.extras)
-            val filepath = parsePathFromIntent(intent)
-            if (filepath == null) {
-                Log.e(TAG, "No file given, exiting")
-                showToast(getString(R.string.error_no_file))
-                finishWithResult(RESULT_CANCELED)
-                return
-            }
-
-            // Read only the auto-rotation setting early (full settings are read later).
-            run {
-                val prefs = getDefaultSharedPreferences(applicationContext)
-                val defaultMode = resources.getString(R.string.pref_auto_rotation_default)
-                val mode = prefs.getString("auto_rotation", defaultMode) ?: defaultMode
-                if (autoRotationMode != "manual")
-                    autoRotationMode = mode
-            }
-
-            // If we're in auto mode, probe the file's orientation BEFORE starting mpv.
-            // This avoids showing the first video frame in portrait and then rotating to landscape.
-            if (autoRotationMode == "auto" &&
-                packageManager.hasSystemFeature(PackageManager.FEATURE_SCREEN_PORTRAIT)
-            ) {
-                val probed = probeOrientationFromMetadata(filepath)
-                val desired = when (probed) {
-                    ProbedOrientation.LANDSCAPE -> ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
-                    ProbedOrientation.PORTRAIT -> ActivityInfo.SCREEN_ORIENTATION_SENSOR_PORTRAIT
-                    ProbedOrientation.SQUARE -> ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
-                    ProbedOrientation.UNKNOWN -> null
-                }
-
-                if (desired != null) {
-                    // If we're already portrait and the app is not locked, don't force-lock portrait.
-                    val skipPortrait =
-                        desired == ActivityInfo.SCREEN_ORIENTATION_SENSOR_PORTRAIT &&
-                            resources.configuration.orientation == Configuration.ORIENTATION_PORTRAIT &&
-                            requestedOrientation == ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
-
-                    if (!skipPortrait) {
-                        lastOrientationProbePath = filepath
-                        if (requestedOrientation != desired)
-                            requestedOrientation = desired
-
-                        // Hold the chosen orientation briefly so we don't get a late flip back
-                        // to portrait if mpv reports an unknown/square aspect during startup.
-                        lockOrientationStability(desired, 2200L)
-
-                        startupDesiredConfigOrientation = when (desired) {
-                            ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE -> Configuration.ORIENTATION_LANDSCAPE
-                            ActivityInfo.SCREEN_ORIENTATION_SENSOR_PORTRAIT -> Configuration.ORIENTATION_PORTRAIT
-                            else -> Configuration.ORIENTATION_UNDEFINED
-                        }
-
-                        deferPlayerInit =
-                            startupDesiredConfigOrientation != Configuration.ORIENTATION_UNDEFINED &&
-                                resources.configuration.orientation != startupDesiredConfigOrientation
-                    }
-                }
-            }
-
-            if (deferPlayerInit) {
-                startupFilePath = filepath
-
-                // Avoid briefly showing the UI in the wrong orientation (portrait -> landscape flash).
-                // Show a simple black placeholder until Android applies the requested orientation.
-                window.decorView.setBackgroundColor(Color.BLACK)
-                setContentView(View(this).apply { setBackgroundColor(Color.BLACK) })
-                return
-            }
-
-            setupUiAndStart(filepath)
+        if (intent.action == Intent.ACTION_VIEW)
+            parseIntentExtras(intent.extras)
+        val filepath = parsePathFromIntent(intent)
+        if (filepath == null) {
+            Log.e(TAG, "No file given, exiting")
+            showToast(getString(R.string.error_no_file))
+            finishWithResult(RESULT_CANCELED)
+            return
         }
+
+        // Request orientation as early as possible in the activity launch. Playback and the real
+        // player UI are initialized immediately afterwards; nothing waits for rotation to finish.
+        val prefs = getDefaultSharedPreferences(applicationContext)
+        val defaultMode = resources.getString(R.string.pref_auto_rotation_default)
+        if (autoRotationMode != "manual")
+            autoRotationMode = prefs.getString("auto_rotation", defaultMode) ?: defaultMode
+        applyLaunchOrientation(filepath)
+
+        binding = PlayerBinding.inflate(layoutInflater)
+        gestures = TouchGestures(this)
+        zoomGestures = VideoZoomGestures(binding.player)
+        binding.player.onSurfaceTextureFrameAvailable = {
+            playerSurfaceFrameSerial += 1L
+            onScrubSurfaceFrameAvailable(playerSurfaceFrameSerial)
+            zoomGestures.onSurfaceTextureFrameAvailable()
+        }
+
+        // Do these here and not in MainActivity because mpv can be launched from a file browser.
+        Utils.copyAssets(this)
+        BackgroundPlaybackService.createNotificationChannel(this)
+
+        setupUiAndStart(filepath)
+    }
 
     private fun setupUiAndStart(filepath: String) {
         if (uiInitialized)
@@ -586,12 +478,8 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
             binding.controlsTitleGroup.visibility = View.VISIBLE
 
         updateOrientation(true)
-
-        setVideoGeometryBlackout(true)
-
         startPlayback(filepath)
     }
-
 
     private var playbackInitialized: Boolean = false
 
@@ -618,96 +506,6 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
         volumeControlStream = STREAM_TYPE
     }
 
-    private fun maybeStartDeferredPlayback() {
-        if (!deferPlayerInit)
-            return
-
-        val desired = startupDesiredConfigOrientation
-        if (desired == Configuration.ORIENTATION_UNDEFINED || resources.configuration.orientation == desired) {
-            // Clear the deferred state FIRST to avoid re-entrancy if we call onConfigurationChanged() manually.
-            val fp = startupFilePath
-            startupFilePath = null
-            deferPlayerInit = false
-
-            if (fp != null) {
-                if (!uiInitialized)
-                    setupUiAndStart(fp)
-                else
-                    startPlayback(fp)
-            }
-        }
-    }
-
-    private fun setVideoGeometryBlackout(visible: Boolean) {
-        if (visible) {
-            videoGeometryBlackoutGeneration += 1
-            videoGeometryBlackoutRevealArmed = false
-            videoGeometryBlackoutRevealPosted = false
-            videoGeometryBlackoutFileLoadedSeen = false
-        } else {
-            videoGeometryBlackoutRevealPosted = false
-        }
-        videoGeometryBlackoutActive = visible
-        if (!::binding.isInitialized || !uiInitialized)
-            return
-
-        binding.videoBlackoutOverlay.visibility = if (visible) View.VISIBLE else View.GONE
-    }
-
-    private fun beginVideoGeometryBlackout() {
-        setVideoGeometryBlackout(true)
-        if (::zoomGestures.isInitialized) {
-            try { zoomGestures.resetForNewFile() } catch (_: Throwable) {}
-        }
-    }
-
-    private fun armVideoGeometryBlackoutReveal() {
-        if (!videoGeometryBlackoutActive)
-            return
-        videoGeometryBlackoutRevealArmed = true
-        revealVideoGeometryBlackoutIfReady()
-    }
-
-    private fun onPlayerSurfaceFrameAvailable() {
-        if (Looper.myLooper() != Looper.getMainLooper()) {
-            eventUiHandler.post { onPlayerSurfaceFrameAvailable() }
-            return
-        }
-
-        revealVideoGeometryBlackoutIfReady()
-    }
-
-    private fun hasSurfaceFrameForLoadedFile(): Boolean {
-        val floor = fileLoadedSurfaceFrameFloor
-        return floor != Long.MAX_VALUE && playerSurfaceFrameSerial > floor
-    }
-
-    private fun revealVideoGeometryBlackoutIfReady() {
-        if (!videoGeometryBlackoutActive ||
-            !videoGeometryBlackoutRevealArmed ||
-            videoGeometryBlackoutRevealPosted ||
-            !videoGeometryBlackoutFileLoadedSeen ||
-            !hasSurfaceFrameForLoadedFile() ||
-            !hasDisplayableVideoGeometry()
-        ) return
-
-        videoGeometryBlackoutRevealPosted = true
-        val generation = videoGeometryBlackoutGeneration
-        ViewCompat.postOnAnimation(binding.player) {
-            videoGeometryBlackoutRevealPosted = false
-            if (videoGeometryBlackoutActive &&
-                videoGeometryBlackoutRevealArmed &&
-                generation == videoGeometryBlackoutGeneration &&
-                videoGeometryBlackoutFileLoadedSeen &&
-                hasSurfaceFrameForLoadedFile() &&
-                hasDisplayableVideoGeometry()
-            ) {
-                videoGeometryBlackoutRevealArmed = false
-                setVideoGeometryBlackout(false)
-            }
-        }
-    }
-
     private fun hasDisplayableVideoGeometry(): Boolean {
         val aspect = try { player.getEffectiveVideoAspect() ?: 0.0 } catch (_: Throwable) { 0.0 }
         val size = try { player.getVideoPixelSize() } catch (_: Throwable) { null }
@@ -715,8 +513,7 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
     }
 
     private fun isAspectMenuGeometrySyncSuppressed(): Boolean {
-        return !videoGeometryBlackoutActive &&
-            SystemClock.uptimeMillis() < suppressAspectMenuGeometrySyncUntilMs
+        return SystemClock.uptimeMillis() < suppressAspectMenuGeometrySyncUntilMs
     }
 
     private fun syncZoomVideoGeometry(
@@ -741,22 +538,12 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
         } catch (_: Throwable) {}
     }
 
-    private fun prepareZoomSurfaceAndRevealWhenReady() {
-        if (!::zoomGestures.isInitialized)
+    private fun prepareZoomSurfaceIfReady() {
+        if (!::zoomGestures.isInitialized || !hasDisplayableVideoGeometry())
             return
 
-        if (videoGeometryBlackoutActive && !videoGeometryBlackoutFileLoadedSeen)
-            return
-        if (!hasDisplayableVideoGeometry())
-            return
-
-        // Pull all geometry at once while the blackout is still covering mpv.
-        // The blackout is removed only after TextureView reports a real frame
-        // update with this geometry, which avoids revealing a stale fullscreen
-        // or old-aspect buffer on heavy images/videos.
         syncZoomVideoGeometry(prepareNormalSurface = true, immediate = true)
         try { zoomGestures.prepareForVisibleMedia() } catch (_: Throwable) {}
-        armVideoGeometryBlackoutReveal()
     }
 
     private fun prepareZoomSurfaceForWindowExit() {
@@ -773,9 +560,8 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
     private fun finishWithResult(code: Int, includeTimePos: Boolean = false) {
         // Refer to http://mpv-android.github.io/mpv-android/intent.html
         // FIXME: should track end-file events to accurately report OK vs CANCELED
-        if (isFinishing || finishPending) // only count first call
+        if (isFinishing)
             return
-        finishPending = true
 
         val result = Intent(RESULT_INTENT)
         result.data = if (intent.data?.scheme == "file") null else intent.data
@@ -785,34 +571,10 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
         }
         setResult(code, result)
 
-        // Avoid letting Android's activity/window transition animate a transformed
-        // TextureView. The player is about to close, so return it to the plain
-        // mpv surface before finish/rotation starts.
+        // Keep the original clean exit behavior: closing the player immediately exposes the
+        // previous activity, whose own orientation is applied as part of the same transition.
+        // Do not rotate or hide the outgoing player first.
         prepareZoomSurfaceForWindowExit()
-
-        // Restore the orientation we entered with. This also bypasses the system auto-rotate lock,
-        // so the next activity does not briefly appear in the wrong orientation.
-        val needRestore = packageManager.hasSystemFeature(PackageManager.FEATURE_SCREEN_PORTRAIT) &&
-                exitRequestedOrientation != ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED &&
-                resources.configuration.orientation != entryConfigOrientation
-
-        if (needRestore) {
-            pendingFinishAfterRotate = true
-            // Hide the player UI so the user doesn't see the intermediate rotation.
-            try {
-                binding.root.alpha = 0f
-            } catch (_: Throwable) { /* ignore */ }
-            requestedOrientation = exitRequestedOrientation
-            // Fallback in case we don't receive a configuration callback.
-            eventUiHandler.postDelayed({
-                if (pendingFinishAfterRotate) {
-                    pendingFinishAfterRotate = false
-                    finish()
-                }
-            }, 600)
-            return
-        }
-
         finish()
     }
 
@@ -850,8 +612,10 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
         // take the background service with us
         stopServiceRunnable.run()
 
-        player.removeObserver(this)
-        player.destroy()
+        if (::binding.isInitialized && playbackInitialized) {
+            player.removeObserver(this)
+            player.destroy()
+        }
         super.onDestroy()
     }
 
@@ -864,6 +628,12 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
         val filepath = intent?.let { parsePathFromIntent(it) }
         if (filepath == null) {
             return
+        }
+
+        val appendOnly =
+            !activityIsForeground && didResumeBackgroundPlayback && !this.newIntentReplace
+        if (!appendOnly && autoRotationMode == "auto") {
+            try { applyOrientationFromMetadata(filepath) } catch (_: Throwable) {}
         }
 
         if (!activityIsForeground && didResumeBackgroundPlayback) {
@@ -1869,14 +1639,6 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
     override fun onConfigurationChanged(newConfig: Configuration) {
         super.onConfigurationChanged(newConfig)
 
-        // If we're exiting and requested an orientation restore, wait until Android applies it
-        // so the caller doesn't flash in the wrong orientation.
-        if (pendingFinishAfterRotate && newConfig.orientation == entryConfigOrientation) {
-            pendingFinishAfterRotate = false
-            finish()
-            return
-        }
-
         val isLandscape = newConfig.orientation == Configuration.ORIENTATION_LANDSCAPE
 
         updateGestureMetricsFromView()
@@ -1897,9 +1659,6 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
                 rightMargin = leftMargin
             }
         }
-
-        // If we deferred startup playback until the forced orientation is applied, start now.
-        maybeStartDeferredPlayback()
     }
 
     private fun onPiPModeChangedImpl(state: Boolean) {
@@ -3334,136 +3093,242 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
     }
 
     private fun updateOrientation(initial: Boolean = false) {
-        // screen orientation is fixed (Android TV)
+        // Screen orientation is fixed on devices such as Android TV.
         if (!packageManager.hasSystemFeature(PackageManager.FEATURE_SCREEN_PORTRAIT))
             return
 
         if (autoRotationMode != "auto") {
             if (!initial)
-                return // don't reset at runtime
-            requestedOrientation = when (autoRotationMode) {
+                return
+            val desired = when (autoRotationMode) {
                 "landscape" -> ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
                 "portrait" -> ActivityInfo.SCREEN_ORIENTATION_SENSOR_PORTRAIT
                 else -> ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
             }
+            if (requestedOrientation != desired)
+                requestedOrientation = desired
+            return
         }
+
+        // Startup already requested the probed orientation. Runtime updates are a fallback for
+        // remote/unsupported sources and a verification step after mpv exposes real geometry.
         if (initial || player.vid == -1)
             return
 
-        // Base automatic orientation on the media's native pixel dimensions, not on mpv's
-        // displayed aspect ratio. The latter can change when the user selects an aspect-ratio
-        // override, and that UI-only choice must never rotate the Android screen.
         val pixelSize = player.getVideoPixelSize() ?: return
-        val ratio = pixelSize.first.toFloat() / pixelSize.second.toFloat()
-
-        // If the dimensions are unavailable/invalid, don't change orientation. In practice this
-        // can happen briefly while mpv is still probing the file (and reacting to it can cause a
-        // portrait "bounce" that sometimes sticks).
-        if (!ratio.isFinite() || ratio == 0f)
-            return
-
-        if (ratio in (1f / ASPECT_RATIO_MIN) .. ASPECT_RATIO_MIN) {
-            // video is square, let Android do what it wants — but don't break an in-progress
-            // startup rotation that we intentionally forced for a landscape/portrait file.
-            if (isWithinOrientationStabilityLock())
-                return
-            requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
-            return
-        }
-
-        val desired = if (ratio > 1f)
-            ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
-        else
-            ActivityInfo.SCREEN_ORIENTATION_SENSOR_PORTRAIT
-
-        // Once we have a reliable non-square aspect ratio, clear the stability lock so future
-        // files / reconfigs can update normally.
-        if (isWithinOrientationStabilityLock()) {
-            orientationStabilityLockUntilMs = 0L
-            orientationStabilityLockValue = ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
-        }
-
-        requestedOrientation = desired
+        requestOrientationForDimensions(pixelSize.first, pixelSize.second)
     }
 
     private enum class ProbedOrientation { LANDSCAPE, PORTRAIT, SQUARE, UNKNOWN }
 
-    private fun probeOrientationFromMetadata(path: String): ProbedOrientation {
-        // Skip unsupported / remote schemes (mpv will update orientation later from video-params).
-        if (path.startsWith("http://") || path.startsWith("https://") ||
-            path.startsWith("rtsp://") || path.startsWith("rtmp://") ||
-            path.startsWith("rtmps://") || path.startsWith("udp://") ||
-            path.startsWith("tcp://") || path.startsWith("memory://") ||
-            path.startsWith("data://") || path.startsWith("lavf://")
-        ) return ProbedOrientation.UNKNOWN
-
-        val mmr = MediaMetadataRetriever()
-        try {
-            if (path.startsWith("content://")) {
-                mmr.setDataSource(this, Uri.parse(path))
-            } else if (path.startsWith("file://")) {
-                mmr.setDataSource(Uri.parse(path).path)
-            } else {
-                // Assume local filesystem path
-                mmr.setDataSource(path)
-            }
-
-            val w0 = mmr.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_WIDTH)?.toIntOrNull()
-            val h0 = mmr.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_HEIGHT)?.toIntOrNull()
-            if (w0 == null || h0 == null || w0 <= 0 || h0 <= 0)
-                return ProbedOrientation.UNKNOWN
-
-            // Apply rotation metadata (common on phone recordings)
-            val rot = mmr.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_ROTATION)?.toIntOrNull() ?: 0
-            val (w, h) = if (rot % 180 != 0) Pair(h0, w0) else Pair(w0, h0)
-
-            val ratio = w.toFloat() / h.toFloat()
-            if (ratio == 0f || ratio in (1f / ASPECT_RATIO_MIN) .. ASPECT_RATIO_MIN)
-                return ProbedOrientation.SQUARE
-            return if (ratio > 1f) ProbedOrientation.LANDSCAPE else ProbedOrientation.PORTRAIT
-        } catch (_: Throwable) {
-            return ProbedOrientation.UNKNOWN
-        } finally {
-            try { mmr.release() } catch (_: Throwable) {}
-        }
-    }
-
-    private fun applyOrientationFromMetadata(path: String, isStartup: Boolean = false) {
-        // screen orientation is fixed (Android TV)
-        if (!packageManager.hasSystemFeature(PackageManager.FEATURE_SCREEN_PORTRAIT))
-            return
-
-        // Avoid probing the same path repeatedly (e.g., playlist refreshes).
-        if (path == lastOrientationProbePath && !isStartup)
-            return
-        lastOrientationProbePath = path
-
-        val probed = probeOrientationFromMetadata(path)
-        val desired = when (probed) {
+    private fun requestForProbedOrientation(probed: ProbedOrientation): Int? {
+        return when (probed) {
             ProbedOrientation.LANDSCAPE -> ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
             ProbedOrientation.PORTRAIT -> ActivityInfo.SCREEN_ORIENTATION_SENSOR_PORTRAIT
             ProbedOrientation.SQUARE -> ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
-            ProbedOrientation.UNKNOWN -> return
+            ProbedOrientation.UNKNOWN -> null
         }
-
-
-        // If we're already in portrait with an unspecified orientation, don't force-lock it.
-        // This avoids unnecessary churn when everything is already portrait.
-        if (desired == ActivityInfo.SCREEN_ORIENTATION_SENSOR_PORTRAIT &&
-            resources.configuration.orientation == Configuration.ORIENTATION_PORTRAIT &&
-            requestedOrientation == ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
-        ) return
-
-        // Only change if needed to prevent redundant config churn.
-        if (requestedOrientation != desired)
-            requestedOrientation = desired
-
-        // Hold the chosen orientation briefly so transient "square/unknown" aspect updates
-        // from mpv won't bounce us back to portrait during startup/reconfig.
-        lockOrientationStability(desired, if (isStartup) 2200L else 1600L)
     }
 
+    private fun applyLaunchOrientation(path: String) {
+        if (!packageManager.hasSystemFeature(PackageManager.FEATURE_SCREEN_PORTRAIT))
+            return
 
+        val desired = when (autoRotationMode) {
+            "landscape" -> ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
+            "portrait" -> ActivityInfo.SCREEN_ORIENTATION_SENSOR_PORTRAIT
+            "auto" -> {
+                val probed = probeOrientationFromMetadata(path)
+                if (probed != ProbedOrientation.UNKNOWN)
+                    lastOrientationProbePath = path
+                requestForProbedOrientation(probed)
+            }
+            else -> ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
+        }
+
+        if (desired != null && requestedOrientation != desired)
+            requestedOrientation = desired
+    }
+
+    private fun requestOrientationForDimensions(width: Int, height: Int) {
+        if (width <= 0 || height <= 0)
+            return
+
+        val ratio = width.toFloat() / height.toFloat()
+        if (!ratio.isFinite() || ratio <= 0f)
+            return
+
+        val desired = when {
+            ratio in (1f / ASPECT_RATIO_MIN) .. ASPECT_RATIO_MIN ->
+                ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
+            ratio > 1f -> ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
+            else -> ActivityInfo.SCREEN_ORIENTATION_SENSOR_PORTRAIT
+        }
+
+        if (requestedOrientation != desired)
+            requestedOrientation = desired
+    }
+
+    private fun classifyDimensions(width: Int, height: Int, rotationDegrees: Int = 0): ProbedOrientation {
+        if (width <= 0 || height <= 0)
+            return ProbedOrientation.UNKNOWN
+
+        val rotated = abs(rotationDegrees) % 180 == 90
+        val displayWidth = if (rotated) height else width
+        val displayHeight = if (rotated) width else height
+        val ratio = displayWidth.toFloat() / displayHeight.toFloat()
+
+        if (!ratio.isFinite() || ratio <= 0f)
+            return ProbedOrientation.UNKNOWN
+        if (ratio in (1f / ASPECT_RATIO_MIN) .. ASPECT_RATIO_MIN)
+            return ProbedOrientation.SQUARE
+        return if (ratio > 1f) ProbedOrientation.LANDSCAPE else ProbedOrientation.PORTRAIT
+    }
+
+    private fun isRemoteOrVirtualPath(path: String): Boolean {
+        val scheme = Uri.parse(path).scheme?.lowercase() ?: return false
+        return scheme != "file" && scheme != "content"
+    }
+
+    private fun setMetadataDataSource(mmr: MediaMetadataRetriever, path: String) {
+        when {
+            path.startsWith("content://") -> mmr.setDataSource(this, Uri.parse(path))
+            path.startsWith("file://") -> {
+                val filePath = Uri.parse(path).path
+                    ?: throw IllegalArgumentException("Invalid file URI")
+                mmr.setDataSource(filePath)
+            }
+            else -> mmr.setDataSource(path)
+        }
+    }
+
+    private fun probeOrientationFromMetadata(path: String): ProbedOrientation {
+        // Remote streams cannot be classified before their headers arrive; mpv's runtime geometry
+        // callback remains the fallback for those sources.
+        if (isRemoteOrVirtualPath(path))
+            return ProbedOrientation.UNKNOWN
+
+        val mmr = MediaMetadataRetriever()
+        try {
+            setMetadataDataSource(mmr, path)
+
+            val videoWidth =
+                mmr.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_WIDTH)?.toIntOrNull()
+            val videoHeight =
+                mmr.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_HEIGHT)?.toIntOrNull()
+            if (videoWidth != null && videoHeight != null && videoWidth > 0 && videoHeight > 0) {
+                val rotation =
+                    mmr.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_ROTATION)
+                        ?.toIntOrNull() ?: 0
+                return classifyDimensions(videoWidth, videoHeight, rotation)
+            }
+
+            // Android 9+ exposes dimensions and rotation for still images through the same API.
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                val imageWidth =
+                    mmr.extractMetadata(MediaMetadataRetriever.METADATA_KEY_IMAGE_WIDTH)?.toIntOrNull()
+                val imageHeight =
+                    mmr.extractMetadata(MediaMetadataRetriever.METADATA_KEY_IMAGE_HEIGHT)?.toIntOrNull()
+                if (imageWidth != null && imageHeight != null && imageWidth > 0 && imageHeight > 0) {
+                    val rotation =
+                        mmr.extractMetadata(MediaMetadataRetriever.METADATA_KEY_IMAGE_ROTATION)
+                            ?.toIntOrNull() ?: 0
+                    return classifyDimensions(imageWidth, imageHeight, rotation)
+                }
+            }
+        } catch (_: Throwable) {
+            // Fall through to the image-bounds probe.
+        } finally {
+            try { mmr.release() } catch (_: Throwable) {}
+        }
+
+        return probeImageOrientation(path)
+    }
+
+    private fun probeImageOrientation(path: String): ProbedOrientation {
+        val options = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+        try {
+            when {
+                path.startsWith("content://") -> {
+                    contentResolver.openInputStream(Uri.parse(path))?.use {
+                        BitmapFactory.decodeStream(it, null, options)
+                    }
+                }
+                path.startsWith("file://") -> {
+                    val filePath = Uri.parse(path).path ?: return ProbedOrientation.UNKNOWN
+                    BitmapFactory.decodeFile(filePath, options)
+                }
+                else -> BitmapFactory.decodeFile(path, options)
+            }
+        } catch (_: Throwable) {
+            return ProbedOrientation.UNKNOWN
+        }
+
+        if (options.outWidth <= 0 || options.outHeight <= 0)
+            return ProbedOrientation.UNKNOWN
+
+        return classifyDimensions(options.outWidth, options.outHeight, readImageRotation(path))
+    }
+
+    @Suppress("DEPRECATION")
+    private fun readImageRotation(path: String): Int {
+        fun orientationToDegrees(orientation: Int): Int {
+            return when (orientation) {
+                android.media.ExifInterface.ORIENTATION_ROTATE_90,
+                android.media.ExifInterface.ORIENTATION_TRANSPOSE -> 90
+                android.media.ExifInterface.ORIENTATION_ROTATE_180,
+                android.media.ExifInterface.ORIENTATION_FLIP_VERTICAL -> 180
+                android.media.ExifInterface.ORIENTATION_ROTATE_270,
+                android.media.ExifInterface.ORIENTATION_TRANSVERSE -> 270
+                else -> 0
+            }
+        }
+
+        return try {
+            val orientation = when {
+                path.startsWith("content://") && Build.VERSION.SDK_INT >= Build.VERSION_CODES.N -> {
+                    contentResolver.openFileDescriptor(Uri.parse(path), "r")?.use { descriptor ->
+                        android.media.ExifInterface(descriptor.fileDescriptor).getAttributeInt(
+                            android.media.ExifInterface.TAG_ORIENTATION,
+                            android.media.ExifInterface.ORIENTATION_NORMAL,
+                        )
+                    } ?: android.media.ExifInterface.ORIENTATION_NORMAL
+                }
+                path.startsWith("file://") -> {
+                    val filePath = Uri.parse(path).path ?: return 0
+                    android.media.ExifInterface(filePath).getAttributeInt(
+                        android.media.ExifInterface.TAG_ORIENTATION,
+                        android.media.ExifInterface.ORIENTATION_NORMAL,
+                    )
+                }
+                !path.contains("://") -> {
+                    android.media.ExifInterface(path).getAttributeInt(
+                        android.media.ExifInterface.TAG_ORIENTATION,
+                        android.media.ExifInterface.ORIENTATION_NORMAL,
+                    )
+                }
+                else -> android.media.ExifInterface.ORIENTATION_NORMAL
+            }
+            orientationToDegrees(orientation)
+        } catch (_: Throwable) {
+            0
+        }
+    }
+
+    private fun applyOrientationFromMetadata(path: String) {
+        if (autoRotationMode != "auto" ||
+            !packageManager.hasSystemFeature(PackageManager.FEATURE_SCREEN_PORTRAIT)
+        ) return
+
+        if (path == lastOrientationProbePath)
+            return
+
+        val probed = probeOrientationFromMetadata(path)
+        val desired = requestForProbedOrientation(probed) ?: return
+        lastOrientationProbePath = path
+        if (requestedOrientation != desired)
+            requestedOrientation = desired
+    }
 
     @RequiresApi(26)
     private fun makeRemoteAction(@DrawableRes icon: Int, @StringRes title: Int, intentAction: String): RemoteAction {
@@ -3586,8 +3451,9 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
             "time-pos" -> updatePlaybackPos(psc.positionSec)
             "playlist-pos", "playlist-count" -> updatePlaylistButtons()
             "video-params/w", "video-params/h" -> {
+                updateOrientation()
                 syncZoomVideoGeometry()
-                prepareZoomSurfaceAndRevealWhenReady()
+                prepareZoomSurfaceIfReady()
             }
         }
     }
@@ -3600,11 +3466,11 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
                 updateOrientation()
                 updatePiPParams()
                 syncZoomVideoGeometry()
-                prepareZoomSurfaceAndRevealWhenReady()
+                prepareZoomSurfaceIfReady()
             }
             "panscan" -> {
                 syncZoomVideoGeometry()
-                prepareZoomSurfaceAndRevealWhenReady()
+                prepareZoomSurfaceIfReady()
             }
         }
     }
@@ -3615,7 +3481,7 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
             "speed" -> updateSpeedButton()
             "video-aspect-override" -> {
                 syncZoomVideoGeometry()
-                prepareZoomSurfaceAndRevealWhenReady()
+                prepareZoomSurfaceIfReady()
             }
         }
         if (metaUpdated)
@@ -3766,12 +3632,6 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
         }
 
         if (eventId == MpvEvent.MPV_EVENT_FILE_LOADED) {
-            // FILE_LOADED is delivered on mpv's event thread. Capture the current
-            // TextureView frame serial here, before posting work to the UI thread.
-            // A static image can publish its only frame while that UI work is still
-            // queued; that frame must remain eligible to remove the blackout.
-            fileLoadedSurfaceFrameFloor = playerSurfaceFrameSerial
-
             currentWatchLaterPath = MPVLib.getPropertyString("path")
             completedWatchLaterPath = null
             val persistFileState = fileStatePersistenceEnabled()
@@ -3804,36 +3664,28 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
                 }
             }
 
-            eventUiHandler.post {
-                videoGeometryBlackoutFileLoadedSeen = true
-                prepareZoomSurfaceAndRevealWhenReady()
-            }
+            eventUiHandler.post { prepareZoomSurfaceIfReady() }
         }
 
         if (eventId == MpvEvent.MPV_EVENT_VIDEO_RECONFIG) {
-            eventUiHandler.post { prepareZoomSurfaceAndRevealWhenReady() }
+            eventUiHandler.post { prepareZoomSurfaceIfReady() }
         }
 
         if (eventId == MpvEvent.MPV_EVENT_START_FILE) {
-            // Invalidate any frame accepted for the previous playlist entry before
-            // the UI-thread blackout reset is posted. This keeps old frames from
-            // satisfying the next file's reveal condition.
-            fileLoadedSurfaceFrameFloor = Long.MAX_VALUE
-
             currentWatchLaterPath = null
             completedWatchLaterPath = null
             // Reset any view-level zoom/pan when a new file starts.
 
-            // Apply orientation as early as possible for playlist items, so we don't show the wrong orientation first.
-            // Must run on the UI thread.
-            if (autoRotationMode == "auto") {
-                val p = MPVLib.getPropertyString("path")
-                if (p != null) eventUiHandler.post { try { applyOrientationFromMetadata(p) } catch (_: Throwable) {} }
-            }
-
+            val startingPath =
+                if (autoRotationMode == "auto") MPVLib.getPropertyString("path") else null
             eventUiHandler.postAtFrontOfQueue {
                 resetScrubSeekControllerForFileChange()
-                beginVideoGeometryBlackout()
+                if (startingPath != null) {
+                    try { applyOrientationFromMetadata(startingPath) } catch (_: Throwable) {}
+                }
+                if (::zoomGestures.isInitialized) {
+                    try { zoomGestures.resetForNewFile() } catch (_: Throwable) {}
+                }
             }
             try {
                 MPVLib.setPropertyDouble("video-zoom", 0.0)
