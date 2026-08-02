@@ -164,8 +164,11 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
     private var audioFocusRestore: () -> Unit = {}
 
     
-    // Media-driven orientation. On exit the player follows the Activity immediately behind it,
-    // so the returning UI owns its orientation instead of the finishing player guessing it.
+    // Media-driven orientation. The return orientation is captured before media orientation is
+    // requested. Internal launches pass the caller's visible configuration explicitly; external
+    // launches fall back to the physical-device sensor and then the current configuration.
+    private var returnRequestedOrientation = ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
+    private var returnOrientationListener: OrientationEventListener? = null
     private var lastOrientationProbePath: String? = null
     private var uiInitialized = false
 
@@ -408,6 +411,8 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
     override fun onCreate(icicle: Bundle?) {
         super.onCreate(icicle)
 
+        captureReturnOrientation(icicle)
+
         if (intent.action == Intent.ACTION_VIEW)
             parseIntentExtras(intent.extras)
         val filepath = parsePathFromIntent(intent)
@@ -573,16 +578,23 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
 
         prepareZoomSurfaceForWindowExit()
 
-        // Submit the orientation restoration before finish(), in this same main-thread turn.
-        // Android receives the orientation request first, then the close request immediately
-        // afterwards, so the return transition and rotation can be composed together. We do not
-        // wait for onConfigurationChanged(), rotate the visible player first, or hide the window.
-        requestBehindOrientationForExit()
+        // Submit the captured return orientation before finish(), in this same main-thread turn.
+        // The target comes from the caller's visible configuration (internal launch) or from the
+        // physical-device sensor (external launch), rather than from the media-rotated player.
+        requestReturnOrientationForExit()
         finish()
+    }
+
+    override fun onSaveInstanceState(outState: Bundle) {
+        outState.putInt(STATE_RETURN_REQUESTED_ORIENTATION, returnRequestedOrientation)
+        super.onSaveInstanceState(outState)
     }
 
     override fun onDestroy() {
         Log.v(TAG, "Exiting.")
+
+        returnOrientationListener?.disable()
+        returnOrientationListener = null
 
         // Suppress any further callbacks
         activityIsForeground = false
@@ -3133,15 +3145,79 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
         }
     }
 
-    private fun requestBehindOrientationForExit() {
-        if (!packageManager.hasSystemFeature(PackageManager.FEATURE_SCREEN_PORTRAIT))
+    private fun configOrientationToSensorRequest(configOrientation: Int): Int {
+        return when (configOrientation) {
+            Configuration.ORIENTATION_LANDSCAPE ->
+                ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
+            Configuration.ORIENTATION_PORTRAIT ->
+                ActivityInfo.SCREEN_ORIENTATION_SENSOR_PORTRAIT
+            else -> ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
+        }
+    }
+
+    private fun captureReturnOrientation(savedInstanceState: Bundle?) {
+        val restored = savedInstanceState?.getInt(
+            STATE_RETURN_REQUESTED_ORIENTATION,
+            ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED,
+        ) ?: ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
+        if (restored != ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED) {
+            returnRequestedOrientation = restored
+            return
+        }
+
+        // The in-app browser knows exactly which orientation was visible before launching the
+        // player. Prefer that over inspecting MPVActivity after Android has begun launch/config.
+        val callerConfigOrientation = intent.getIntExtra(
+            EXTRA_CALLER_CONFIG_ORIENTATION,
+            Configuration.ORIENTATION_UNDEFINED,
+        )
+        val callerRequest = configOrientationToSensorRequest(callerConfigOrientation)
+        if (callerRequest != ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED) {
+            returnRequestedOrientation = callerRequest
+            return
+        }
+
+        // Immediate fallback for external launchers. A reliable sensor sample, when available,
+        // replaces this value shortly afterwards without waiting or delaying player startup.
+        returnRequestedOrientation = configOrientationToSensorRequest(resources.configuration.orientation)
+        if (!packageManager.hasSystemFeature(PackageManager.FEATURE_SENSOR_ACCELEROMETER))
             return
 
-        // SCREEN_ORIENTATION_BEHIND delegates orientation to the Activity that will become
-        // visible after finish(). This avoids forcing the return UI to the media orientation
-        // and works for both mpv's own browser and external callers.
-        if (requestedOrientation != ActivityInfo.SCREEN_ORIENTATION_BEHIND)
-            requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_BEHIND
+        val listener = object : OrientationEventListener(this) {
+            override fun onOrientationChanged(orientation: Int) {
+                if (orientation == OrientationEventListener.ORIENTATION_UNKNOWN)
+                    return
+
+                // Ignore diagonal/ambiguous positions. SENSOR_* lets Android choose the normal or
+                // reverse variant while preserving the original portrait/landscape axis.
+                val reliableRequest = when (orientation) {
+                    in 0..30, in 150..210, in 330..359 ->
+                        ActivityInfo.SCREEN_ORIENTATION_SENSOR_PORTRAIT
+                    in 60..120, in 240..300 ->
+                        ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
+                    else -> ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
+                }
+                if (reliableRequest == ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED)
+                    return
+
+                returnRequestedOrientation = reliableRequest
+                disable()
+                returnOrientationListener = null
+            }
+        }
+        if (listener.canDetectOrientation()) {
+            returnOrientationListener = listener
+            listener.enable()
+        }
+    }
+
+    private fun requestReturnOrientationForExit() {
+        if (!packageManager.hasSystemFeature(PackageManager.FEATURE_SCREEN_PORTRAIT))
+            return
+        if (returnRequestedOrientation == ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED)
+            return
+        if (requestedOrientation != returnRequestedOrientation)
+            requestedOrientation = returnRequestedOrientation
     }
 
     private fun applyLaunchOrientation(path: String) {
@@ -4291,6 +4367,11 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
     }
 
     companion object {
+        const val EXTRA_CALLER_CONFIG_ORIENTATION =
+            "is.xyz.mpv.MPVActivity.caller_config_orientation"
+
+        private const val STATE_RETURN_REQUESTED_ORIENTATION =
+            "is.xyz.mpv.MPVActivity.return_requested_orientation"
         private const val TAG = "mpv"
         // how long should controls be displayed on screen (ms)
         private const val CONTROLS_DISPLAY_TIMEOUT = 1500L

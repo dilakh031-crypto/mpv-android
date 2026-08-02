@@ -201,6 +201,13 @@ class MainScreenFragment : Fragment(R.layout.fragment_main_screen) {
             i.putExtra("filepath", filepath)
         }
         i.setClass(requireContext(), MPVActivity::class.java)
+        // Preserve the orientation that is actually visible in the browser. MPVActivity may be
+        // forced to the opposite media orientation immediately after launch, so reading its own
+        // configuration later is not a reliable way to know what should be restored on exit.
+        i.putExtra(
+            MPVActivity.EXTRA_CALLER_CONFIG_ORIENTATION,
+            resources.configuration.orientation,
+        )
         playerLauncher.launch(i)
     }
 
