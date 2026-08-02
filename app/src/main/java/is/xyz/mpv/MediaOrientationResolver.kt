@@ -1,4 +1,4 @@
-package `is`.xyz.mpv
+package is.xyz.mpv
 
 import android.content.Context
 import android.graphics.BitmapFactory
