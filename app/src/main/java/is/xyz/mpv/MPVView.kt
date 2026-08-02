@@ -555,6 +555,62 @@ internal class MPVView(context: Context, attrs: AttributeSet) : BaseMPVView(cont
         return if (rot % 180 == 90) h to w else w to h
     }
 
+    /**
+     * Returns the display aspect exposed by mpv's demuxer for the selected video track. Unlike
+     * video-params, this is available before a decoder or Android video surface is created.
+     * Attached cover-art tracks are ignored when a real video track exists.
+     */
+    fun getDemuxVideoAspect(): Double? {
+        readDemuxVideoAspect("current-tracks/video")?.let { return it }
+
+        val count = MPVLib.getPropertyInt("track-list/count") ?: return null
+        var bestAspect: Double? = null
+        var bestScore = Int.MIN_VALUE
+
+        for (index in 0 until count) {
+            val prefix = "track-list/$index"
+            if (MPVLib.getPropertyString("$prefix/type") != "video")
+                continue
+
+            val aspect = readDemuxVideoAspect(prefix) ?: continue
+            val albumArt = MPVLib.getPropertyBoolean("$prefix/albumart") == true
+            val selected = MPVLib.getPropertyBoolean("$prefix/selected") == true
+            val isDefault = MPVLib.getPropertyBoolean("$prefix/default") == true
+            val score = (if (selected) 8 else 0) +
+                (if (isDefault) 4 else 0) +
+                (if (albumArt) -100 else 2)
+            if (score >= bestScore) {
+                bestAspect = aspect
+                bestScore = score
+            }
+        }
+
+        return bestAspect
+    }
+
+    private fun readDemuxVideoAspect(prefix: String): Double? {
+        // Container crop is authoritative when present. This covers streams stored in a larger
+        // coded frame while declaring a narrower visible rectangle.
+        val width = MPVLib.getPropertyInt("$prefix/demux-crop-w")
+            ?.takeIf { it > 0 }
+            ?: MPVLib.getPropertyInt("$prefix/demux-w")?.takeIf { it > 0 }
+            ?: return null
+        val height = MPVLib.getPropertyInt("$prefix/demux-crop-h")
+            ?.takeIf { it > 0 }
+            ?: MPVLib.getPropertyInt("$prefix/demux-h")?.takeIf { it > 0 }
+            ?: return null
+
+        val pixelAspect = MPVLib.getPropertyDouble("$prefix/demux-par")
+            ?.takeIf { it.isFinite() && it > 0.0 } ?: 1.0
+        var aspect = width.toDouble() * pixelAspect / height.toDouble()
+        val rotation = MPVLib.getPropertyInt("$prefix/demux-rotation") ?: 0
+        val normalizedRotation = ((rotation % 360) + 360) % 360
+        if (normalizedRotation == 90 || normalizedRotation == 270)
+            aspect = 1.0 / aspect
+
+        return aspect.takeIf { it.isFinite() && it > 0.001 }
+    }
+
     fun setAudioSessionId(id: Int) {
         MPVLib.setPropertyInt("audiotrack-session-id", id)
         MPVLib.setPropertyInt("aaudio-session-id", id)

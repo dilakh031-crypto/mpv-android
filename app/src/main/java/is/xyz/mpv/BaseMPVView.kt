@@ -59,6 +59,9 @@ abstract class BaseMPVView(context: Context, attrs: AttributeSet) : TextureView(
         surfaceTextureListener = null
         detachSurfaceTexture()
 
+        preloadedFileWaitingForSurface = false
+        revealPreloadedFileWhenSurfaceIsReady = false
+        filePath = null
         MPVLib.destroy()
     }
 
@@ -68,6 +71,9 @@ abstract class BaseMPVView(context: Context, attrs: AttributeSet) : TextureView(
     protected abstract fun observeProperties()
 
     private var filePath: String? = null
+    private var preloadedFileWaitingForSurface = false
+    private var revealPreloadedFileWhenSurfaceIsReady = false
+    private var pauseStateBeforePreload = false
 
     /**
      * Set the first file to be played once the player is ready.
@@ -82,21 +88,48 @@ abstract class BaseMPVView(context: Context, attrs: AttributeSet) : TextureView(
     }
 
     /**
-     * Start demuxing a file before the TextureView is allowed to draw.
+     * Load the first file through mpv before this TextureView is attached to a window.
      *
-     * This is used only by MPVActivity's first-frame orientation gate. The null VO lets mpv/FFmpeg
-     * expose video-params without an Android Surface; when the gate opens, attachSurfaceTexture()
-     * restores [voInUse] and rendering continues on the real surface.
+     * The file remains paused and uses vo=null, so mpv can demux/decode enough metadata to expose
+     * its authoritative video geometry without producing audio or a frame in the caller's old
+     * orientation. [revealPreloadedFile] resumes it only after the real surface exists.
      */
-    fun playFileHeadless(filePath: String) {
-        if (attachedSurface != null) {
-            playFile(filePath)
-            return
-        }
-
+    fun preloadFileForOrientation(filePath: String) {
         this.filePath = null
+        pauseStateBeforePreload = MPVLib.getPropertyBoolean("pause") ?: false
+        preloadedFileWaitingForSurface = true
+        revealPreloadedFileWhenSurfaceIsReady = false
+
+        MPVLib.setPropertyBoolean("pause", true)
         MPVLib.setPropertyString("vo", "null")
         MPVLib.command(arrayOf("loadfile", filePath))
+        // Keep the hold authoritative even if loadfile applies a file-local pause default.
+        MPVLib.setPropertyBoolean("pause", true)
+    }
+
+    /**
+     * Make a file loaded by [preloadFileForOrientation] visible. If Android has not created the
+     * TextureView surface yet, the reveal is completed synchronously from the surface callback.
+     */
+    fun revealPreloadedFile() {
+        if (!preloadedFileWaitingForSurface)
+            return
+
+        revealPreloadedFileWhenSurfaceIsReady = true
+        if (attachedSurface != null)
+            completePreloadedFileReveal()
+    }
+
+    private fun completePreloadedFileReveal() {
+        if (!preloadedFileWaitingForSurface || !revealPreloadedFileWhenSurfaceIsReady)
+            return
+
+        // attachSurfaceTexture() has already installed the real Android surface. Enabling the
+        // configured VO before restoring pause prevents audio or video from advancing invisibly.
+        MPVLib.setPropertyString("vo", voInUse)
+        MPVLib.setPropertyBoolean("pause", pauseStateBeforePreload)
+        preloadedFileWaitingForSurface = false
+        revealPreloadedFileWhenSurfaceIsReady = false
     }
 
     private var voInUse: String = "gpu"
@@ -191,9 +224,12 @@ abstract class BaseMPVView(context: Context, attrs: AttributeSet) : TextureView(
             MPVLib.command(arrayOf("loadfile", filePath as String))
             filePath = null
         } else {
-            // We disable video output when the context disappears, enable it back
+            // We disable video output when the context disappears, enable it back. A headless
+            // launch preload is still paused here and is released immediately below.
             MPVLib.setPropertyString("vo", voInUse)
         }
+
+        completePreloadedFileReveal()
     }
 
     private fun detachSurfaceTexture() {
