@@ -3406,6 +3406,7 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
             future.get(ORIENTATION_PROBE_BUDGET_MS, TimeUnit.MILLISECONDS)
         } catch (_: TimeoutException) {
             future.cancel(true)
+            Log.w(TAG, "Media orientation probe timed out before player attachment: $path")
             return MediaOrientationResolver.Orientation.UNKNOWN
         } catch (_: InterruptedException) {
             Thread.currentThread().interrupt()
@@ -4628,8 +4629,8 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
 
         // The launch probe has no fixed sleep: it returns as soon as local metadata is available.
         // The budget only prevents a cloud-backed/content provider from blocking Activity.onCreate.
-        private const val ORIENTATION_PROBE_BUDGET_MS = 400L
-        private const val ORIENTATION_ASYNC_PROBE_TIMEOUT_MS = 500L
+        private const val ORIENTATION_PROBE_BUDGET_MS = 2500L
+        private const val ORIENTATION_ASYNC_PROBE_TIMEOUT_MS = 2500L
         private const val ORIENTATION_CACHE_SIZE = 8
         private const val PHYSICAL_ORIENTATION_AXIS_HALF_WIDTH_DEGREES = 30
         private const val STATE_ENTRY_CONFIG_ORIENTATION = "entry_config_orientation"
