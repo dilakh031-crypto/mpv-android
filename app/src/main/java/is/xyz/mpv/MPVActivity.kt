@@ -200,6 +200,10 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
     private lateinit var binding: PlayerBinding
     private lateinit var gestures: TouchGestures
     private lateinit var zoomGestures: VideoZoomGestures
+    // A very fast finger replacement may briefly form a two-pointer stream. If no real zoom
+    // starts, the sole remaining pointer must be handed back to TouchGestures instead of leaving
+    // subsequent MOVE events without an owner.
+    private var awaitingSinglePointerGestureHandoff = false
 
     // convenience alias
     private val player get() = binding.player
@@ -385,28 +389,60 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
             if (lockedUI)
                 return@setOnTouchListener false
 
-            if (e.actionMasked == MotionEvent.ACTION_POINTER_DOWN)
-                gestures.cancel()
+            when (e.actionMasked) {
+                MotionEvent.ACTION_DOWN ->
+                    awaitingSinglePointerGestureHandoff = false
+                MotionEvent.ACTION_POINTER_DOWN -> {
+                    gestures.cancel()
+                    awaitingSinglePointerGestureHandoff = true
+                }
+            }
 
-            val blockDefault = zoomGestures.shouldBlockOtherGestures(e)
             val handledByZoom = zoomGestures.onTouchEvent(e)
+            // Decide ownership after VideoZoomGestures has consumed this event. In particular,
+            // ACTION_DOWN clears the preceding touch session; using the stale pre-DOWN state can
+            // block this new DOWN and leave all following MOVE events without a drag owner.
+            val blockDefault = zoomGestures.shouldBlockOtherGestures(e)
             val handOffPointerIndex = if (
+                awaitingSinglePointerGestureHandoff &&
                 zoomGestures.canHandOffSinglePointerAfterPointerUp(e)
             ) {
                 (0 until e.pointerCount).firstOrNull { it != e.actionIndex }
             } else {
                 null
             }
+            val recoverOrphanedSinglePointerMove =
+                awaitingSinglePointerGestureHandoff &&
+                e.actionMasked == MotionEvent.ACTION_MOVE &&
+                zoomGestures.canHandOffSinglePointerDrag(e)
 
-            when {
-                handOffPointerIndex != null ->
+            val handled = when {
+                handOffPointerIndex != null -> {
+                    awaitingSinglePointerGestureHandoff = false
                     gestures.restartSinglePointerGesture(
                         e.getX(handOffPointerIndex),
                         e.getY(handOffPointerIndex),
                     ) || handledByZoom
+                }
+                recoverOrphanedSinglePointerMove -> {
+                    // Some devices omit or delay the usable POINTER_UP handoff. Reconstruct the
+                    // drag origin from the oldest batched point, then process this MOVE normally.
+                    awaitingSinglePointerGestureHandoff = false
+                    val startX = if (e.historySize > 0) e.getHistoricalX(0) else e.x
+                    val startY = if (e.historySize > 0) e.getHistoricalY(0) else e.y
+                    val restarted = gestures.restartSinglePointerGesture(startX, startY)
+                    val handledByDrag = restarted && gestures.onTouchEvent(e)
+                    restarted || handledByDrag || handledByZoom
+                }
                 blockDefault -> handledByZoom
                 else -> gestures.onTouchEvent(e)
             }
+
+            if (e.actionMasked == MotionEvent.ACTION_UP ||
+                e.actionMasked == MotionEvent.ACTION_CANCEL
+            ) awaitingSinglePointerGestureHandoff = false
+
+            handled
         }
 
         ViewCompat.setOnApplyWindowInsetsListener(binding.outside) { _, windowInsets ->

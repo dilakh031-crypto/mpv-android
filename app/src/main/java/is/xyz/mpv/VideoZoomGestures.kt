@@ -111,6 +111,10 @@ internal class VideoZoomGestures(
     private var pinchTouchSessionActive = false
     private var lockedPinchFocusX = 0f
     private var lockedPinchFocusY = 0f
+    // ScaleGestureDetector can briefly report an in-progress/pending scale during a very fast
+    // finger replacement even though the image never zoomed. Track visible zoom ownership
+    // separately so that such a stream can be handed back to one-finger drag gestures.
+    private var zoomStartedDuringPinch = false
 
     private var lastTapTime = 0L
     private var lastTapX = 0f
@@ -199,6 +203,7 @@ internal class VideoZoomGestures(
                 // without delivering that pointer transition to this view.
                 if (!pinchTouchSessionActive) {
                     pinchTouchSessionActive = true
+                    zoomStartedDuringPinch = isZoomed()
                     lockedPinchFocusX = detector.focusX
                     lockedPinchFocusY = detector.focusY
                 }
@@ -245,6 +250,8 @@ internal class VideoZoomGestures(
                 pendingPinchDoubleTapReset = false
                 if (newScale == oldScale)
                     return true
+
+                zoomStartedDuringPinch = true
 
                 // Keep the zoom focus fixed at the midpoint captured when the
                 // two-finger touch session started. Moving both fingers does not
@@ -402,13 +409,15 @@ internal class VideoZoomGestures(
     }
 
     fun shouldBlockOtherGestures(e: MotionEvent): Boolean {
-        return isZoomed() || pendingPinchDoubleTapReset || scaleDetector.isInProgress || e.pointerCount > 1
+        val zoomOwnsCurrentTouch = zoomStartedDuringPinch &&
+                (pinchTouchSessionActive || pendingPinchDoubleTapReset || scaleDetector.isInProgress)
+        return isZoomed() || zoomOwnsCurrentTouch || e.pointerCount > 1
     }
 
     /**
      * A near-simultaneous finger replacement can briefly arrive as two pointers even though no
-     * pinch ever starts. Once one pointer remains, hand that stream back to drag gestures instead
-     * of consuming all of its MOVE events with no active gesture owner.
+     * visible zoom starts. Once one pointer remains, hand that stream back to drag gestures
+     * instead of consuming all of its MOVE events with no active gesture owner.
      *
      * This must be queried after onTouchEvent has fed ACTION_POINTER_UP to the scale detector.
      */
@@ -416,8 +425,12 @@ internal class VideoZoomGestures(
         return e.actionMasked == MotionEvent.ACTION_POINTER_UP &&
                 e.pointerCount - 1 == 1 &&
                 !isZoomed() &&
-                !pendingPinchDoubleTapReset &&
-                !scaleDetector.isInProgress
+                !zoomStartedDuringPinch
+    }
+
+    /** True when an unzoomed one-pointer stream is not owned by an actual pinch. */
+    fun canHandOffSinglePointerDrag(e: MotionEvent): Boolean {
+        return e.pointerCount == 1 && !isZoomed() && !zoomStartedDuringPinch
     }
 
     fun reset() {
@@ -480,6 +493,8 @@ internal class VideoZoomGestures(
         canBeTap = false
         lastTapTime = 0L
         pendingPinchDoubleTapReset = false
+        if (!pinchTouchSessionActive)
+            zoomStartedDuringPinch = false
         stopZoomQualityMonitor()
         zoomRenderSurfaceMode = null
         zoomHighQualityRequested = false
@@ -714,6 +729,7 @@ internal class VideoZoomGestures(
 
         if (!pinchTouchSessionActive) {
             pinchTouchSessionActive = true
+            zoomStartedDuringPinch = isZoomed()
             lockedPinchFocusX = focus.x
             lockedPinchFocusY = focus.y
         }
@@ -721,6 +737,7 @@ internal class VideoZoomGestures(
 
     private fun endPinchTouchSession() {
         pinchTouchSessionActive = false
+        zoomStartedDuringPinch = false
         lockedPinchFocusX = 0f
         lockedPinchFocusY = 0f
     }

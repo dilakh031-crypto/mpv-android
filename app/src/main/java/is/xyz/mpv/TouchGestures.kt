@@ -60,9 +60,13 @@ internal class TouchGestures(private val observer: TouchGesturesObserver) {
     // When seeking is enabled on only one axis, turning toward the non-seek axis pauses seek
     // updates instead of finalizing them. The frozen seek-axis delta lets a later turn back to
     // the enabled axis continue from the same target without counting drift from the paused leg.
-    // If the other axis has an enabled gesture, processDirectionChange switches to it normally.
+    // If seek is enabled on the other axis too, processDirectionChange switches within the same
+    // scrub session so playback remains held until the finger is actually lifted.
     private var seekPausedForNonSeekDirection = false
     private var frozenSeekAxisDelta = 0f
+    // Cumulative observer diff at the origin of the current seek axis. Keeping this value while
+    // switching between horizontal and vertical seek lets both axes share one scrub session.
+    private var seekBaseDiff = 0f
 
     private var width = 0f
     private var height = 0f
@@ -132,6 +136,7 @@ internal class TouchGestures(private val observer: TouchGesturesObserver) {
         state = State.Up
         seekPausedForNonSeekDirection = false
         frozenSeekAxisDelta = 0f
+        seekBaseDiff = 0f
         lastTapTime = 0L
         tapEligible = false
     }
@@ -146,6 +151,14 @@ internal class TouchGestures(private val observer: TouchGesturesObserver) {
         return if (gesture == State.ControlSeek) trigger / 4 else trigger
     }
 
+    private fun seekDiffAt(p: PointF): Float {
+        val axisFraction = if (stateDirection == 0)
+            (p.x - initialPos.x) / width
+        else
+            -(p.y - initialPos.y) / height
+        return seekBaseDiff + CONTROL_SEEK_MAX * axisFraction
+    }
+
     private fun activateGesture(
         gesture: State,
         direction: Int,
@@ -154,6 +167,7 @@ internal class TouchGestures(private val observer: TouchGesturesObserver) {
     ) {
         seekPausedForNonSeekDirection = false
         frozenSeekAxisDelta = 0f
+        seekBaseDiff = 0f
         stateDirection = direction
         state = if (gesture == State.Down) State.Ignored else gesture
         directionAnchor.set(p)
@@ -238,12 +252,26 @@ internal class TouchGestures(private val observer: TouchGesturesObserver) {
             (currentDelta == 0f || nextDelta / currentDelta >= DIRECTION_LOCK_RATIO)
 
         if (changedDirection) {
-            // Turning from an active seek toward an axis where seek is not enabled is not the
-            // end of the touch.
-            // Freeze the current target and ignore that leg instead of sending Finalize. This
-            // is deliberately symmetric for horizontal-only and vertical-only seeking. When
-            // the target axis is enabled (including another seek), switch to it normally below.
-            if (state == State.ControlSeek && nextGesture != State.ControlSeek) {
+            if (state == State.ControlSeek) {
+                if (nextGesture == State.ControlSeek) {
+                    // Both axes belong to the same seek touch. Preserve the cumulative target
+                    // and rebase only the movement axis; Finalize/Init here would briefly end the
+                    // playback hold and could also capture that temporary pause as the final
+                    // playback state.
+                    seekBaseDiff = seekDiffAt(lastPos)
+                    seekPausedForNonSeekDirection = false
+                    frozenSeekAxisDelta = 0f
+                    stateDirection = nextDirection
+                    initialPos.set(p)
+                    directionAnchor.set(p)
+                    lastPos.set(p)
+                    return true
+                }
+
+                // Turning from an active seek toward an axis where seek is not enabled is not
+                // the end of the touch. Freeze the current target and ignore that leg instead
+                // of sending Finalize. This is symmetric for horizontal-only and vertical-only
+                // seeking.
                 frozenSeekAxisDelta = if (stateDirection == 0)
                     lastPos.x - initialPos.x
                 else
@@ -362,7 +390,7 @@ internal class TouchGestures(private val observer: TouchGesturesObserver) {
                 }
             }
             State.ControlSeek ->
-                sendPropertyChange(PropertyChange.Seek, CONTROL_SEEK_MAX * dr)
+                sendPropertyChange(PropertyChange.Seek, seekDiffAt(p))
             State.ControlVolume ->
                 sendPropertyChange(PropertyChange.Volume, CONTROL_VOLUME_MAX * dr)
             State.ControlBright ->
@@ -407,6 +435,7 @@ internal class TouchGestures(private val observer: TouchGesturesObserver) {
         maxAbsDy = 0f
         seekPausedForNonSeekDirection = false
         frozenSeekAxisDelta = 0f
+        seekBaseDiff = 0f
         state = State.Down
         return true
     }
@@ -464,6 +493,7 @@ internal class TouchGestures(private val observer: TouchGesturesObserver) {
                 state = State.Up
                 seekPausedForNonSeekDirection = false
                 frozenSeekAxisDelta = 0f
+                seekBaseDiff = 0f
                 tapEligible = false
             }
             MotionEvent.ACTION_DOWN -> {
