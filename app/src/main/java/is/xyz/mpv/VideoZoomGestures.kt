@@ -276,7 +276,12 @@ internal class VideoZoomGestures(
                 }
             }
         }
-    )
+    ).apply {
+        // Zoom is exclusively a real multi-touch pinch in this player. Android enables
+        // double-tap-and-drag "quick scale" by default; that can steal a new one-finger seek
+        // when it starts immediately after the preceding finger is lifted.
+        setQuickScaleEnabled(false)
+    }
 
     fun setMetrics(width: Float, height: Float) {
         stopFling()
@@ -398,6 +403,21 @@ internal class VideoZoomGestures(
 
     fun shouldBlockOtherGestures(e: MotionEvent): Boolean {
         return isZoomed() || pendingPinchDoubleTapReset || scaleDetector.isInProgress || e.pointerCount > 1
+    }
+
+    /**
+     * A near-simultaneous finger replacement can briefly arrive as two pointers even though no
+     * pinch ever starts. Once one pointer remains, hand that stream back to drag gestures instead
+     * of consuming all of its MOVE events with no active gesture owner.
+     *
+     * This must be queried after onTouchEvent has fed ACTION_POINTER_UP to the scale detector.
+     */
+    fun canHandOffSinglePointerAfterPointerUp(e: MotionEvent): Boolean {
+        return e.actionMasked == MotionEvent.ACTION_POINTER_UP &&
+                e.pointerCount - 1 == 1 &&
+                !isZoomed() &&
+                !pendingPinchDoubleTapReset &&
+                !scaleDetector.isInProgress
     }
 
     fun reset() {

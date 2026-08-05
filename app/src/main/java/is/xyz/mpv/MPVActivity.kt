@@ -390,8 +390,20 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
 
             val blockDefault = zoomGestures.shouldBlockOtherGestures(e)
             val handledByZoom = zoomGestures.onTouchEvent(e)
+            val handOffPointerIndex = if (
+                zoomGestures.canHandOffSinglePointerAfterPointerUp(e)
+            ) {
+                (0 until e.pointerCount).firstOrNull { it != e.actionIndex }
+            } else {
+                null
+            }
 
             when {
+                handOffPointerIndex != null ->
+                    gestures.restartSinglePointerGesture(
+                        e.getX(handOffPointerIndex),
+                        e.getY(handOffPointerIndex),
+                    ) || handledByZoom
                 blockDefault -> handledByZoom
                 else -> gestures.onTouchEvent(e)
             }

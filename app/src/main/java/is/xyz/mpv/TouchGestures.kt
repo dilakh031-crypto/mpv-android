@@ -44,6 +44,9 @@ internal class TouchGestures(private val observer: TouchGesturesObserver) {
     private var lastTapTime = 0L
     // when the current gesture began
     private var lastDownTime = 0L
+    // A one-finger stream handed back after an unconsumed multi-touch transition may seek, but
+    // must not turn that pointer transition into a tap or prime a later double-tap action.
+    private var tapEligible = false
 
     // where user initially placed their finger (ACTION_DOWN)
     private var initialPos = PointF()
@@ -54,11 +57,12 @@ internal class TouchGestures(private val observer: TouchGesturesObserver) {
     private var maxAbsDy = 0f
     // latest point that still belonged clearly to the active movement axis
     private var directionAnchor = PointF()
-    // Once a horizontal seek is active, a vertical turn pauses seek updates instead of
-    // finalizing the gesture. The frozen horizontal delta lets a later horizontal turn
-    // continue from the same seek target without counting sideways drift from the vertical leg.
-    private var seekVerticalMovement = false
-    private var frozenSeekDx = 0f
+    // When seeking is enabled on only one axis, turning toward the non-seek axis pauses seek
+    // updates instead of finalizing them. The frozen seek-axis delta lets a later turn back to
+    // the enabled axis continue from the same target without counting drift from the paused leg.
+    // If the other axis has an enabled gesture, processDirectionChange switches to it normally.
+    private var seekPausedForNonSeekDirection = false
+    private var frozenSeekAxisDelta = 0f
 
     private var width = 0f
     private var height = 0f
@@ -126,9 +130,10 @@ internal class TouchGestures(private val observer: TouchGesturesObserver) {
         if (state.isControl())
             sendPropertyChange(PropertyChange.Finalize, 0f)
         state = State.Up
-        seekVerticalMovement = false
-        frozenSeekDx = 0f
+        seekPausedForNonSeekDirection = false
+        frozenSeekAxisDelta = 0f
         lastTapTime = 0L
+        tapEligible = false
     }
 
     private fun State.isControl(): Boolean {
@@ -147,8 +152,8 @@ internal class TouchGestures(private val observer: TouchGesturesObserver) {
         p: PointF,
         rebaseOrigin: Boolean,
     ) {
-        seekVerticalMovement = false
-        frozenSeekDx = 0f
+        seekPausedForNonSeekDirection = false
+        frozenSeekAxisDelta = 0f
         stateDirection = direction
         state = if (gesture == State.Down) State.Ignored else gesture
         directionAnchor.set(p)
@@ -171,37 +176,44 @@ internal class TouchGestures(private val observer: TouchGesturesObserver) {
         }
     }
 
-    private fun processVerticalMovementDuringSeek(p: PointF): Boolean {
+    private fun processMovementWhileSeekPaused(p: PointF): Boolean {
         val dx = p.x - directionAnchor.x
         val dy = p.y - directionAnchor.y
-        val absDx = abs(dx)
-        val absDy = abs(dy)
+        val seekAxisDelta = if (stateDirection == 0) dx else dy
+        val pausedAxisDelta = if (stateDirection == 0) dy else dx
+        val absSeekAxisDelta = abs(seekAxisDelta)
+        val absPausedAxisDelta = abs(pausedAxisDelta)
 
-        // Resume seek updates only after the new movement is clearly horizontal. Sideways
-        // drift accumulated while moving vertically is excluded; only this horizontal leg is
-        // added to the seek delta that was visible before the direction changed.
-        val horizontalIntent =
-            absDx > activationThreshold(State.ControlSeek) &&
-            (absDy == 0f || absDx / absDy >= DIRECTION_LOCK_RATIO)
-        if (horizontalIntent) {
-            val resumedSeekDx = frozenSeekDx + dx
-            initialPos.x = p.x - resumedSeekDx
-            seekVerticalMovement = false
-            frozenSeekDx = 0f
-            stateDirection = 0
+        // Resume only after movement is clearly back on the enabled seek axis. Drift gathered
+        // on the non-seek axis is excluded; only the new seek-axis leg is added to the target
+        // that was visible before the direction changed.
+        val resumeSeekIntent =
+            absSeekAxisDelta > activationThreshold(State.ControlSeek) &&
+            (absPausedAxisDelta == 0f ||
+                    absSeekAxisDelta / absPausedAxisDelta >= DIRECTION_LOCK_RATIO)
+        if (resumeSeekIntent) {
+            val resumedSeekDelta = frozenSeekAxisDelta + seekAxisDelta
+            if (stateDirection == 0)
+                initialPos.x = p.x - resumedSeekDelta
+            else
+                initialPos.y = p.y - resumedSeekDelta
+            seekPausedForNonSeekDirection = false
+            frozenSeekAxisDelta = 0f
             directionAnchor.set(p)
             return false
         }
 
-        // Follow the vertical leg with the direction anchor so a later horizontal turn is
-        // recognized locally, regardless of how far up or down the finger has moved.
-        val continuesVertically =
-            absDy > 0f && (absDx == 0f || absDy / absDx >= DIRECTION_LOCK_RATIO)
-        if (continuesVertically)
+        // Follow the non-seek-axis leg so a later turn back to seek is recognized locally,
+        // regardless of how far the finger moved while seek updates were paused.
+        val continuesOnPausedAxis =
+            absPausedAxisDelta > 0f &&
+            (absSeekAxisDelta == 0f ||
+                    absPausedAxisDelta / absSeekAxisDelta >= DIRECTION_LOCK_RATIO)
+        if (continuesOnPausedAxis)
             directionAnchor.set(p)
 
         // Keep throttling relative to the latest ignored point. No observer event is sent, so
-        // the pending seek target remains unchanged until horizontal movement resumes or the
+        // the pending seek target remains unchanged until seek-axis movement resumes or the
         // finger is actually lifted.
         lastPos.set(p)
         return true
@@ -226,12 +238,17 @@ internal class TouchGestures(private val observer: TouchGesturesObserver) {
             (currentDelta == 0f || nextDelta / currentDelta >= DIRECTION_LOCK_RATIO)
 
         if (changedDirection) {
-            // A vertical turn during an active horizontal seek is not the end of the touch.
-            // Freeze the last seek delta and ignore the vertical leg instead of sending
-            // Finalize (which would execute the seek as though ACTION_UP had occurred).
-            if (state == State.ControlSeek && stateDirection == 0 && nextDirection == 1) {
-                frozenSeekDx = lastPos.x - initialPos.x
-                seekVerticalMovement = true
+            // Turning from an active seek toward an axis where seek is not enabled is not the
+            // end of the touch.
+            // Freeze the current target and ignore that leg instead of sending Finalize. This
+            // is deliberately symmetric for horizontal-only and vertical-only seeking. When
+            // the target axis is enabled (including another seek), switch to it normally below.
+            if (state == State.ControlSeek && nextGesture != State.ControlSeek) {
+                frozenSeekAxisDelta = if (stateDirection == 0)
+                    lastPos.x - initialPos.x
+                else
+                    lastPos.y - initialPos.y
+                seekPausedForNonSeekDirection = true
                 directionAnchor.set(p)
                 lastPos.set(p)
                 return true
@@ -262,6 +279,8 @@ internal class TouchGestures(private val observer: TouchGesturesObserver) {
                 lastTapTime = 0 // last tap was too far away, invalidate
             return true
         }
+        if (!tapEligible)
+            return false
         // discard if any movement gesture took place
         if (state != State.Down)
             return false
@@ -287,8 +306,8 @@ internal class TouchGestures(private val observer: TouchGesturesObserver) {
     }
 
     private fun processMovement(p: PointF): Boolean {
-        if (state == State.ControlSeek && seekVerticalMovement &&
-            processVerticalMovementDuringSeek(p)
+        if (state == State.ControlSeek && seekPausedForNonSeekDirection &&
+            processMovementWhileSeekPaused(p)
         ) return true
         if (state != State.Up && state != State.Down && processDirectionChange(p))
             return true
@@ -372,6 +391,36 @@ internal class TouchGestures(private val observer: TouchGesturesObserver) {
         observer.onPropertyChange(p, diff)
     }
 
+    private fun beginSinglePointerGesture(p: PointF, allowTap: Boolean): Boolean {
+        // deadzone on top/bottom
+        if (p.y < height * DEADZONE / 100 || p.y > height * (100 - DEADZONE) / 100)
+            return false
+
+        tapEligible = allowTap
+        initialPos.set(p)
+        if (allowTap)
+            processTap(p)
+        else
+            lastTapTime = 0L
+        lastPos.set(p)
+        maxAbsDx = 0f
+        maxAbsDy = 0f
+        seekPausedForNonSeekDirection = false
+        frozenSeekAxisDelta = 0f
+        state = State.Down
+        return true
+    }
+
+    /**
+     * Starts a fresh drag from the sole pointer left after a multi-touch contact that never
+     * became zoom. MPVActivity has already cancelled the pre-multitouch gesture at this point.
+     */
+    fun restartSinglePointerGesture(x: Float, y: Float): Boolean {
+        if (width < 1 || height < 1 || !checkFloat(x, y))
+            return false
+        return beginSinglePointerGesture(PointF(x, y), allowTap = false)
+    }
+
     fun syncSettings(prefs: SharedPreferences, resources: Resources) {
         val get: (String, Int) -> String = { key, defaultRes ->
             val v = prefs.getString(key, "")
@@ -413,23 +462,13 @@ internal class TouchGestures(private val observer: TouchGesturesObserver) {
                 if (state.isControl())
                     sendPropertyChange(PropertyChange.Finalize, 0f)
                 state = State.Up
-                seekVerticalMovement = false
-                frozenSeekDx = 0f
+                seekPausedForNonSeekDirection = false
+                frozenSeekAxisDelta = 0f
+                tapEligible = false
             }
             MotionEvent.ACTION_DOWN -> {
-                // deadzone on top/bottom
-                if (e.y < height * DEADZONE / 100 || e.y > height * (100 - DEADZONE) / 100)
-                    return false
-                initialPos.set(point)
-                processTap(point)
-                lastPos.set(point)
-                maxAbsDx = 0f
-                maxAbsDy = 0f
-                seekVerticalMovement = false
-                frozenSeekDx = 0f
-                state = State.Down
                 // always return true on ACTION_DOWN to continue receiving events
-                gestureHandled = true
+                gestureHandled = beginSinglePointerGesture(point, allowTap = true)
             }
             MotionEvent.ACTION_MOVE -> {
                 gestureHandled = processMovement(e)
