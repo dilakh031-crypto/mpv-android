@@ -4090,7 +4090,13 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
         scrubSeekHandler.removeCallbacks(scrubHardTimeoutRunnable)
         scrubSeekHandler.postDelayed(scrubHardTimeoutRunnable, SCRUB_SEEK_HARD_TIMEOUT_MS)
 
-        val mode = if (exact) "absolute+exact" else "absolute+keyframes"
+        val adjacentKeyframe = !exact &&
+            abs(targetSec - initialSeek.roundToInt()) == 1.0
+        val mode = when {
+            exact -> "absolute+exact"
+            adjacentKeyframe -> "absolute+keyframes+adjacent-keyframe"
+            else -> "absolute+keyframes"
+        }
         val result = try {
             MPVLib.commandAsync(arrayOf("seek", targetSec.toString(), mode), request.userdata)
         } catch (error: Throwable) {

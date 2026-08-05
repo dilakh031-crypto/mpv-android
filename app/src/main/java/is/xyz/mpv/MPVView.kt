@@ -13,6 +13,7 @@ import `is`.xyz.mpv.MPVLib.MpvFormat.MPV_FORMAT_FLAG
 import `is`.xyz.mpv.MPVLib.MpvFormat.MPV_FORMAT_INT64
 import `is`.xyz.mpv.MPVLib.MpvFormat.MPV_FORMAT_NONE
 import `is`.xyz.mpv.MPVLib.MpvFormat.MPV_FORMAT_STRING
+import java.io.File
 import java.security.MessageDigest
 import kotlin.reflect.KProperty
 
@@ -20,6 +21,7 @@ internal class MPVView(context: Context, attrs: AttributeSet) : BaseMPVView(cont
     private var watchLaterOptionsBeforeDisable: String? = null
     private var watchLaterOptionsSuppressed = false
     private var exactSeekFrameCacheEnabled = false
+    private var exactSeekCacheDirPath = ""
 
     val usesExactSeekFrameCache: Boolean
         get() = exactSeekFrameCacheEnabled
@@ -32,6 +34,16 @@ internal class MPVView(context: Context, attrs: AttributeSet) : BaseMPVView(cont
         val persistFileState = sharedPreferences.getBoolean("save_position", false)
         exactSeekFrameCacheEnabled =
             sharedPreferences.getBoolean("seek_gesture_smooth", false)
+        val exactSeekCacheDir = File(context.cacheDir, "exact-seek-cache")
+        // Remove files left by a killed process before starting a new player session.
+        val oldCacheRemoved = exactSeekCacheDir.deleteRecursively()
+        if (exactSeekFrameCacheEnabled &&
+            (!oldCacheRemoved ||
+             (!exactSeekCacheDir.mkdirs() && !exactSeekCacheDir.isDirectory))) {
+            Log.w(TAG, "Disabling exact-seek cache because its temporary directory is unavailable")
+            exactSeekFrameCacheEnabled = false
+        }
+        exactSeekCacheDirPath = exactSeekCacheDir.path
 
         // apply phone-optimized defaults
         MPVLib.setOptionString("profile", "fast")
@@ -114,6 +126,11 @@ internal class MPVView(context: Context, attrs: AttributeSet) : BaseMPVView(cont
         MPVLib.setOptionString("gpu-context", "android")
         MPVLib.setOptionString("opengl-es", "yes")
         MPVLib.setOptionString("hwdec", hwdec)
+        MPVLib.setOptionString("exact-seek-cache-dir", exactSeekCacheDirPath)
+        MPVLib.setOptionString(
+            "exact-seek-cache-max-bytes",
+            EXACT_SEEK_CACHE_MAX_BYTES.toString()
+        )
         MPVLib.setOptionString(
             "exact-seek-cache-secs",
             if (exactSeekFrameCacheEnabled) EXACT_SEEK_CACHE_SECONDS.toString() else "0"
@@ -142,7 +159,12 @@ internal class MPVView(context: Context, attrs: AttributeSet) : BaseMPVView(cont
     override fun postInitOptions() {
         val sharedPreferences = PreferenceManager.getDefaultSharedPreferences(context)
         // Apply this after mpv.conf so the Android preference remains authoritative: disabled
-        // means no frame/audio references are retained at all.
+        // means no decoded A/V cache files are written at all.
+        MPVLib.setPropertyString("exact-seek-cache-dir", exactSeekCacheDirPath)
+        MPVLib.setPropertyString(
+            "exact-seek-cache-max-bytes",
+            EXACT_SEEK_CACHE_MAX_BYTES.toString()
+        )
         MPVLib.setPropertyDouble(
             "exact-seek-cache-secs",
             if (exactSeekFrameCacheEnabled) EXACT_SEEK_CACHE_SECONDS.toDouble() else 0.0
@@ -711,9 +733,10 @@ internal class MPVView(context: Context, attrs: AttributeSet) : BaseMPVView(cont
 
         // mpv option `hwdec` is set to this
         private const val HWDECS = "mediacodec,mediacodec-copy"
-        // Direct MediaCodec frames retain a small, driver-limited surface pool. Copy-back frames
-        // can safely outlive the decoder while the ten-second exact-seek window owns them.
+        // Direct MediaCodec frames are opaque GPU surfaces. Copy-back provides CPU-readable
+        // frames that the native ten-second exact-seek window can serialize to temporary files.
         private const val SEEK_CACHE_HWDECS = "mediacodec-copy"
         private const val EXACT_SEEK_CACHE_SECONDS = 10
+        private const val EXACT_SEEK_CACHE_MAX_BYTES = 1_073_741_824L
     }
 }
