@@ -19,10 +19,19 @@ import kotlin.reflect.KProperty
 internal class MPVView(context: Context, attrs: AttributeSet) : BaseMPVView(context, attrs) {
     private var watchLaterOptionsBeforeDisable: String? = null
     private var watchLaterOptionsSuppressed = false
+    private var exactSeekFrameCacheEnabled = false
+
+    val usesExactSeekFrameCache: Boolean
+        get() = exactSeekFrameCacheEnabled
+
+    private val availableHwdecs: String
+        get() = if (exactSeekFrameCacheEnabled) SEEK_CACHE_HWDECS else HWDECS
 
     override fun initOptions() {
         val sharedPreferences = PreferenceManager.getDefaultSharedPreferences(context)
         val persistFileState = sharedPreferences.getBoolean("save_position", false)
+        exactSeekFrameCacheEnabled =
+            sharedPreferences.getBoolean("seek_gesture_smooth", false)
 
         // apply phone-optimized defaults
         MPVLib.setOptionString("profile", "fast")
@@ -38,7 +47,7 @@ internal class MPVView(context: Context, attrs: AttributeSet) : BaseMPVView(cont
 
         // hwdec
         val hwdec = if (sharedPreferences.getBoolean("hardware_decoding", true))
-            HWDECS
+            availableHwdecs
         else
             "no"
 
@@ -105,6 +114,10 @@ internal class MPVView(context: Context, attrs: AttributeSet) : BaseMPVView(cont
         MPVLib.setOptionString("gpu-context", "android")
         MPVLib.setOptionString("opengl-es", "yes")
         MPVLib.setOptionString("hwdec", hwdec)
+        MPVLib.setOptionString(
+            "exact-seek-cache-secs",
+            if (exactSeekFrameCacheEnabled) EXACT_SEEK_CACHE_SECONDS.toString() else "0"
+        )
         MPVLib.setOptionString("hwdec-codecs", "h264,hevc,mpeg4,mpeg2video,vp8,vp9,av1")
         MPVLib.setOptionString("ao", "audiotrack,opensles")
         MPVLib.setOptionString("audio-set-media-role", "yes")
@@ -127,6 +140,21 @@ internal class MPVView(context: Context, attrs: AttributeSet) : BaseMPVView(cont
     }
 
     override fun postInitOptions() {
+        val sharedPreferences = PreferenceManager.getDefaultSharedPreferences(context)
+        // Apply this after mpv.conf so the Android preference remains authoritative: disabled
+        // means no frame/audio references are retained at all.
+        MPVLib.setPropertyDouble(
+            "exact-seek-cache-secs",
+            if (exactSeekFrameCacheEnabled) EXACT_SEEK_CACHE_SECONDS.toDouble() else 0.0
+        )
+        if (exactSeekFrameCacheEnabled) {
+            val safeHwdec = if (sharedPreferences.getBoolean("hardware_decoding", true))
+                availableHwdecs
+            else
+                "no"
+            MPVLib.setPropertyString("hwdec", safeHwdec)
+        }
+
         // We call write-watch-later manually, including before every explicit playlist jump.
         MPVLib.setOptionString("save-position-on-quit", "no")
 
@@ -134,7 +162,6 @@ internal class MPVView(context: Context, attrs: AttributeSet) : BaseMPVView(cont
         // exposed as a per-video control by this app, including changes made through input.conf.
         mergeStringListProperty("reset-on-next-file", PER_FILE_PLAYBACK_OPTIONS + "start")
 
-        val sharedPreferences = PreferenceManager.getDefaultSharedPreferences(context)
         configureFileStatePersistence(sharedPreferences.getBoolean("save_position", false))
     }
 
@@ -201,7 +228,12 @@ internal class MPVView(context: Context, attrs: AttributeSet) : BaseMPVView(cont
      * value is restored to the pre-file value when this file unloads.
      */
     fun setFileLocalString(name: String, value: String) {
-        MPVLib.setPropertyString("file-local-options/$name", value)
+        val safeValue = if (exactSeekFrameCacheEnabled && name == "hwdec" &&
+            value == "mediacodec")
+            "mediacodec-copy"
+        else
+            value
+        MPVLib.setPropertyString("file-local-options/$name", safeValue)
     }
 
     fun setFileLocalInt(name: String, value: Int) {
@@ -604,7 +636,7 @@ internal class MPVView(context: Context, attrs: AttributeSet) : BaseMPVView(cont
     fun cycleHwdec() {
         if (!makeCurrentOptionFileLocal("hwdec"))
             return
-        MPVLib.command(arrayOf("cycle-values", "hwdec", HWDECS, "no"))
+        MPVLib.command(arrayOf("cycle-values", "hwdec", availableHwdecs, "no"))
         persistCurrentFileState()
     }
 
@@ -679,5 +711,9 @@ internal class MPVView(context: Context, attrs: AttributeSet) : BaseMPVView(cont
 
         // mpv option `hwdec` is set to this
         private const val HWDECS = "mediacodec,mediacodec-copy"
+        // Direct MediaCodec frames retain a small, driver-limited surface pool. Copy-back frames
+        // can safely outlive the decoder while the ten-second exact-seek window owns them.
+        private const val SEEK_CACHE_HWDECS = "mediacodec-copy"
+        private const val EXACT_SEEK_CACHE_SECONDS = 10
     }
 }

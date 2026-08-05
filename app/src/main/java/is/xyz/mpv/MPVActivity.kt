@@ -2491,7 +2491,7 @@ private fun pickDecoder() {
         Pair("HW (mediacodec-copy)", "mediacodec-copy"),
         Pair("SW", "no")
     )
-    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O)
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && !player.usesExactSeekFrameCache)
         items.add(0, Pair("HW+ (mediacodec)", "mediacodec"))
 
     val hwdecActive = player.hwdecActive
