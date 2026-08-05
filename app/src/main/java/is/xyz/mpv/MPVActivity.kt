@@ -114,6 +114,8 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
         val generation: Long,
         val targetSec: Double,
         val exact: Boolean,
+        val commandValueSec: Double,
+        val directionalKeyframeDirection: Int,
         val issuedAtMs: Long,
         val frameFloor: Long
     ) {
@@ -2491,7 +2493,7 @@ private fun pickDecoder() {
         Pair("HW (mediacodec-copy)", "mediacodec-copy"),
         Pair("SW", "no")
     )
-    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && !player.usesExactSeekFrameCache)
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O)
         items.add(0, Pair("HW+ (mediacodec)", "mediacodec"))
 
     val hwdecActive = player.hwdecActive
@@ -4054,7 +4056,7 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
         if (request.exact == exact && sameSeekTarget(request.targetSec, targetSec))
             return
 
-        // mpv already coalesces absolute seeks internally. Do not pretend mpv_abort_async_command
+        // mpv already coalesces queued seeks internally. Do not pretend mpv_abort_async_command
         // stopped decoder work; simply revoke the old request's authority over UI/playback state.
         request.superseded = true
         scrubSeekHandler.removeCallbacks(scrubFrameGraceRunnable)
@@ -4070,6 +4072,39 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
     }
 
     private fun sendScrubSeek(targetSec: Double, exact: Boolean): Boolean {
+        val mode = if (exact) "absolute+exact" else "absolute+keyframes"
+        return queueScrubSeek(targetSec, exact, targetSec, mode)
+    }
+
+    private fun sendGestureScrubSeek(targetSec: Int): Boolean {
+        if (smoothSeekGesture)
+            return sendScrubSeek(targetSec.toDouble(), exact = true)
+
+        val direction = targetSec.compareTo(initialSeek.roundToInt())
+        if (direction == 0)
+            return sendScrubSeek(targetSec.toDouble(), exact = false)
+
+        // An absolute keyframe seek always rounds backwards. First align playback with the
+        // keyframe that owns the gesture's starting position; after that request settles,
+        // complete the seek relatively so mpv can honor the requested direction. In particular,
+        // clamping the second stage just past this anchor makes even +1/-1 select the adjacent
+        // next/previous keyframe instead of resolving to the same GOP anchor.
+        return queueScrubSeek(
+            targetSec = targetSec.toDouble(),
+            exact = false,
+            commandValueSec = initialSeek.toDouble(),
+            commandMode = "absolute+keyframes",
+            directionalKeyframeDirection = direction
+        )
+    }
+
+    private fun queueScrubSeek(
+        targetSec: Double,
+        exact: Boolean,
+        commandValueSec: Double,
+        commandMode: String,
+        directionalKeyframeDirection: Int = 0
+    ): Boolean {
         supersedeActiveScrubSeekIfTargetChanged(targetSec, exact)
 
         val request = ScrubSeekRequest(
@@ -4077,6 +4112,8 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
             generation = ++scrubSeekGeneration,
             targetSec = targetSec,
             exact = exact,
+            commandValueSec = commandValueSec,
+            directionalKeyframeDirection = directionalKeyframeDirection,
             issuedAtMs = SystemClock.uptimeMillis(),
             frameFloor = playerSurfaceFrameSerial
         )
@@ -4090,15 +4127,11 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
         scrubSeekHandler.removeCallbacks(scrubHardTimeoutRunnable)
         scrubSeekHandler.postDelayed(scrubHardTimeoutRunnable, SCRUB_SEEK_HARD_TIMEOUT_MS)
 
-        val adjacentKeyframe = !exact &&
-            abs(targetSec - initialSeek.roundToInt()) == 1.0
-        val mode = when {
-            exact -> "absolute+exact"
-            adjacentKeyframe -> "absolute+keyframes+adjacent-keyframe"
-            else -> "absolute+keyframes"
-        }
         val result = try {
-            MPVLib.commandAsync(arrayOf("seek", targetSec.toString(), mode), request.userdata)
+            MPVLib.commandAsync(
+                arrayOf("seek", commandValueSec.toString(), commandMode),
+                request.userdata
+            )
         } catch (error: Throwable) {
             Log.e(TAG, "failed to queue scrub seek generation ${request.generation}", error)
             failActiveScrubSeek(request, Int.MIN_VALUE)
@@ -4204,6 +4237,13 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
             !request.playbackRestartSeen || mpvSeeking
         ) return
 
+        // The anchor stage is internal: once mpv has settled on its keyframe, immediately queue
+        // the visible directional stage instead of waiting for the anchor frame to be rendered.
+        if (request.directionalKeyframeDirection != 0) {
+            completeActiveScrubSeek(request, "keyframe-anchor")
+            return
+        }
+
         if (request.targetPositionSeen && request.frameSeen) {
             completeActiveScrubSeek(request, "frame")
             return
@@ -4247,6 +4287,12 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
         if (activeScrubSeek !== request)
             return
 
+        val continueDirectionalKeyframeSeek = request.directionalKeyframeDirection != 0 &&
+                !request.superseded && reason != "timeout"
+        val keyframeAnchorSec = latestPlaybackTimeSec.takeIf { it.isFinite() }
+            ?: readScrubPlaybackTimeFromMpv()
+            ?: request.commandValueSec
+
         scrubSeekHandler.removeCallbacks(scrubFrameGraceRunnable)
         scrubSeekHandler.removeCallbacks(scrubHardTimeoutRunnable)
         activeScrubSeek = null
@@ -4261,6 +4307,22 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
                 TAG,
                 "exact scrub seek generation ${request.generation} completed by $reason in ${elapsed}ms"
             )
+        }
+
+        if (continueDirectionalKeyframeSeek) {
+            val relativeAmountSec = (request.targetSec - keyframeAnchorSec).let { amount ->
+                if (request.directionalKeyframeDirection > 0)
+                    amount.coerceAtLeast(KEYFRAME_DIRECTION_EPSILON_SEC)
+                else
+                    amount.coerceAtMost(-KEYFRAME_DIRECTION_EPSILON_SEC)
+            }
+            if (queueScrubSeek(
+                    targetSec = request.targetSec,
+                    exact = false,
+                    commandValueSec = relativeAmountSec,
+                    commandMode = "relative+keyframes"
+                )
+            ) return
         }
 
         finishScrubPlaybackHoldIfReady()
@@ -4286,7 +4348,7 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
         val target = pendingGestureSeekSec ?: return
         val exact = smoothSeekGesture
         if (gestureTargetAlreadyResolved(target, exact)) return
-        if (sendScrubSeek(target.toDouble(), exact))
+        if (sendGestureScrubSeek(target))
             lastIssuedGestureSeekSec = target
     }
 
@@ -4440,7 +4502,7 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
                 if (target != null &&
                     !gestureTargetAlreadyResolved(target, exact = smoothSeekGesture)
                 ) {
-                    if (sendScrubSeek(target.toDouble(), exact = smoothSeekGesture))
+                    if (sendGestureScrubSeek(target))
                         lastIssuedGestureSeekSec = target
                 }
 
@@ -4540,6 +4602,7 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
         private const val SCRUB_TARGET_NEAR_TOLERANCE_SEC = 0.75
         private const val SCRUB_FRAME_GRACE_MS = 350L
         private const val SCRUB_SEEK_HARD_TIMEOUT_MS = 45_000L
+        private const val KEYFRAME_DIRECTION_EPSILON_SEC = 0.001
 
         // Per-file subtitle persistence keys
         private const val PREF_SUB_KIND = "sub_kind"
