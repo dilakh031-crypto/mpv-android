@@ -20,6 +20,9 @@ extern "C" {
 
 #define ARRAYLEN(a) (sizeof(a)/sizeof(a[0]))
 
+// render.cpp owns the JNI global reference for the currently attached Android Surface.
+void release_surface_reference(JNIEnv *env);
+
 extern "C" {
     jni_func(void, create, jobject appctx);
     jni_func(void, init);
@@ -91,6 +94,10 @@ jni_func(void, destroy) {
 
     mpv_terminate_destroy(g_mpv);
     g_mpv = NULL;
+
+    // The VO/EGL teardown is synchronous at this point, so the Android Surface global reference
+    // can be released without racing a renderer thread.
+    release_surface_reference(env);
 }
 
 jni_func(void, command, jobjectArray jarray) {
