@@ -19,6 +19,8 @@ import kotlin.reflect.KProperty
 internal class MPVView(context: Context, attrs: AttributeSet) : BaseMPVView(context, attrs) {
     private var watchLaterOptionsBeforeDisable: String? = null
     private var watchLaterOptionsSuppressed = false
+    private var hwdecPersistencePending = false
+    private var hwdecPersistencePath: String? = null
 
     override fun initOptions() {
         val sharedPreferences = PreferenceManager.getDefaultSharedPreferences(context)
@@ -204,6 +206,12 @@ internal class MPVView(context: Context, attrs: AttributeSet) : BaseMPVView(cont
         MPVLib.setPropertyString("file-local-options/$name", value)
     }
 
+    fun setFileLocalHwdec(value: String) {
+        hwdecPersistencePending = true
+        hwdecPersistencePath = MPVLib.getPropertyString("path")
+        setFileLocalString("hwdec", value)
+    }
+
     fun setFileLocalInt(name: String, value: Int) {
         MPVLib.setPropertyInt("file-local-options/$name", value)
     }
@@ -260,7 +268,7 @@ internal class MPVView(context: Context, attrs: AttributeSet) : BaseMPVView(cont
                 else
                     putString(key, value)
             }
-            commit()
+            apply()
         }
     }
 
@@ -282,7 +290,7 @@ internal class MPVView(context: Context, attrs: AttributeSet) : BaseMPVView(cont
         with (preferences.edit()) {
             for (option in APP_PERSISTED_PLAYBACK_OPTIONS)
                 remove(perFilePlaybackOptionKey(path, option))
-            commit()
+            apply()
         }
     }
 
@@ -604,7 +612,20 @@ internal class MPVView(context: Context, attrs: AttributeSet) : BaseMPVView(cont
     fun cycleHwdec() {
         if (!makeCurrentOptionFileLocal("hwdec"))
             return
+        hwdecPersistencePending = true
+        hwdecPersistencePath = MPVLib.getPropertyString("path")
         MPVLib.command(arrayOf("cycle-values", "hwdec", HWDECS, "no"))
+    }
+
+    /** Persist only after mpv has finished replacing the active decoder/VO. */
+    fun persistPendingHwdecState() {
+        if (!hwdecPersistencePending)
+            return
+        hwdecPersistencePending = false
+        val pendingPath = hwdecPersistencePath
+        hwdecPersistencePath = null
+        if (pendingPath == null || MPVLib.getPropertyString("path") != pendingPath)
+            return
         persistCurrentFileState()
     }
 

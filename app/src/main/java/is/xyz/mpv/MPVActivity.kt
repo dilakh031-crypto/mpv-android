@@ -459,12 +459,6 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
             onScrubSurfaceFrameAvailable(playerSurfaceFrameSerial)
             zoomGestures.onSurfaceTextureFrameAvailable()
         }
-        binding.player.onRenderSurfaceGenerationReady = { generation ->
-            zoomGestures.onRenderSurfaceGenerationReady(generation)
-        }
-        binding.player.onRenderSurfaceGenerationFailed = { generation ->
-            zoomGestures.onRenderSurfaceGenerationFailed(generation)
-        }
 
         readAutoRotationModeForLaunch()
         val launchOrientation = resolveLaunchRequestedOrientation(filepath)
@@ -2508,8 +2502,7 @@ private fun pickDecoder() {
     var handled = false
     val dialog = with(AlertDialog.Builder(this)) {
         setSingleChoiceItems(items.map { it.first }.toTypedArray(), selectedIndex) { _, idx ->
-            player.setFileLocalString("hwdec", items[idx].second)
-            player.persistCurrentFileState()
+            player.setFileLocalHwdec(items[idx].second)
             // Keep dialog open (apply-in-place).
         }
         setNegativeButton(R.string.dialog_cancel) { d, _ -> d.cancel() }
@@ -3608,7 +3601,10 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
         when (property) {
             "track-list" -> player.loadTracks()
             "current-tracks/audio/selected", "current-tracks/video/image" -> updateAudioUI()
-            "hwdec-current" -> updateDecoderButton()
+            "hwdec-current" -> {
+                updateDecoderButton()
+                player.persistPendingHwdecState()
+            }
         }
         if (metaUpdated)
             updateMetadataDisplay()
@@ -3870,6 +3866,7 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
 
         if (eventId == MpvEvent.MPV_EVENT_VIDEO_RECONFIG) {
             eventUiHandler.post {
+                player.persistPendingHwdecState()
                 updateOrientation()
                 prepareZoomSurfaceWhenReady()
             }

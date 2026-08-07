@@ -1,5 +1,7 @@
 package `is`.xyz.mpv
 
+import android.app.ActivityManager
+import android.content.Context
 import android.os.SystemClock
 import android.view.Choreographer
 import android.view.MotionEvent
@@ -53,6 +55,7 @@ internal class VideoZoomGestures(
     private var panscan = 0.0
 
     private val viewConfiguration = ViewConfiguration.get(target.context)
+    private val maxRenderSurfacePixels = calculateRenderSurfacePixelBudget()
     private val touchSlop = viewConfiguration.scaledTouchSlop.toFloat()
     private val panStartSlop = max(1f, min(2.5f, touchSlop * 0.22f))
     private val minimumFlingVelocity = viewConfiguration.scaledMinimumFlingVelocity.toFloat()
@@ -122,7 +125,6 @@ internal class VideoZoomGestures(
     private var requestedRenderSurfaceMode = RenderSurfaceMode.BASE
     private var displayedRenderSurfaceMode = RenderSurfaceMode.BASE
     private var surfaceModeTransitionInFlight: RenderSurfaceMode? = null
-    private var surfaceModeTransitionGeneration: Long? = null
     private var queuedRenderSurfaceUpdate = false
 
     private var previousSurfaceFrameUptimeMs = Long.MIN_VALUE
@@ -384,22 +386,10 @@ internal class VideoZoomGestures(
         val now = SystemClock.uptimeMillis()
         previousSurfaceFrameUptimeMs = lastSurfaceFrameUptimeMs
         lastSurfaceFrameUptimeMs = now
-    }
 
-    /**
-     * Called only after BaseMPVView has stopped the old VO, rebound the requested SurfaceTexture
-     * buffer and received the first frame from that new surface generation. This prevents an old
-     * queued TextureView frame from completing an aspect-fit transition prematurely.
-     */
-    fun onRenderSurfaceGenerationReady(generation: Long) {
         val completedMode = surfaceModeTransitionInFlight ?: return
-        val expectedGeneration = surfaceModeTransitionGeneration ?: return
-        if (generation < expectedGeneration)
-            return
-
         displayedRenderSurfaceMode = completedMode
         surfaceModeTransitionInFlight = null
-        surfaceModeTransitionGeneration = null
         clampTranslationToVideoContent()
         applyToView()
 
@@ -407,23 +397,6 @@ internal class VideoZoomGestures(
             queuedRenderSurfaceUpdate = false
             updateRenderSurfaceForCurrentState(force = true)
         }
-    }
-
-    fun onRenderSurfaceGenerationFailed(generation: Long) {
-        val expectedGeneration = surfaceModeTransitionGeneration
-        if (expectedGeneration != null && generation >= expectedGeneration) {
-            surfaceModeTransitionInFlight = null
-            surfaceModeTransitionGeneration = null
-            queuedRenderSurfaceUpdate = false
-        }
-
-        // Preserve the user's zoom/pan transform. Only abandon the high-resolution backing buffer
-        // for this attempt; BaseMPVView is already falling back to its view-sized surface.
-        zoomHighQualityRequested = false
-        zoomRenderSurfaceMode = null
-        requestBaseRenderSurfaceSize(force = true)
-        clampTranslationToVideoContent()
-        applyToView()
     }
 
     fun shouldBlockOtherGestures(e: MotionEvent): Boolean {
@@ -1097,8 +1070,8 @@ internal class VideoZoomGestures(
         if (!force && requestedRenderSurfaceMode == RenderSurfaceMode.BASE)
             return
 
-        val generation = player.resetRenderSurfaceSize()
-        markRenderSurfaceModeRequested(RenderSurfaceMode.BASE, generation)
+        player.resetRenderSurfaceSize()
+        markRenderSurfaceModeRequested(RenderSurfaceMode.BASE)
     }
 
     private fun requestViewAspectOriginalRenderSurfaceSize(force: Boolean) {
@@ -1127,8 +1100,8 @@ internal class VideoZoomGestures(
 
         val bufferWidth = ceilToIntAtLeastOne(viewWidth.toDouble() * bufferScale)
         val bufferHeight = ceilToIntAtLeastOne(viewHeight.toDouble() * bufferScale)
-        val generation = player.setRenderSurfaceSize(bufferWidth, bufferHeight)
-        markRenderSurfaceModeRequested(RenderSurfaceMode.VIEW_ASPECT_ORIGINAL, generation)
+        player.setRenderSurfaceSize(bufferWidth, bufferHeight)
+        markRenderSurfaceModeRequested(RenderSurfaceMode.VIEW_ASPECT_ORIGINAL)
     }
 
     private fun requestMediaAspectOriginalRenderSurfaceSize(force: Boolean) {
@@ -1157,25 +1130,17 @@ internal class VideoZoomGestures(
 
         val bufferWidth = ceilToIntAtLeastOne(c.w.toDouble() * bufferScale)
         val bufferHeight = ceilToIntAtLeastOne(c.h.toDouble() * bufferScale)
-        val generation = player.setRenderSurfaceSize(bufferWidth, bufferHeight)
-        markRenderSurfaceModeRequested(RenderSurfaceMode.MEDIA_ASPECT_ORIGINAL, generation)
+        player.setRenderSurfaceSize(bufferWidth, bufferHeight)
+        markRenderSurfaceModeRequested(RenderSurfaceMode.MEDIA_ASPECT_ORIGINAL)
     }
 
-    private fun markRenderSurfaceModeRequested(mode: RenderSurfaceMode, generation: Long) {
+    private fun markRenderSurfaceModeRequested(mode: RenderSurfaceMode) {
         requestedRenderSurfaceMode = mode
-        val player = renderTarget
-
-        // Modes with the same fit semantics can switch immediately; only the backing resolution
-        // changes. A BASE <-> MEDIA_ASPECT transition changes TextureView geometry, so wait until
-        // the exact SurfaceTexture generation is producing frames before applying that transform.
-        if (mode.usesMediaAspectFit == displayedRenderSurfaceMode.usesMediaAspectFit ||
-            player == null || player.isRenderSurfaceGenerationReady(generation)) {
+        if (mode.usesMediaAspectFit == displayedRenderSurfaceMode.usesMediaAspectFit) {
             displayedRenderSurfaceMode = mode
             surfaceModeTransitionInFlight = null
-            surfaceModeTransitionGeneration = null
         } else {
             surfaceModeTransitionInFlight = mode
-            surfaceModeTransitionGeneration = generation
         }
     }
 
@@ -1183,7 +1148,6 @@ internal class VideoZoomGestures(
         requestedRenderSurfaceMode = RenderSurfaceMode.BASE
         displayedRenderSurfaceMode = RenderSurfaceMode.BASE
         surfaceModeTransitionInFlight = null
-        surfaceModeTransitionGeneration = null
         queuedRenderSurfaceUpdate = false
     }
 
@@ -1289,7 +1253,7 @@ internal class VideoZoomGestures(
         val maxEdge = max(baseWidth, baseHeight).coerceAtLeast(1.0)
         val maxByEdge = MAX_RENDER_SURFACE_EDGE / maxEdge
         val maxByPixels = sqrt(
-            MAX_RENDER_SURFACE_PIXELS / (baseWidth * baseHeight).coerceAtLeast(1.0),
+            maxRenderSurfacePixels / (baseWidth * baseHeight).coerceAtLeast(1.0),
         )
 
         // Avoid requesting oversized SurfaceTexture buffers. Very wide overridden
@@ -1299,6 +1263,22 @@ internal class VideoZoomGestures(
             .coerceAtMost(maxByEdge)
             .coerceAtMost(maxByPixels)
             .coerceAtLeast(1.0)
+    }
+
+    private fun calculateRenderSurfacePixelBudget(): Double {
+        val activityManager = target.context.applicationContext
+            .getSystemService(Context.ACTIVITY_SERVICE) as? ActivityManager
+
+        // Preserve full-resolution zoom on capable devices, including 8K
+        // landscape sources, while avoiding a 8192x8192 RGBA BufferQueue on
+        // Android-designated low-RAM devices that cannot sustain it alongside
+        // SW-decoded YUVA frames. Do not use memoryClass as a proxy for graphics
+        // memory: on many capable devices it is deliberately conservative. The
+        // display-sized base buffer and the zoom model are never reduced.
+        return if (activityManager?.isLowRamDevice == true)
+            LOW_MEMORY_RENDER_SURFACE_PIXELS
+        else
+            HIGH_MEMORY_RENDER_SURFACE_PIXELS
     }
 
     private fun originalDetailBufferScale(c: ContentRect): Double {
@@ -1457,7 +1437,8 @@ internal class VideoZoomGestures(
         private const val MAX_ZOOM_VELOCITY_DT_SECONDS = 1f / 8f
 
         private const val MAX_RENDER_SURFACE_EDGE = 8192.0
-        private const val MAX_RENDER_SURFACE_PIXELS = MAX_RENDER_SURFACE_EDGE * MAX_RENDER_SURFACE_EDGE
+        private const val LOW_MEMORY_RENDER_SURFACE_PIXELS = 3840.0 * 2160.0
+        private const val HIGH_MEMORY_RENDER_SURFACE_PIXELS = 7680.0 * 4320.0
 
         private const val DEFAULT_FRAME_DT = 1f / 60f
         private const val MIN_FILTER_DT = 1f / 240f
