@@ -35,6 +35,7 @@ mpv_handle *g_mpv;
 std::atomic<bool> g_event_thread_request_exit(false);
 
 static pthread_t event_thread_id;
+static jobject global_appctx;
 
 // render.cpp owns the global Java Surface reference.
 void release_surface_ref(JNIEnv *env);
@@ -45,9 +46,16 @@ static void prepare_environment(JNIEnv *env, jobject appctx) {
     if (!env->GetJavaVM(&g_vm) && g_vm)
         av_jni_set_java_vm(g_vm, NULL);
 
-    jobject global_appctx = env->NewGlobalRef(appctx);
-    if (global_appctx)
-        av_jni_set_android_app_ctx(global_appctx, NULL);
+    // FFmpeg keeps this pointer globally and has no API for clearing it. Store
+    // exactly one global reference (the Java side passes applicationContext)
+    // instead of leaking a new Activity reference on every player recreation.
+    if (!global_appctx) {
+        global_appctx = env->NewGlobalRef(appctx);
+        if (global_appctx && av_jni_set_android_app_ctx(global_appctx, NULL) < 0) {
+            env->DeleteGlobalRef(global_appctx);
+            global_appctx = NULL;
+        }
+    }
 
     init_methods_cache(env);
 }
