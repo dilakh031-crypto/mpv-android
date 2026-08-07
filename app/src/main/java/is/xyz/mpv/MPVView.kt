@@ -273,16 +273,7 @@ internal class MPVView(context: Context, attrs: AttributeSet) : BaseMPVView(cont
         for (option in APP_PERSISTED_PLAYBACK_OPTIONS) {
             val value = preferences.getString(perFilePlaybackOptionKey(path, option), null)
                 ?: continue
-            if (option == "hwdec") {
-                // `hwdec` is already covered by reset-on-next-file. Marking its current value
-                // through file-local-options forces a decoder reinitialization even when the
-                // value did not change. Avoid that extra reinit: HEVC alpha streams can lose the
-                // VPS/SPS state between two immediate decoder resets.
-                if (MPVLib.getPropertyString("hwdec") != value)
-                    MPVLib.setPropertyString("hwdec", value)
-            } else {
-                setFileLocalString(option, value)
-            }
+            setFileLocalString(option, value)
         }
     }
 
@@ -611,21 +602,7 @@ internal class MPVView(context: Context, attrs: AttributeSet) : BaseMPVView(cont
     }
 
     fun cycleHwdec() {
-        // Do not first copy the current value into file-local-options/hwdec. That write itself
-        // carries UPDATE_HWDEC and reinitializes the decoder, so the old implementation reset
-        // HEVC twice back-to-back. reset-on-next-file already gives this option per-file scope.
         MPVLib.command(arrayOf("cycle-values", "hwdec", HWDECS, "no"))
-        persistCurrentFileState()
-    }
-
-    fun setHwdec(value: String) {
-        // Selecting the already active entry must not flush and reopen the decoder.
-        if (hwdecActive == value)
-            return
-
-        // Use the real property directly. As with cycleHwdec(), reset-on-next-file restores the
-        // configured default for the following media item without a preparatory decoder reset.
-        MPVLib.setPropertyString("hwdec", value)
         persistCurrentFileState()
     }
 
