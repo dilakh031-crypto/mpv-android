@@ -28,7 +28,9 @@ abstract class BaseMPVView(context: Context, attrs: AttributeSet) : TextureView(
      */
     fun initialize(configDir: String, cacheDir: String) {
         destroying = false
-        MPVLib.create(context)
+        // FFmpeg retains this JNI context for content:// access. Never give it
+        // the Activity/View context, which would leak a destroyed player window.
+        MPVLib.create(context.applicationContext)
 
         /* set normal options (user-supplied config can override) */
         MPVLib.setOptionString("config", "yes")
