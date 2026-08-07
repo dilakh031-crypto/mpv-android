@@ -13,23 +13,8 @@ extern "C" {
 
 static jobject surface;
 
-// Called after mpv has fully torn down its VO. Keeping this separate from
-// detachSurface() lets destroy() release the JNI reference only after
-// mpv_terminate_destroy() has stopped every renderer thread.
-void release_surface_ref(JNIEnv *env) {
-    if (!surface)
-        return;
-    env->DeleteGlobalRef(surface);
-    surface = NULL;
-}
-
 jni_func(void, attachSurface, jobject surface_) {
     CHECK_MPV_INIT();
-
-    if (surface) {
-        ALOGE("attachSurface called while another surface is still attached");
-        return;
-    }
 
     surface = env->NewGlobalRef(surface_);
     if (!surface)
@@ -48,5 +33,6 @@ jni_func(void, detachSurface) {
     if (result < 0)
          ALOGE("mpv_set_option(wid) returned error %s", mpv_error_string(result));
 
-    release_surface_ref(env);
+    env->DeleteGlobalRef(surface);
+    surface = NULL;
 }
