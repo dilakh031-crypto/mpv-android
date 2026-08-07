@@ -37,6 +37,29 @@ fetch_git_revision() {
 	fi
 }
 
+download_lua_archive() {
+	local destination=$1
+	local filename="lua-$v_lua.tar.gz"
+	local expected_sha256=b9e2e4aad6789b3b63a056d442f7b39f0ecfca3ae0f1fc0ae4e9614401b69f4b
+	local url
+
+	# lua.org can be unreachable from GitHub-hosted runners. Bazel's mirror
+	# contains the byte-identical upstream release; keep lua.org as fallback.
+	for url in \
+		"https://mirror.bazel.build/www.lua.org/ftp/$filename" \
+		"https://www.lua.org/ftp/$filename"
+	do
+		if $WGET --tries=3 --timeout=30 "$url" -O "$destination" && \
+			printf '%s  %s\n' "$expected_sha256" "$destination" | sha256sum -c -
+		then
+			return 0
+		fi
+		echo "Failed to download a valid $filename from $url" >&2
+	done
+
+	return 1
+}
+
 # mbedtls
 if [ ! -d mbedtls ]; then
 	mkdir mbedtls
@@ -93,9 +116,13 @@ fetch_git_revision https://github.com/libass/libass libass "$v_ci_libass"
 
 # lua
 if [ ! -d lua ]; then
+	lua_archive=$(mktemp "lua-$v_lua.XXXXXX")
+	trap 'rm -f "$lua_archive"' EXIT
+	download_lua_archive "$lua_archive"
 	mkdir lua
-	$WGET https://www.lua.org/ftp/lua-$v_lua.tar.gz -O - | \
-		tar -xz -C lua --strip-components=1
+	tar -xzf "$lua_archive" -C lua --strip-components=1
+	rm -f "$lua_archive"
+	trap - EXIT
 fi
 
 # libplacebo
