@@ -2502,7 +2502,8 @@ private fun pickDecoder() {
     var handled = false
     val dialog = with(AlertDialog.Builder(this)) {
         setSingleChoiceItems(items.map { it.first }.toTypedArray(), selectedIndex) { _, idx ->
-            player.setHwdec(items[idx].second)
+            player.setFileLocalString("hwdec", items[idx].second)
+            player.persistCurrentFileState()
             // Keep dialog open (apply-in-place).
         }
         setNegativeButton(R.string.dialog_cancel) { d, _ -> d.cancel() }
