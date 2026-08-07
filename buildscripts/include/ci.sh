@@ -6,6 +6,14 @@ cd "$( dirname "${BASH_SOURCE[0]}" )/.."
 . ./include/depinfo.sh
 
 ci_arch=${CI_ARCH:-armv7l}
+case "$ci_arch" in
+	armv7l|arm64|x86|x86_64) ;;
+	*)
+		echo "Unsupported CI_ARCH: $ci_arch" >&2
+		exit 1
+		;;
+esac
+
 if [ -n "${CI_ARCH:-}" ]; then
 	ci_cache_identifier="${ci_tarball%.tgz}-${ci_arch}.tgz"
 else
@@ -65,11 +73,24 @@ elif [ "$1" = "install" ]; then
 	msg "Fetching SDK + NDK"
 	IN_CI=1 ./include/download-sdk.sh
 
-	msg "Fetching mpv"
-	mkdir -p deps/mpv
-	$WGET https://github.com/mpv-player/mpv/archive/master.tar.gz -O master.tgz
-	tar -xzf master.tgz -C deps/mpv --strip-components=1
-	rm master.tgz
+	msg "Fetching pinned mpv revision $v_ci_mpv"
+	mkdir -p deps
+	if [ -e deps/mpv ]; then
+		if [ ! -d deps/mpv/.git ]; then
+			echo "deps/mpv exists but is not a git checkout" >&2
+			exit 1
+		fi
+		actual_mpv_revision=$(git -C deps/mpv rev-parse HEAD)
+		if [ "$actual_mpv_revision" != "$v_ci_mpv" ]; then
+			echo "deps/mpv is at $actual_mpv_revision, expected $v_ci_mpv" >&2
+			exit 1
+		fi
+	else
+		git init -q deps/mpv
+		git -C deps/mpv remote add origin https://github.com/mpv-player/mpv
+		git -C deps/mpv fetch --depth=1 origin "$v_ci_mpv"
+		git -C deps/mpv checkout -q --detach FETCH_HEAD
+	fi
 
 	msg "Trying to fetch existing prefix"
 	mkdir -p prefix

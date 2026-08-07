@@ -7,6 +7,36 @@
 
 mkdir -p deps && cd deps
 
+fetch_git_revision() {
+	local repository=$1
+	local directory=$2
+	local revision=$3
+	local recursive=${4:-0}
+
+	if [ -e "$directory" ]; then
+		if [ ! -d "$directory/.git" ]; then
+			echo "Dependency $directory exists but is not a git checkout" >&2
+			return 1
+		fi
+		local current
+		current=$(git -C "$directory" rev-parse HEAD)
+		if [ "$current" != "$revision" ]; then
+			echo "Dependency $directory is at $current, expected $revision" >&2
+			return 1
+		fi
+	else
+		git init -q "$directory"
+		git -C "$directory" remote add origin "$repository"
+		git -C "$directory" fetch --depth=1 origin "$revision"
+		git -C "$directory" checkout -q --detach FETCH_HEAD
+	fi
+
+	if [ "$recursive" -eq 1 ]; then
+		git -C "$directory" submodule sync --recursive
+		git -C "$directory" submodule update --init --recursive --depth=1
+	fi
+}
+
 # mbedtls
 if [ ! -d mbedtls ]; then
 	mkdir mbedtls
@@ -15,14 +45,10 @@ if [ ! -d mbedtls ]; then
 fi
 
 # dav1d
-[ ! -d dav1d ] && git clone https://github.com/videolan/dav1d
+fetch_git_revision https://github.com/videolan/dav1d dav1d "$v_ci_dav1d"
 
 # ffmpeg
-if [ ! -d ffmpeg ]; then
-	args=()
-	[ $IN_CI -eq 1 ] && args+=(--depth=1 -b "$v_ci_ffmpeg")
-	git clone https://github.com/FFmpeg/FFmpeg ffmpeg "${args[@]}"
-fi
+fetch_git_revision https://github.com/FFmpeg/FFmpeg ffmpeg "$v_ci_ffmpeg"
 
 # freetype2
 [ ! -d freetype2 ] && git clone --recurse-submodules https://gitlab.freedesktop.org/freetype/freetype.git freetype2 -b VER-${v_freetype//./-}
@@ -63,7 +89,7 @@ if [ ! -d fontconfig ]; then
 fi
 
 # libass
-[ ! -d libass ] && git clone https://github.com/libass/libass
+fetch_git_revision https://github.com/libass/libass libass "$v_ci_libass"
 
 # lua
 if [ ! -d lua ]; then
@@ -73,9 +99,9 @@ if [ ! -d lua ]; then
 fi
 
 # libplacebo
-[ ! -d libplacebo ] && git clone --recursive https://github.com/haasn/libplacebo
+fetch_git_revision https://github.com/haasn/libplacebo libplacebo "$v_ci_libplacebo" 1
 
 # mpv
-[ ! -d mpv ] && git clone https://github.com/mpv-player/mpv
+fetch_git_revision https://github.com/mpv-player/mpv mpv "$v_ci_mpv"
 
 cd ..
