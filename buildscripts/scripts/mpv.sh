@@ -18,14 +18,8 @@ fi
 # player pause loses the 75-150 ms already handed to Android. Teach the backend
 # to use its hardware pause path and retain the unwritten tail of a blocking
 # AudioTrack.write() if pause interrupts that call.
-if grep -Eq '^[[:space:]]*\.set_pause[[:space:]]*=[[:space:]]*set_pause,' \
-	audio/out/ao_audiotrack.c && \
-	! grep -q 'written_byte_remainder' audio/out/ao_audiotrack.c; then
-	echo >&2 "Stale AudioTrack pause patch detected; reset deps/mpv before rebuilding."
-	exit 1
-fi
-
-if ! grep -q 'written_byte_remainder' audio/out/ao_audiotrack.c; then
+if ! grep -Eq '^[[:space:]]*\.set_pause[[:space:]]*=[[:space:]]*set_pause,' \
+	audio/out/ao_audiotrack.c; then
 	patch -p1 --forward --batch <<'PATCH'
 diff --git a/audio/out/ao_audiotrack.c b/audio/out/ao_audiotrack.c
 --- a/audio/out/ao_audiotrack.c
@@ -39,16 +33,15 @@ diff --git a/audio/out/ao_audiotrack.c b/audio/out/ao_audiotrack.c
  #include "ao.h"
  #include "internal.h"
  #include "common/msg.h"
-@@ -52,6 +54,8 @@ struct priv {
+@@ -52,6 +54,7 @@ struct priv {
  
      void *chunk;
      int chunksize;
 +    int pending_bytes;
-+    uint32_t written_byte_remainder;
      jbyteArray bytearray;
      jshortArray shortarray;
      jfloatArray floatarray;
-@@ -579,21 +583,47 @@ static MP_THREAD_VOID ao_thread(void *arg)
+@@ -579,14 +582,25 @@ static MP_THREAD_VOID ao_thread(void *arg)
              state = MP_JNI_CALL_INT(p->audiotrack, AudioTrack.getPlayState);
          }
          if (state == AudioTrack.PLAYSTATE_PLAYING) {
@@ -69,41 +62,18 @@ diff --git a/audio/out/ao_audiotrack.c b/audio/out/ao_audiotrack.c
 +                bytes = samples * ao->sstride;
 +            }
 +
-+            // Keep ownership until AudioTrack confirms consumption. Otherwise
-+            // ERROR_DEAD_OBJECT can silently drop a freshly dequeued block.
-+            p->pending_bytes = bytes;
 +            int ret = AudioTrack_write(ao, bytes);
              if (ret >= 0) {
--                p->written_frames += ret / ao->sstride;
-+                if (ret > bytes) {
-+                    MP_ERR(ao, "AudioTrack.write returned %d for a %d-byte buffer\n",
-+                           ret, bytes);
-+                    ret = bytes;
-+                }
-+                uint32_t completed = p->written_byte_remainder + ret;
-+                p->written_frames += completed / ao->sstride;
-+                p->written_byte_remainder = completed % ao->sstride;
++                mp_assert(ret <= bytes);
++                mp_assert(ret % ao->sstride == 0);
+                 p->written_frames += ret / ao->sstride;
 +                p->pending_bytes = bytes - ret;
 +                if (ret > 0 && p->pending_bytes > 0)
 +                    memmove(p->chunk, (char *)p->chunk + ret, p->pending_bytes);
              } else if (ret == AudioManager.ERROR_DEAD_OBJECT) {
                  MP_WARN(ao, "AudioTrack.write failed with ERROR_DEAD_OBJECT. Recreating AudioTrack...\n");
                  if (AudioTrack_Recreate(ao) < 0) {
-                     MP_ERR(ao, "AudioTrack_Recreate failed\n");
-+                } else {
-+                    // A recreated AudioTrack starts stopped. Resume it so the
-+                    // retained block can be submitted on the next iteration.
-+                    MP_JNI_CALL_VOID(p->audiotrack, AudioTrack.play);
-+                    MP_JNI_EXCEPTION_LOG(ao);
-                 }
-             } else {
-                 MP_ERR(ao, "AudioTrack.write failed with %d\n", ret);
-+                p->pending_bytes = 0;
-+                p->written_byte_remainder = 0;
-             }
-         } else {
-             mp_cond_timedwait(&p->wakeup, &p->lock, MP_TIME_MS_TO_NS(300));
-@@ -808,30 +838,54 @@ static void stop(struct ao *ao)
+@@ -808,30 +822,54 @@ static void stop(struct ao *ao)
  
      JNIEnv *env = MP_JNI_GET_ENV(ao);
      MP_JNI_CALL_VOID(p->audiotrack, AudioTrack.pause);
@@ -112,13 +82,13 @@ diff --git a/audio/out/ao_audiotrack.c b/audio/out/ao_audiotrack.c
 +        return;
 +
 +    // AudioTrack.pause() interrupts a blocking write. Wait for that write to
-+    // return before flushing and discarding any retained tail.
++    // return before flushing and discarding any unwritten tail retained by the
++    // audio thread.
 +    mp_mutex_lock(&p->lock);
      MP_JNI_CALL_VOID(p->audiotrack, AudioTrack.flush);
      MP_JNI_EXCEPTION_LOG(ao);
  
 +    p->pending_bytes = 0;
-+    p->written_byte_remainder = 0;
      p->playhead_offset = 0;
      p->reset_pending = true;
      p->written_frames = 0;
@@ -165,7 +135,7 @@ diff --git a/audio/out/ao_audiotrack.c b/audio/out/ao_audiotrack.c
  }
  
  #define OPT_BASE_STRUCT struct priv
-@@ -843,6 +897,7 @@ const struct ao_driver audio_out_audiotrack = {
+@@ -843,6 +881,7 @@ const struct ao_driver audio_out_audiotrack = {
      .uninit    = uninit,
      .reset     = stop,
      .start     = start,
