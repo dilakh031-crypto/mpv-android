@@ -19,8 +19,6 @@ import kotlin.reflect.KProperty
 internal class MPVView(context: Context, attrs: AttributeSet) : BaseMPVView(context, attrs) {
     private var watchLaterOptionsBeforeDisable: String? = null
     private var watchLaterOptionsSuppressed = false
-    private var hwdecPersistencePending = false
-    private var hwdecPersistencePath: String? = null
 
     override fun initOptions() {
         val sharedPreferences = PreferenceManager.getDefaultSharedPreferences(context)
@@ -206,12 +204,6 @@ internal class MPVView(context: Context, attrs: AttributeSet) : BaseMPVView(cont
         MPVLib.setPropertyString("file-local-options/$name", value)
     }
 
-    fun setFileLocalHwdec(value: String) {
-        hwdecPersistencePending = true
-        hwdecPersistencePath = MPVLib.getPropertyString("path")
-        setFileLocalString("hwdec", value)
-    }
-
     fun setFileLocalInt(name: String, value: Int) {
         MPVLib.setPropertyInt("file-local-options/$name", value)
     }
@@ -268,7 +260,7 @@ internal class MPVView(context: Context, attrs: AttributeSet) : BaseMPVView(cont
                 else
                     putString(key, value)
             }
-            apply()
+            commit()
         }
     }
 
@@ -281,7 +273,16 @@ internal class MPVView(context: Context, attrs: AttributeSet) : BaseMPVView(cont
         for (option in APP_PERSISTED_PLAYBACK_OPTIONS) {
             val value = preferences.getString(perFilePlaybackOptionKey(path, option), null)
                 ?: continue
-            setFileLocalString(option, value)
+            if (option == "hwdec") {
+                // `hwdec` is already covered by reset-on-next-file. Marking its current value
+                // through file-local-options forces a decoder reinitialization even when the
+                // value did not change. Avoid that extra reinit: HEVC alpha streams can lose the
+                // VPS/SPS state between two immediate decoder resets.
+                if (MPVLib.getPropertyString("hwdec") != value)
+                    MPVLib.setPropertyString("hwdec", value)
+            } else {
+                setFileLocalString(option, value)
+            }
         }
     }
 
@@ -290,7 +291,7 @@ internal class MPVView(context: Context, attrs: AttributeSet) : BaseMPVView(cont
         with (preferences.edit()) {
             for (option in APP_PERSISTED_PLAYBACK_OPTIONS)
                 remove(perFilePlaybackOptionKey(path, option))
-            apply()
+            commit()
         }
     }
 
@@ -610,22 +611,21 @@ internal class MPVView(context: Context, attrs: AttributeSet) : BaseMPVView(cont
     }
 
     fun cycleHwdec() {
-        if (!makeCurrentOptionFileLocal("hwdec"))
-            return
-        hwdecPersistencePending = true
-        hwdecPersistencePath = MPVLib.getPropertyString("path")
+        // Do not first copy the current value into file-local-options/hwdec. That write itself
+        // carries UPDATE_HWDEC and reinitializes the decoder, so the old implementation reset
+        // HEVC twice back-to-back. reset-on-next-file already gives this option per-file scope.
         MPVLib.command(arrayOf("cycle-values", "hwdec", HWDECS, "no"))
+        persistCurrentFileState()
     }
 
-    /** Persist only after mpv has finished replacing the active decoder/VO. */
-    fun persistPendingHwdecState() {
-        if (!hwdecPersistencePending)
+    fun setHwdec(value: String) {
+        // Selecting the already active entry must not flush and reopen the decoder.
+        if (hwdecActive == value)
             return
-        hwdecPersistencePending = false
-        val pendingPath = hwdecPersistencePath
-        hwdecPersistencePath = null
-        if (pendingPath == null || MPVLib.getPropertyString("path") != pendingPath)
-            return
+
+        // Use the real property directly. As with cycleHwdec(), reset-on-next-file restores the
+        // configured default for the following media item without a preparatory decoder reset.
+        MPVLib.setPropertyString("hwdec", value)
         persistCurrentFileState()
     }
 

@@ -2502,7 +2502,7 @@ private fun pickDecoder() {
     var handled = false
     val dialog = with(AlertDialog.Builder(this)) {
         setSingleChoiceItems(items.map { it.first }.toTypedArray(), selectedIndex) { _, idx ->
-            player.setFileLocalHwdec(items[idx].second)
+            player.setHwdec(items[idx].second)
             // Keep dialog open (apply-in-place).
         }
         setNegativeButton(R.string.dialog_cancel) { d, _ -> d.cancel() }
@@ -3601,10 +3601,7 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
         when (property) {
             "track-list" -> player.loadTracks()
             "current-tracks/audio/selected", "current-tracks/video/image" -> updateAudioUI()
-            "hwdec-current" -> {
-                updateDecoderButton()
-                player.persistPendingHwdecState()
-            }
+            "hwdec-current" -> updateDecoderButton()
         }
         if (metaUpdated)
             updateMetadataDisplay()
@@ -3866,7 +3863,6 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
 
         if (eventId == MpvEvent.MPV_EVENT_VIDEO_RECONFIG) {
             eventUiHandler.post {
-                player.persistPendingHwdecState()
                 updateOrientation()
                 prepareZoomSurfaceWhenReady()
             }

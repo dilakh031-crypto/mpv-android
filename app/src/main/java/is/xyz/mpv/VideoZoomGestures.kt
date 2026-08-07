@@ -1,7 +1,5 @@
 package `is`.xyz.mpv
 
-import android.app.ActivityManager
-import android.content.Context
 import android.os.SystemClock
 import android.view.Choreographer
 import android.view.MotionEvent
@@ -55,7 +53,6 @@ internal class VideoZoomGestures(
     private var panscan = 0.0
 
     private val viewConfiguration = ViewConfiguration.get(target.context)
-    private val maxRenderSurfacePixels = calculateRenderSurfacePixelBudget()
     private val touchSlop = viewConfiguration.scaledTouchSlop.toFloat()
     private val panStartSlop = max(1f, min(2.5f, touchSlop * 0.22f))
     private val minimumFlingVelocity = viewConfiguration.scaledMinimumFlingVelocity.toFloat()
@@ -1253,7 +1250,7 @@ internal class VideoZoomGestures(
         val maxEdge = max(baseWidth, baseHeight).coerceAtLeast(1.0)
         val maxByEdge = MAX_RENDER_SURFACE_EDGE / maxEdge
         val maxByPixels = sqrt(
-            maxRenderSurfacePixels / (baseWidth * baseHeight).coerceAtLeast(1.0),
+            MAX_RENDER_SURFACE_PIXELS / (baseWidth * baseHeight).coerceAtLeast(1.0),
         )
 
         // Avoid requesting oversized SurfaceTexture buffers. Very wide overridden
@@ -1263,22 +1260,6 @@ internal class VideoZoomGestures(
             .coerceAtMost(maxByEdge)
             .coerceAtMost(maxByPixels)
             .coerceAtLeast(1.0)
-    }
-
-    private fun calculateRenderSurfacePixelBudget(): Double {
-        val activityManager = target.context.applicationContext
-            .getSystemService(Context.ACTIVITY_SERVICE) as? ActivityManager
-
-        // Preserve full-resolution zoom on capable devices, including 8K
-        // landscape sources, while avoiding a 8192x8192 RGBA BufferQueue on
-        // Android-designated low-RAM devices that cannot sustain it alongside
-        // SW-decoded YUVA frames. Do not use memoryClass as a proxy for graphics
-        // memory: on many capable devices it is deliberately conservative. The
-        // display-sized base buffer and the zoom model are never reduced.
-        return if (activityManager?.isLowRamDevice == true)
-            LOW_MEMORY_RENDER_SURFACE_PIXELS
-        else
-            HIGH_MEMORY_RENDER_SURFACE_PIXELS
     }
 
     private fun originalDetailBufferScale(c: ContentRect): Double {
@@ -1437,8 +1418,7 @@ internal class VideoZoomGestures(
         private const val MAX_ZOOM_VELOCITY_DT_SECONDS = 1f / 8f
 
         private const val MAX_RENDER_SURFACE_EDGE = 8192.0
-        private const val LOW_MEMORY_RENDER_SURFACE_PIXELS = 3840.0 * 2160.0
-        private const val HIGH_MEMORY_RENDER_SURFACE_PIXELS = 7680.0 * 4320.0
+        private const val MAX_RENDER_SURFACE_PIXELS = MAX_RENDER_SURFACE_EDGE * MAX_RENDER_SURFACE_EDGE
 
         private const val DEFAULT_FRAME_DT = 1f / 60f
         private const val MIN_FILTER_DT = 1f / 240f
