@@ -30,7 +30,7 @@ jni_func(void, attachSurface, jobject surface_) {
     // Be defensive against an accidental double attach. Drop mpv's old wid before deleting the
     // global reference so the previous Java Surface can never be freed while mpv still points at it.
     if (surface) {
-        ALOGW("attachSurface called while another surface is still attached; replacing it safely");
+        ALOGV("attachSurface called while another surface is still attached; replacing it safely");
         int64_t no_wid = 0;
         int clear_result = mpv_set_option(g_mpv, "wid", MPV_FORMAT_INT64, &no_wid);
         if (clear_result < 0)
