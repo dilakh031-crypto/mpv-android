@@ -459,6 +459,12 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
             onScrubSurfaceFrameAvailable(playerSurfaceFrameSerial)
             zoomGestures.onSurfaceTextureFrameAvailable()
         }
+        binding.player.onRenderSurfaceGenerationReady = { generation ->
+            zoomGestures.onRenderSurfaceGenerationReady(generation)
+        }
+        binding.player.onRenderSurfaceGenerationFailed = { generation ->
+            zoomGestures.onRenderSurfaceGenerationFailed(generation)
+        }
 
         readAutoRotationModeForLaunch()
         val launchOrientation = resolveLaunchRequestedOrientation(filepath)

@@ -122,6 +122,7 @@ internal class VideoZoomGestures(
     private var requestedRenderSurfaceMode = RenderSurfaceMode.BASE
     private var displayedRenderSurfaceMode = RenderSurfaceMode.BASE
     private var surfaceModeTransitionInFlight: RenderSurfaceMode? = null
+    private var surfaceModeTransitionGeneration: Long? = null
     private var queuedRenderSurfaceUpdate = false
 
     private var previousSurfaceFrameUptimeMs = Long.MIN_VALUE
@@ -383,10 +384,22 @@ internal class VideoZoomGestures(
         val now = SystemClock.uptimeMillis()
         previousSurfaceFrameUptimeMs = lastSurfaceFrameUptimeMs
         lastSurfaceFrameUptimeMs = now
+    }
 
+    /**
+     * Called only after BaseMPVView has stopped the old VO, rebound the requested SurfaceTexture
+     * buffer and received the first frame from that new surface generation. This prevents an old
+     * queued TextureView frame from completing an aspect-fit transition prematurely.
+     */
+    fun onRenderSurfaceGenerationReady(generation: Long) {
         val completedMode = surfaceModeTransitionInFlight ?: return
+        val expectedGeneration = surfaceModeTransitionGeneration ?: return
+        if (generation < expectedGeneration)
+            return
+
         displayedRenderSurfaceMode = completedMode
         surfaceModeTransitionInFlight = null
+        surfaceModeTransitionGeneration = null
         clampTranslationToVideoContent()
         applyToView()
 
@@ -394,6 +407,23 @@ internal class VideoZoomGestures(
             queuedRenderSurfaceUpdate = false
             updateRenderSurfaceForCurrentState(force = true)
         }
+    }
+
+    fun onRenderSurfaceGenerationFailed(generation: Long) {
+        val expectedGeneration = surfaceModeTransitionGeneration
+        if (expectedGeneration != null && generation >= expectedGeneration) {
+            surfaceModeTransitionInFlight = null
+            surfaceModeTransitionGeneration = null
+            queuedRenderSurfaceUpdate = false
+        }
+
+        // Preserve the user's zoom/pan transform. Only abandon the high-resolution backing buffer
+        // for this attempt; BaseMPVView is already falling back to its view-sized surface.
+        zoomHighQualityRequested = false
+        zoomRenderSurfaceMode = null
+        requestBaseRenderSurfaceSize(force = true)
+        clampTranslationToVideoContent()
+        applyToView()
     }
 
     fun shouldBlockOtherGestures(e: MotionEvent): Boolean {
@@ -1067,8 +1097,8 @@ internal class VideoZoomGestures(
         if (!force && requestedRenderSurfaceMode == RenderSurfaceMode.BASE)
             return
 
-        player.resetRenderSurfaceSize()
-        markRenderSurfaceModeRequested(RenderSurfaceMode.BASE)
+        val generation = player.resetRenderSurfaceSize()
+        markRenderSurfaceModeRequested(RenderSurfaceMode.BASE, generation)
     }
 
     private fun requestViewAspectOriginalRenderSurfaceSize(force: Boolean) {
@@ -1097,8 +1127,8 @@ internal class VideoZoomGestures(
 
         val bufferWidth = ceilToIntAtLeastOne(viewWidth.toDouble() * bufferScale)
         val bufferHeight = ceilToIntAtLeastOne(viewHeight.toDouble() * bufferScale)
-        player.setRenderSurfaceSize(bufferWidth, bufferHeight)
-        markRenderSurfaceModeRequested(RenderSurfaceMode.VIEW_ASPECT_ORIGINAL)
+        val generation = player.setRenderSurfaceSize(bufferWidth, bufferHeight)
+        markRenderSurfaceModeRequested(RenderSurfaceMode.VIEW_ASPECT_ORIGINAL, generation)
     }
 
     private fun requestMediaAspectOriginalRenderSurfaceSize(force: Boolean) {
@@ -1127,17 +1157,25 @@ internal class VideoZoomGestures(
 
         val bufferWidth = ceilToIntAtLeastOne(c.w.toDouble() * bufferScale)
         val bufferHeight = ceilToIntAtLeastOne(c.h.toDouble() * bufferScale)
-        player.setRenderSurfaceSize(bufferWidth, bufferHeight)
-        markRenderSurfaceModeRequested(RenderSurfaceMode.MEDIA_ASPECT_ORIGINAL)
+        val generation = player.setRenderSurfaceSize(bufferWidth, bufferHeight)
+        markRenderSurfaceModeRequested(RenderSurfaceMode.MEDIA_ASPECT_ORIGINAL, generation)
     }
 
-    private fun markRenderSurfaceModeRequested(mode: RenderSurfaceMode) {
+    private fun markRenderSurfaceModeRequested(mode: RenderSurfaceMode, generation: Long) {
         requestedRenderSurfaceMode = mode
-        if (mode.usesMediaAspectFit == displayedRenderSurfaceMode.usesMediaAspectFit) {
+        val player = renderTarget
+
+        // Modes with the same fit semantics can switch immediately; only the backing resolution
+        // changes. A BASE <-> MEDIA_ASPECT transition changes TextureView geometry, so wait until
+        // the exact SurfaceTexture generation is producing frames before applying that transform.
+        if (mode.usesMediaAspectFit == displayedRenderSurfaceMode.usesMediaAspectFit ||
+            player == null || player.isRenderSurfaceGenerationReady(generation)) {
             displayedRenderSurfaceMode = mode
             surfaceModeTransitionInFlight = null
+            surfaceModeTransitionGeneration = null
         } else {
             surfaceModeTransitionInFlight = mode
+            surfaceModeTransitionGeneration = generation
         }
     }
 
@@ -1145,6 +1183,7 @@ internal class VideoZoomGestures(
         requestedRenderSurfaceMode = RenderSurfaceMode.BASE
         displayedRenderSurfaceMode = RenderSurfaceMode.BASE
         surfaceModeTransitionInFlight = null
+        surfaceModeTransitionGeneration = null
         queuedRenderSurfaceUpdate = false
     }
 
