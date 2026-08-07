@@ -20,9 +20,6 @@ extern "C" {
 
 #define ARRAYLEN(a) (sizeof(a)/sizeof(a[0]))
 
-// render.cpp owns the JNI global reference for the currently attached Android Surface.
-void release_surface_reference(JNIEnv *env);
-
 extern "C" {
     jni_func(void, create, jobject appctx);
     jni_func(void, init);
@@ -38,6 +35,9 @@ mpv_handle *g_mpv;
 std::atomic<bool> g_event_thread_request_exit(false);
 
 static pthread_t event_thread_id;
+
+// render.cpp owns the global Java Surface reference.
+void release_surface_ref(JNIEnv *env);
 
 static void prepare_environment(JNIEnv *env, jobject appctx) {
     setlocale(LC_NUMERIC, "C");
@@ -84,6 +84,7 @@ jni_func(void, init) {
 jni_func(void, destroy) {
     if (!g_mpv) {
         ALOGV("mpv destroy called but it's already destroyed");
+        release_surface_ref(env);
         return;
     }
 
@@ -94,10 +95,7 @@ jni_func(void, destroy) {
 
     mpv_terminate_destroy(g_mpv);
     g_mpv = NULL;
-
-    // The VO/EGL teardown is synchronous at this point, so the Android Surface global reference
-    // can be released without racing a renderer thread.
-    release_surface_reference(env);
+    release_surface_ref(env);
 }
 
 jni_func(void, command, jobjectArray jarray) {
@@ -145,4 +143,3 @@ jni_func(void, abortAsyncCommand, jlong userdata) {
     CHECK_MPV_INIT();
     mpv_abort_async_command(g_mpv, (uint64_t)userdata);
 }
-
