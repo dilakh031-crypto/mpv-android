@@ -88,7 +88,7 @@ internal class VideoZoomGestures(
     private var flingFramePosted = false
     private val flingFrameCallback = Choreographer.FrameCallback {
         flingFramePosted = false
-        if (panScroller.computeScrollOffset()) {
+        if (!released && panScroller.computeScrollOffset()) {
             tx = panScroller.currX.toDouble()
             ty = panScroller.currY.toDouble()
             clampTranslationToVideoContent()
@@ -104,13 +104,19 @@ internal class VideoZoomGestures(
 
     private var pendingPinchDoubleTapReset = false
 
+    // Becomes true before libmpv teardown. Every Choreographer/fling callback checks
+    // this so no late gesture frame can call JNI after MPVLib.destroy().
+    private var released = false
+
     // Coalesce all touch samples to one mpv transform update per display frame.
     private val choreographer = Choreographer.getInstance()
     private var applyScheduled = false
     private val frameCallback = Choreographer.FrameCallback {
         applyScheduled = false
-        clampTranslationToVideoContent()
-        applyToMpv()
+        if (!released) {
+            clampTranslationToVideoContent()
+            applyToMpv()
+        }
     }
 
     // Avoid sending identical JNI/property updates on every vsync.
@@ -195,6 +201,7 @@ internal class VideoZoomGestures(
     )
 
     fun setMetrics(width: Float, height: Float) {
+        if (released) return
         stopFling()
         viewWidth = width
         viewHeight = height
@@ -208,6 +215,7 @@ internal class VideoZoomGestures(
         panscanValue: Double?,
         immediate: Boolean = false,
     ) {
+        if (released) return
         stopFling()
         videoAspect = aspect ?: 0.0
         panscan = (panscanValue ?: 0.0).coerceAtLeast(0.0)
@@ -239,11 +247,13 @@ internal class VideoZoomGestures(
     }
 
     fun reset() {
+        if (released) return
         resetTransformState()
         applyToMpv(force = true)
     }
 
     fun resetForNewFile() {
+        if (released) return
         resetTransformState()
         videoAspect = 0.0
         panscan = 0.0
@@ -251,8 +261,23 @@ internal class VideoZoomGestures(
     }
 
     fun prepareForWindowExit() {
+        if (released) return
         resetTransformState()
+        // Flush one final identity transform while libmpv is still valid, then permanently
+        // disable this gesture object before Activity/Surface teardown can race callbacks.
         applyToMpv(force = true)
+        shutdown()
+    }
+
+    fun shutdown() {
+        if (released) return
+        released = true
+        stopFling()
+        recyclePanVelocityTracker()
+        if (applyScheduled) {
+            choreographer.removeFrameCallback(frameCallback)
+            applyScheduled = false
+        }
     }
 
     private fun resetTransformState() {
@@ -298,6 +323,7 @@ internal class VideoZoomGestures(
      *         Single tap returns false so the Activity can toggle controls.
      */
     fun onTouchEvent(e: MotionEvent): Boolean {
+        if (released) return false
         refreshMetricsFromTarget()
 
         when (e.actionMasked) {
@@ -638,6 +664,7 @@ internal class VideoZoomGestures(
     }
 
     private fun postFlingFrame() {
+        if (released) return
         if (flingFramePosted)
             return
         flingFramePosted = true
@@ -654,6 +681,7 @@ internal class VideoZoomGestures(
     }
 
     private fun scheduleApply() {
+        if (released) return
         if (applyScheduled)
             return
         applyScheduled = true
@@ -791,6 +819,7 @@ internal class VideoZoomGestures(
     }
 
     private fun applyToMpv(force: Boolean = false) {
+        if (released) return
         val transform = mpvTransform()
         val changed = force ||
                 !sameMpvValue(transform.zoom, lastAppliedZoom) ||

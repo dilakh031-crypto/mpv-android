@@ -623,8 +623,12 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
         mediaOrientationExecutor.shutdownNow()
         orientationHandler.removeCallbacksAndMessages(null)
 
-        // Suppress any further callbacks
+        // Suppress any further callbacks. Zoom owns Choreographer callbacks which can otherwise
+        // arrive after MPVLib.destroy(); stop them before touching the native player.
         activityIsForeground = false
+        if (::zoomGestures.isInitialized)
+            zoomGestures.shutdown()
+        eventUiHandler.removeCallbacksAndMessages(null)
         immersiveHandler.removeCallbacksAndMessages(null)
         scrubSeekHandler.removeCallbacksAndMessages(null)
         invalidateGestureStableTargetCheck()
