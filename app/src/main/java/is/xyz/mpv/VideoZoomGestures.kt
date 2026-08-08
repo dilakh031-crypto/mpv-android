@@ -982,12 +982,50 @@ internal class VideoZoomGestures(
     private fun applyToView() {
         val fit = renderSurfaceFitTransform()
 
+        applyVideoClipBounds()
+        applyOsdContentInsets()
+
         target.pivotX = 0f
         target.pivotY = 0f
         target.scaleX = scale * fit.scaleX
         target.scaleY = scale * fit.scaleY
         target.translationX = (tx + scale * fit.translationX).toFloat()
         target.translationY = (ty + scale * fit.translationY).toFloat()
+    }
+
+    /**
+     * Keep mpv-rendered text and overlays attached to the image rather than the
+     * full TextureView. clipBounds uses local (pre-transform) coordinates, so
+     * zooming and panning move the image and its hard OSD boundary together.
+     */
+    private fun applyVideoClipBounds() {
+        val player = renderTarget ?: return
+        val rect = surfaceContentRect(displayedRenderSurfaceMode)
+        player.setVideoClipBounds(rect.ox, rect.oy, rect.ox + rect.w, rect.oy + rect.h)
+    }
+
+    /**
+     * Move mpv's own OSD margins inside the image. This makes normal OSD text and
+     * stats.lua start/wrap in the video rectangle; the clip above remains the
+     * final guarantee for content which is still too large to fit.
+     */
+    private fun applyOsdContentInsets() {
+        val player = renderTarget ?: return
+        if (viewWidth <= 1f || viewHeight <= 1f)
+            return
+
+        val rect = surfaceContentRect(requestedRenderSurfaceMode)
+        player.setOsdContentInsets(
+            horizontalFraction = (rect.ox / viewWidth).toDouble(),
+            verticalFraction = (rect.oy / viewHeight).toDouble(),
+        )
+    }
+
+    private fun surfaceContentRect(mode: RenderSurfaceMode): ContentRect {
+        return if (mode.usesMediaAspectFit)
+            ContentRect(0f, 0f, viewWidth, viewHeight)
+        else
+            contentRect()
     }
 
     private fun renderSurfaceFitTransform(): SurfaceFitTransform {
@@ -1133,6 +1171,7 @@ internal class VideoZoomGestures(
 
     private fun markRenderSurfaceModeRequested(mode: RenderSurfaceMode) {
         requestedRenderSurfaceMode = mode
+        applyOsdContentInsets()
         if (mode.usesMediaAspectFit == displayedRenderSurfaceMode.usesMediaAspectFit) {
             displayedRenderSurfaceMode = mode
             surfaceModeTransitionInFlight = null
