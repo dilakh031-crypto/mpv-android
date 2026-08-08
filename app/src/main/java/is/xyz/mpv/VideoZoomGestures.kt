@@ -52,21 +52,6 @@ internal class VideoZoomGestures(
     private var videoPixelHeight = 0
     private var panscan = 0.0
 
-    // OSD confinement is deliberately independent from render-surface sizing.
-    // The high-quality BASE/original-detail surface path below must stay intact.
-    private var osdContentBoundsEnabled = false
-    private var baseOsdMarginX: Double? = null
-    private var baseOsdMarginY: Double? = null
-    private var baseOsdScale: Double? = null
-    private var baseScriptOpts: String? = null
-    private var baseStatsFontSize = DEFAULT_STATS_FONT_SIZE
-    private var scriptOptsCaptured = false
-    private var lastAppliedOsdMarginX = Double.NaN
-    private var lastAppliedOsdMarginY = Double.NaN
-    private var lastAppliedOsdScale = Double.NaN
-    private var lastAppliedStatsFontSize = Double.NaN
-    private var lastAppliedStatsVidscale: Boolean? = null
-
     private val viewConfiguration = ViewConfiguration.get(target.context)
     private val touchSlop = viewConfiguration.scaledTouchSlop.toFloat()
     private val panStartSlop = max(1f, min(2.5f, touchSlop * 0.22f))
@@ -306,7 +291,6 @@ internal class VideoZoomGestures(
             updateRenderSurfaceForCurrentState(force = true)
             scheduleApply()
         }
-        updateOsdContentBounds()
     }
 
     fun setVideoAspect(aspect: Double?) {
@@ -352,7 +336,6 @@ internal class VideoZoomGestures(
         videoPixelHeight = pixelSize?.second ?: 0
         panscan = panscanValue ?: 0.0
         zoomRenderSurfaceMode = null
-        osdContentBoundsEnabled = true
 
         if (prepareNormalSurface)
             normalCompactSurfacePrepared = true
@@ -361,7 +344,6 @@ internal class VideoZoomGestures(
             clampTranslationToVideoContent()
 
         updateRenderSurfaceForCurrentState(force = true)
-        updateOsdContentBounds()
         if (immediate)
             applyToView()
         else
@@ -407,7 +389,6 @@ internal class VideoZoomGestures(
         surfaceModeTransitionInFlight = null
         clampTranslationToVideoContent()
         applyToView()
-        updateOsdContentBounds()
 
         if (queuedRenderSurfaceUpdate) {
             queuedRenderSurfaceUpdate = false
@@ -427,7 +408,6 @@ internal class VideoZoomGestures(
         // the prepared compact normal surface so the next zoom starts from the
         // same geometry, without a start/end tear.
         updateRenderSurfaceForCurrentState(force = true)
-        updateOsdContentBounds()
         applyToView()
     }
 
@@ -437,7 +417,6 @@ internal class VideoZoomGestures(
         videoPixelWidth = 0
         videoPixelHeight = 0
         panscan = 0.0
-        osdContentBoundsEnabled = false
         normalCompactSurfacePrepared = false
         previousSurfaceFrameUptimeMs = Long.MIN_VALUE
         lastSurfaceFrameUptimeMs = Long.MIN_VALUE
@@ -445,7 +424,6 @@ internal class VideoZoomGestures(
         zoomHighQualityRequested = false
         commitHiddenBaseRenderSurfaceMode()
         requestBaseRenderSurfaceSize(force = true)
-        restoreBaseOsdSettings()
         applyToView()
     }
 
@@ -455,7 +433,6 @@ internal class VideoZoomGestures(
 
         normalCompactSurfacePrepared = true
         updateRenderSurfaceForCurrentState(force = true)
-        updateOsdContentBounds()
         applyToView()
     }
 
@@ -926,226 +903,6 @@ internal class VideoZoomGestures(
             viewWidth = w.toFloat()
             viewHeight = h.toFloat()
         }
-    }
-
-    /**
-     * Make mpv OSD behave as if its logical canvas were the visible video
-     * rectangle, while leaving the real SurfaceTexture size completely alone.
-     *
-     * This is the key difference from the old media-aspect-surface solution:
-     * video quality keeps using the target project's BASE/original-detail path,
-     * while OSD margins and scale emulate the smaller video-sized canvas.
-     */
-    private fun updateOsdContentBounds() {
-        if (!osdContentBoundsEnabled)
-            return
-
-        refreshMetricsFromTarget()
-        if (viewWidth <= 1f || viewHeight <= 1f)
-            return
-
-        val c = contentRect()
-        val mediaAspectSurface = displayedRenderSurfaceMode.usesMediaAspectFit
-
-        captureBaseOsdSettings()
-        val baseX = baseOsdMarginX ?: return
-        val baseY = baseOsdMarginY ?: return
-        val baseScale = baseOsdScale ?: DEFAULT_OSD_SCALE
-
-        val scaleByWindow = try {
-            MPVLib.getPropertyBoolean("osd-scale-by-window") ?: true
-        } catch (_: Throwable) {
-            true
-        }
-
-        // mpv exposes the exact OSD-to-video margins in render coordinates.
-        // Prefer them when they are settled; during a surface transition they
-        // can temporarily be all-zero, in which case Android-side geometry is
-        // the reliable fallback.
-        val osdHeight = try { MPVLib.getPropertyInt("osd-dimensions/h") ?: 0 } catch (_: Throwable) { 0 }
-        val osdMl = try { MPVLib.getPropertyInt("osd-dimensions/ml") ?: -1 } catch (_: Throwable) { -1 }
-        val osdMr = try { MPVLib.getPropertyInt("osd-dimensions/mr") ?: -1 } catch (_: Throwable) { -1 }
-        val osdMt = try { MPVLib.getPropertyInt("osd-dimensions/mt") ?: -1 } catch (_: Throwable) { -1 }
-        val osdMb = try { MPVLib.getPropertyInt("osd-dimensions/mb") ?: -1 } catch (_: Throwable) { -1 }
-
-        val expectedBars = !mediaAspectSurface &&
-            (c.ox > OSD_BOUNDS_EPS || c.oy > OSD_BOUNDS_EPS ||
-                c.w < viewWidth - OSD_BOUNDS_EPS || c.h < viewHeight - OSD_BOUNDS_EPS)
-        val mpvHasBars = max(max(osdMl, osdMr), max(osdMt, osdMb)) > 0
-        val haveMpvBounds = osdHeight > 1 && osdMl >= 0 && osdMr >= 0 &&
-            osdMt >= 0 && osdMb >= 0 && (!expectedBars || mpvHasBars)
-
-        val insetXPx: Double
-        val insetYPx: Double
-        val renderHeightPx: Double
-        val contentHeightPx: Double
-        if (mediaAspectSurface) {
-            // The whole mpv canvas is already fitted to the image in this mode.
-            insetXPx = 0.0
-            insetYPx = 0.0
-            renderHeightPx = if (osdHeight > 1) osdHeight.toDouble() else viewHeight.toDouble()
-            contentHeightPx = renderHeightPx
-        } else if (haveMpvBounds) {
-            insetXPx = max(osdMl, osdMr).toDouble()
-            insetYPx = max(osdMt, osdMb).toDouble()
-            renderHeightPx = osdHeight.toDouble()
-            contentHeightPx = (osdHeight - osdMt - osdMb).toDouble().coerceAtLeast(1.0)
-        } else {
-            insetXPx = c.ox.toDouble().coerceAtLeast(0.0)
-            insetYPx = c.oy.toDouble().coerceAtLeast(0.0)
-            renderHeightPx = viewHeight.toDouble()
-            contentHeightPx = c.h.toDouble().coerceAtLeast(1.0)
-        }
-
-        // OSD margins are in PlayResY=720 scaled units when scale-by-window is
-        // enabled. Adding the video inset makes normal OSD text wrap at the
-        // image's left/right edges and start below the top letterbox bar.
-        val logicalHeightRatio = (contentHeightPx / renderHeightPx.coerceAtLeast(1.0))
-            .coerceIn(MIN_OSD_LOGICAL_SCALE, 1.0)
-        val osdUnitsPerRenderPixel = if (scaleByWindow)
-            OSD_REFERENCE_HEIGHT / renderHeightPx.coerceAtLeast(1.0)
-        else
-            1.0
-
-        // In the reference media-aspect surface the user's original margins are
-        // themselves scaled by the shorter video-canvas height. Reproduce that
-        // here as well as adding the black-bar inset; otherwise a default 16-unit
-        // margin becomes much too large on a portrait screen with a wide video.
-        val baseMarginScale = if (scaleByWindow) logicalHeightRatio else 1.0
-        val desiredX = baseX * baseMarginScale + insetXPx * osdUnitsPerRenderPixel
-        val desiredY = baseY * baseMarginScale + insetYPx * osdUnitsPerRenderPixel
-
-        // A media-aspect render surface naturally makes OSD text smaller when a
-        // wide video occupies only a short strip of a portrait screen. Emulate
-        // that logical canvas height here instead of shrinking the actual video
-        // SurfaceTexture (which is what caused the quality regression).
-        val desiredOsdScale = if (scaleByWindow) baseScale * logicalHeightRatio else baseScale
-        val desiredStatsFontSize = if (scaleByWindow)
-            baseStatsFontSize * logicalHeightRatio
-        else
-            baseStatsFontSize
-
-        try {
-            if (!lastAppliedOsdMarginX.isFinite() ||
-                abs(desiredX - lastAppliedOsdMarginX) > OSD_VALUE_EPS) {
-                MPVLib.setPropertyDouble("osd-margin-x", desiredX)
-                lastAppliedOsdMarginX = desiredX
-            }
-            if (!lastAppliedOsdMarginY.isFinite() ||
-                abs(desiredY - lastAppliedOsdMarginY) > OSD_VALUE_EPS) {
-                MPVLib.setPropertyDouble("osd-margin-y", desiredY)
-                lastAppliedOsdMarginY = desiredY
-            }
-            if (!lastAppliedOsdScale.isFinite() ||
-                abs(desiredOsdScale - lastAppliedOsdScale) > OSD_VALUE_EPS) {
-                MPVLib.setPropertyDouble("osd-scale", desiredOsdScale)
-                lastAppliedOsdScale = desiredOsdScale
-            }
-            applyStatsSizing(desiredStatsFontSize, scaleByWindow)
-        } catch (_: Throwable) {
-            // OSD tuning is cosmetic. Never let an unavailable mpv property
-            // interfere with video rendering or with the quality surface path.
-        }
-    }
-
-    private fun captureBaseOsdSettings() {
-        if (baseOsdMarginX == null) {
-            baseOsdMarginX = try {
-                MPVLib.getPropertyDouble("osd-margin-x") ?: DEFAULT_OSD_MARGIN
-            } catch (_: Throwable) {
-                DEFAULT_OSD_MARGIN
-            }
-        }
-        if (baseOsdMarginY == null) {
-            baseOsdMarginY = try {
-                MPVLib.getPropertyDouble("osd-margin-y") ?: DEFAULT_OSD_MARGIN
-            } catch (_: Throwable) {
-                DEFAULT_OSD_MARGIN
-            }
-        }
-        if (baseOsdScale == null) {
-            baseOsdScale = try {
-                MPVLib.getPropertyDouble("osd-scale") ?: DEFAULT_OSD_SCALE
-            } catch (_: Throwable) {
-                DEFAULT_OSD_SCALE
-            }
-        }
-        if (!scriptOptsCaptured) {
-            val opts = try { MPVLib.getPropertyString("script-opts") } catch (_: Throwable) { null }
-            baseScriptOpts = opts ?: ""
-            baseStatsFontSize = findScriptOptionDouble(baseScriptOpts.orEmpty(), STATS_FONT_SIZE_KEY)
-                ?: DEFAULT_STATS_FONT_SIZE
-            scriptOptsCaptured = true
-        }
-    }
-
-    private fun applyStatsSizing(fontSize: Double, scaleByWindow: Boolean) {
-        if (!scriptOptsCaptured)
-            return
-        if (lastAppliedStatsFontSize.isFinite() &&
-            abs(fontSize - lastAppliedStatsFontSize) <= STATS_FONT_EPS &&
-            lastAppliedStatsVidscale == scaleByWindow)
-            return
-
-        // stats.lua uses its own explicit ASS \fs size, so --osd-scale alone does
-        // not recreate the smaller media-aspect OSD canvas. Scale the stats font
-        // by the same content/window height ratio and force its vidscale mode to
-        // match osd-scale-by-window so the physical result follows that canvas.
-        val value = fontSize.coerceAtLeast(MIN_STATS_FONT_SIZE).toString()
-        var updated = replaceScriptOption(baseScriptOpts.orEmpty(), STATS_FONT_SIZE_KEY, value)
-        updated = replaceScriptOption(
-            updated,
-            STATS_VIDSCALE_KEY,
-            if (scaleByWindow) "yes" else "no",
-        )
-        MPVLib.setPropertyString("script-opts", updated)
-        lastAppliedStatsFontSize = fontSize
-        lastAppliedStatsVidscale = scaleByWindow
-    }
-
-    private fun restoreBaseOsdSettings() {
-        try {
-            baseOsdMarginX?.let { MPVLib.setPropertyDouble("osd-margin-x", it) }
-            baseOsdMarginY?.let { MPVLib.setPropertyDouble("osd-margin-y", it) }
-            baseOsdScale?.let { MPVLib.setPropertyDouble("osd-scale", it) }
-            if (scriptOptsCaptured)
-                MPVLib.setPropertyString("script-opts", baseScriptOpts.orEmpty())
-        } catch (_: Throwable) {
-            // Best-effort restoration only.
-        }
-        lastAppliedOsdMarginX = Double.NaN
-        lastAppliedOsdMarginY = Double.NaN
-        lastAppliedOsdScale = Double.NaN
-        lastAppliedStatsFontSize = Double.NaN
-        lastAppliedStatsVidscale = null
-    }
-
-    private fun findScriptOptionDouble(options: String, key: String): Double? {
-        val prefix = "$key="
-        return options.split(',')
-            .asSequence()
-            .map { it.trim() }
-            .firstOrNull { it.startsWith(prefix) }
-            ?.substring(prefix.length)
-            ?.toDoubleOrNull()
-    }
-
-    private fun replaceScriptOption(options: String, key: String, value: String): String {
-        val prefix = "$key="
-        val entries = options.split(',')
-            .map { it.trim() }
-            .filter { it.isNotEmpty() }
-            .toMutableList()
-        var replaced = false
-        for (i in entries.indices) {
-            if (entries[i].startsWith(prefix)) {
-                entries[i] = "$key=$value"
-                replaced = true
-            }
-        }
-        if (!replaced)
-            entries.add("$key=$value")
-        return entries.joinToString(",")
     }
 
     /** Compute the content/video rect within the view at base scale. */
@@ -1638,18 +1395,6 @@ internal class VideoZoomGestures(
     }
 
     companion object {
-        private const val DEFAULT_OSD_MARGIN = 16.0
-        private const val DEFAULT_OSD_SCALE = 1.0
-        private const val DEFAULT_STATS_FONT_SIZE = 20.0
-        private const val MIN_STATS_FONT_SIZE = 1.0
-        private const val OSD_REFERENCE_HEIGHT = 720.0
-        private const val MIN_OSD_LOGICAL_SCALE = 0.01
-        private const val OSD_VALUE_EPS = 0.001
-        private const val STATS_FONT_EPS = 0.01
-        private const val OSD_BOUNDS_EPS = 0.5f
-        private const val STATS_FONT_SIZE_KEY = "stats-font_size"
-        private const val STATS_VIDSCALE_KEY = "stats-vidscale"
-
         private const val EPS = 0.001f
         private const val MIN_SCALE = 1f
         private const val MAX_SCALE = 20f
