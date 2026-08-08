@@ -375,23 +375,13 @@ if 'mpv_android_set_video_transform' not in text:
 path = Path('video/out/vo.c')
 text = path.read_text()
 if 'android_transform_pending' not in text:
-    needle = '    bool request_redraw;            // redraw request from player to VO\n    bool want_redraw;               // redraw request from VO to player\n'
-    repl = needle + r'''    bool android_transform_pending;
-    struct voctrl_android_video_transform android_transform;
-'''
-    text = replace_once(text, needle, repl, 'vo.c state')
+    def insert_after_regex(src, pattern, addition, where):
+        m = re.search(pattern, src, flags=re.S | re.M)
+        if not m:
+            fail(where, 'anchor not found')
+        return src[:m.end()] + addition + src[m.end():]
 
-if 'apply_android_video_transform' not in text:
-    needle = r'''static void wakeup_locked(struct vo *vo)
-{
-    struct vo_internal *in = vo->in;
-    mp_cond_broadcast(&in->wakeup);
-    if (vo->driver->wakeup)
-        vo->driver->wakeup(vo);
-    in->need_wakeup = true;
-}
-'''
-    addition = needle + r'''
+    addition = r'''
 
 void vo_set_android_video_transform(
     struct vo *vo, const struct voctrl_android_video_transform *transform)
@@ -428,35 +418,28 @@ static void apply_android_video_transform(struct vo *vo)
         vo->driver->control(vo, VOCTRL_ANDROID_VIDEO_TRANSFORM, &transform);
 }
 '''
-    text = replace_once(text, needle, addition, 'vo.c transform producer')
+    text = insert_after_regex(
+        text,
+        r'static void wakeup_locked\s*\(\s*struct vo \*vo\s*\)\s*\{.*?\n\}',
+        addition,
+        'vo.c transform producer',
+    )
 
-normal_draw = r'''        stats_time_start(in->stats, "video-draw");
-
-        in->visible = vo->driver->draw_frame(vo, frame);
-'''
+normal_token = 'stats_time_start(in->stats, "video-draw");'
 if 'apply_android_video_transform(vo);\n\n        stats_time_start(in->stats, "video-draw");' not in text:
-    normal_draw_new = r'''        apply_android_video_transform(vo);
+    idx = text.find(normal_token)
+    if idx < 0:
+        fail('vo.c normal draw', 'video-draw anchor not found')
+    line_start = text.rfind('\n', 0, idx) + 1
+    text = text[:line_start] + '        apply_android_video_transform(vo);\n\n' + text[line_start:]
 
-        stats_time_start(in->stats, "video-draw");
-
-        in->visible = vo->driver->draw_frame(vo, frame);
-'''
-    text = replace_once(text, normal_draw, normal_draw_new, 'vo.c normal draw')
-
-redraw = r'''    mp_mutex_unlock(&in->lock);
-
-    vo->driver->draw_frame(vo, frame);
-    vo->driver->flip_page(vo);
-'''
+redraw_anchor = '    mp_mutex_unlock(&in->lock);\n\n    vo->driver->draw_frame(vo, frame);\n    vo->driver->flip_page(vo);\n'
 if 'apply_android_video_transform(vo);\n\n    vo->driver->draw_frame(vo, frame);' not in text:
-    redraw_new = r'''    mp_mutex_unlock(&in->lock);
+    idx = text.find(redraw_anchor)
+    if idx < 0:
+        fail('vo.c retained redraw', 'retained redraw anchor not found')
+    text = text[:idx] + '    mp_mutex_unlock(&in->lock);\n\n    apply_android_video_transform(vo);\n\n    vo->driver->draw_frame(vo, frame);\n    vo->driver->flip_page(vo);\n' + text[idx + len(redraw_anchor):]
 
-    apply_android_video_transform(vo);
-
-    vo->driver->draw_frame(vo, frame);
-    vo->driver->flip_page(vo);
-'''
-    text = replace_once(text, redraw, redraw_new, 'vo.c retained redraw')
 path.write_text(text)
 
 path = Path('video/out/vo_gpu_next.c')
