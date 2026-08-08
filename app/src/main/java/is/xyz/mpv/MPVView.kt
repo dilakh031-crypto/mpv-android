@@ -132,7 +132,10 @@ internal class MPVView(context: Context, attrs: AttributeSet) : BaseMPVView(cont
 
         // Runtime option changes normally leak into the next playlist item. Reset every option
         // exposed as a per-video control by this app, including changes made through input.conf.
-        mergeStringListProperty("reset-on-next-file", PER_FILE_PLAYBACK_OPTIONS + "start")
+        mergeStringListProperty(
+            "reset-on-next-file",
+            PER_FILE_PLAYBACK_OPTIONS + TRANSIENT_VIDEO_TRANSFORM_OPTIONS + "start"
+        )
 
         val sharedPreferences = PreferenceManager.getDefaultSharedPreferences(context)
         configureFileStatePersistence(sharedPreferences.getBoolean("save_position", false))
@@ -159,7 +162,8 @@ internal class MPVView(context: Context, attrs: AttributeSet) : BaseMPVView(cont
             // option are stored together while the preference is enabled.
             mergeStringListProperty(
                 "watch-later-options",
-                PER_FILE_PLAYBACK_OPTIONS + "start"
+                PER_FILE_PLAYBACK_OPTIONS + "start",
+                remove = TRANSIENT_VIDEO_TRANSFORM_OPTIONS
             )
         } else {
             if (!watchLaterOptionsSuppressed) {
@@ -669,6 +673,14 @@ internal class MPVView(context: Context, attrs: AttributeSet) : BaseMPVView(cont
             "sid",
             "secondary-sid",
             "vid",
+        )
+
+        // Gesture zoom is transient UI state. mpv's default watch-later list can include
+        // video-* options, so explicitly keep our renderer transform out of per-file state.
+        private val TRANSIENT_VIDEO_TRANSFORM_OPTIONS = linkedSetOf(
+            "video-zoom",
+            "video-pan-x",
+            "video-pan-y",
         )
 
         // Audio/subtitle IDs are restored together with external filenames by MPVActivity.

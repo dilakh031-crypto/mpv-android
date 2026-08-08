@@ -116,8 +116,7 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
         val exact: Boolean,
         val commandValueSec: Double,
         val directionalKeyframeDirection: Int,
-        val issuedAtMs: Long,
-        val frameFloor: Long
+        val issuedAtMs: Long
     ) {
         var superseded = false
         var commandReplyReceived = false
@@ -188,9 +187,6 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
         ): Boolean = size > ORIENTATION_CACHE_SIZE
     }
     private var uiInitialized: Boolean = false
-
-    @Volatile
-    private var playerSurfaceFrameSerial = 0L
 
     private var suppressAspectMenuGeometrySyncUntilMs = 0L
 
@@ -378,9 +374,8 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
             playbackSeekbar.setOnSeekBarChangeListener(seekBarChangeListener)
         }
 
-        // NOTE: touch events must come from an untransformed overlay view (gestureLayer).
-        // The player view is transformed for zoom/pan, so attaching gestures directly to it
-        // would inverse-transform MotionEvents and create feedback/jitter.
+        // Keep zoom/touch input on a dedicated, never-transformed overlay. The player itself
+        // remains a fixed SurfaceView and mpv performs all zoom/pan in the video renderer.
         binding.gestureLayer.setOnTouchListener { _, e ->
             if (lockedUI)
                 return@setOnTouchListener false
@@ -454,11 +449,6 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
         binding = PlayerBinding.inflate(layoutInflater)
         gestures = TouchGestures(this)
         zoomGestures = VideoZoomGestures(binding.player)
-        binding.player.onSurfaceTextureFrameAvailable = {
-            playerSurfaceFrameSerial += 1L
-            onScrubSurfaceFrameAvailable(playerSurfaceFrameSerial)
-            zoomGestures.onSurfaceTextureFrameAvailable()
-        }
 
         readAutoRotationModeForLaunch()
         val launchOrientation = resolveLaunchRequestedOrientation(filepath)
@@ -540,31 +530,24 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
 
     private fun hasDisplayableVideoGeometry(): Boolean {
         val aspect = try { player.getEffectiveVideoAspect() ?: 0.0 } catch (_: Throwable) { 0.0 }
-        val size = try { player.getVideoPixelSize() } catch (_: Throwable) { null }
-        return aspect > 0.001 && size != null
+        return aspect > 0.001
     }
 
     private fun isAspectMenuGeometrySyncSuppressed(): Boolean {
         return SystemClock.uptimeMillis() < suppressAspectMenuGeometrySyncUntilMs
     }
 
-    private fun syncZoomVideoGeometry(
-        prepareNormalSurface: Boolean = false,
-        immediate: Boolean = false,
-    ) {
+    private fun syncZoomVideoGeometry(immediate: Boolean = false) {
         if (!::zoomGestures.isInitialized || isAspectMenuGeometrySyncSuppressed())
             return
 
         val aspect = try { player.getEffectiveVideoAspect() } catch (_: Throwable) { null }
-        val size = try { player.getVideoPixelSize() } catch (_: Throwable) { null }
         val pan = try { player.getPanscan() } catch (_: Throwable) { 0.0 }
 
         try {
             zoomGestures.setVideoGeometry(
                 aspect = aspect,
-                pixelSize = size,
                 panscanValue = pan,
-                prepareNormalSurface = prepareNormalSurface,
                 immediate = immediate,
             )
         } catch (_: Throwable) {
@@ -572,16 +555,10 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
         }
     }
 
-    private fun prepareZoomSurfaceWhenReady() {
+    private fun syncZoomGeometryWhenReady() {
         if (!::zoomGestures.isInitialized || !hasDisplayableVideoGeometry())
             return
-
-        syncZoomVideoGeometry(prepareNormalSurface = true, immediate = true)
-        try {
-            zoomGestures.prepareForVisibleMedia()
-        } catch (_: Throwable) {
-            // Zoom is optional; playback must continue.
-        }
+        syncZoomVideoGeometry(immediate = true)
     }
 
     private fun resetZoomForNewFile() {
@@ -594,14 +571,14 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
         }
     }
 
-    private fun prepareZoomSurfaceForWindowExit() {
+    private fun prepareZoomForWindowExit() {
         if (!::zoomGestures.isInitialized || !::binding.isInitialized)
             return
 
         try {
             zoomGestures.prepareForWindowExit()
         } catch (_: Throwable) {
-            // Finish must continue even if a vendor TextureView rejects a final transform update.
+            // Zoom reset is best-effort during teardown; finish must always continue.
         }
     }
 
@@ -627,8 +604,8 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
         }
         setResult(code, result)
 
-        // Return a zoomed TextureView to its normal transform without hiding or resizing it.
-        prepareZoomSurfaceForWindowExit()
+        // Return a zoomed video to its normal transform without hiding or resizing it.
+        prepareZoomForWindowExit()
 
         // SCREEN_ORIENTATION_BEHIND is Android's native way to adopt the activity underneath while
         // this window is still participating in the close transition. A task-root player instead
@@ -1114,10 +1091,8 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
     /**
      * Keeps the Android UI overlay above the video layer and forces a redraw.
      *
-     * On some devices the TextureView can momentarily win composition/z-order during player
-     * startup. Touch still reaches gestureLayer, so seeking works, but controls/gestureTextView
-     * do not become visible until the window is redrawn by something external (for example
-     * pulling the notification shade). Poking the overlay here makes that redraw deterministic.
+     * Keep the app UI deterministically above the SurfaceView video layer during startup,
+     * rotation and player redraws. Touch stays on gestureLayer; controls remain on outside.
      */
     private fun refreshPlayerOverlay() {
         if (!::binding.isInitialized)
@@ -2872,8 +2847,6 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
                 } else {
                     parseAspectRatio(ratio) ?: try { player.getVideoAspect() } catch (_: Throwable) { null }
                 }
-                val targetPixelSize = try { player.getVideoPixelSize() } catch (_: Throwable) { null }
-
                 // Menu selections are the only transition where we already know the
                 // requested geometry. Apply it before asking mpv to redraw so the
                 // user never sees the temporary fullscreen/base layout.
@@ -2881,7 +2854,6 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
                     try {
                         zoomGestures.applyPredictedAspectMenuGeometry(
                             aspect = targetAspect,
-                            pixelSize = targetPixelSize,
                             panscanValue = targetPanscan,
                         )
                     } catch (_: Throwable) {}
@@ -2891,7 +2863,7 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
                 suppressAspectMenuGeometrySyncUntilMs = suppressUntil
                 eventUiHandler.postDelayed({
                     if (SystemClock.uptimeMillis() >= suppressUntil)
-                        syncZoomVideoGeometry(prepareNormalSurface = true, immediate = true)
+                        syncZoomVideoGeometry(immediate = true)
                 }, ASPECT_MENU_PREDICTIVE_SYNC_GRACE_MS + 20L)
 
                 if (ratio == "panscan") {
@@ -3629,8 +3601,7 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
             }
             "video-params/w", "video-params/h" -> {
                 updateOrientation()
-                syncZoomVideoGeometry()
-                prepareZoomSurfaceWhenReady()
+                syncZoomGeometryWhenReady()
             }
         }
     }
@@ -3643,13 +3614,9 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
             "video-params/aspect", "video-params/rotate" -> {
                 updateOrientation()
                 updatePiPParams()
-                syncZoomVideoGeometry()
-                prepareZoomSurfaceWhenReady()
+                syncZoomGeometryWhenReady()
             }
-            "panscan" -> {
-                syncZoomVideoGeometry()
-                prepareZoomSurfaceWhenReady()
-            }
+            "panscan" -> syncZoomGeometryWhenReady()
         }
     }
 
@@ -3657,10 +3624,7 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
         if (!activityIsForeground) return
         when (property) {
             "speed" -> updateSpeedButton()
-            "video-aspect-override" -> {
-                syncZoomVideoGeometry()
-                prepareZoomSurfaceWhenReady()
-            }
+            "video-aspect-override" -> syncZoomGeometryWhenReady()
         }
         if (metaUpdated)
             updateMetadataDisplay()
@@ -3856,8 +3820,9 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
 
             eventUiHandler.post {
                 mediaGeometryReadyForOrientation = true
+                resetZoomForNewFile()
                 updateOrientation()
-                prepareZoomSurfaceWhenReady()
+                syncZoomGeometryWhenReady()
                 prefetchAdjacentPlaylistOrientations()
             }
         }
@@ -3865,7 +3830,7 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
         if (eventId == MpvEvent.MPV_EVENT_VIDEO_RECONFIG) {
             eventUiHandler.post {
                 updateOrientation()
-                prepareZoomSurfaceWhenReady()
+                syncZoomGeometryWhenReady()
             }
         }
 
@@ -3890,9 +3855,7 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
                 }
             }
             try {
-                MPVLib.setPropertyDouble("video-zoom", 0.0)
-                MPVLib.setPropertyDouble("video-pan-x", 0.0)
-                MPVLib.setPropertyDouble("video-pan-y", 0.0)
+                MPVLib.setVideoTransform(0.0, 0.0, 0.0)
             } catch (_: Throwable) {
                 // ignore
             }
@@ -4114,8 +4077,7 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
             exact = exact,
             commandValueSec = commandValueSec,
             directionalKeyframeDirection = directionalKeyframeDirection,
-            issuedAtMs = SystemClock.uptimeMillis(),
-            frameFloor = playerSurfaceFrameSerial
+            issuedAtMs = SystemClock.uptimeMillis()
         )
 
         // Install the request before entering JNI. A very fast COMMAND_REPLY is posted back to the
@@ -4172,6 +4134,7 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
             MpvEvent.MPV_EVENT_PLAYBACK_RESTART -> {
                 request.playbackRestartSeen = true
                 applyScrubPlaybackTime(request, playbackTime)
+                scheduleScrubSurfaceSettle(request)
             }
         }
         maybeFinishActiveScrubSeek(request)
@@ -4212,18 +4175,24 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
         applyScrubPlaybackTime(request, readScrubPlaybackTimeFromMpv())
     }
 
-    private fun onScrubSurfaceFrameAvailable(serial: Long) {
-        if (Looper.myLooper() != Looper.getMainLooper()) {
-            eventUiHandler.post { onScrubSurfaceFrameAvailable(serial) }
-            return
-        }
-        if (isDestroyed)
+    private fun scheduleScrubSurfaceSettle(request: ScrubSeekRequest) {
+        if (isDestroyed || activeScrubSeek !== request || request.superseded)
             return
 
-        val request = activeScrubSeek ?: return
-        if (serial > request.frameFloor)
-            request.frameSeen = true
-        maybeFinishActiveScrubSeek(request)
+        // TextureView used to provide a per-buffer callback. With the direct SurfaceView path,
+        // wait for two display frames after mpv reports PLAYBACK_RESTART before allowing the
+        // frozen scrub frame to be considered visible. This keeps the old "don't resume on an
+        // intermediate seek frame" behavior without inserting a TextureView compositor stage.
+        binding.player.postOnAnimation outer@{
+            if (isDestroyed || activeScrubSeek !== request || request.superseded)
+                return@outer
+            binding.player.postOnAnimation inner@{
+                if (isDestroyed || activeScrubSeek !== request || request.superseded)
+                    return@inner
+                request.frameSeen = true
+                maybeFinishActiveScrubSeek(request)
+            }
+        }
     }
 
     private fun maybeFinishActiveScrubSeek(request: ScrubSeekRequest) {
