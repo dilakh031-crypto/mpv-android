@@ -33,7 +33,6 @@ object MPVLib {
     external fun setPropertyInt(property: String, value: Int)
     external fun getPropertyDouble(property: String): Double?
     external fun setPropertyDouble(property: String, value: Double)
-    external fun setVideoTransform(zoom: Double, panX: Double, panY: Double)
     external fun getPropertyBoolean(property: String): Boolean?
     external fun setPropertyBoolean(property: String, value: Boolean)
     external fun getPropertyString(property: String): String?
