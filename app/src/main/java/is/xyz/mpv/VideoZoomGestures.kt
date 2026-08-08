@@ -1009,9 +1009,8 @@ internal class VideoZoomGestures(
     private fun updateRenderSurfaceForCurrentState(force: Boolean) {
         val zooming = isZoomed() || scaleDetector.isInProgress
         val desiredMode = when {
-            // Panscan intentionally uses the full view as mpv's output window because the
-            // image itself is cropped to fill that view. Keeping a media-aspect surface here
-            // would remove the letterbox area panscan needs to crop into.
+            // Panscan needs the full view-shaped output window; changing its surface
+            // aspect would change the intended crop behavior.
             isPanscanActive() -> {
                 if (zooming && zoomHighQualityRequested)
                     RenderSurfaceMode.VIEW_ASPECT_ORIGINAL
@@ -1019,9 +1018,10 @@ internal class VideoZoomGestures(
                     RenderSurfaceMode.BASE
             }
 
-            // Once reliable video geometry is known, keep mpv's normal render surface at the
-            // video's effective aspect ratio. mpv OSD (stats, property messages, etc.) is then
-            // laid out inside the image rectangle instead of across the whole phone view.
+            // At normal size keep mpv's OSD canvas on the actual video rectangle,
+            // so stats/property messages cannot extend into the letterbox bars.
+            // This compact mode has the same on-screen video pixel dimensions as
+            // BASE and therefore does not reduce normal playback detail.
             !zooming -> {
                 if (normalCompactSurfacePrepared)
                     RenderSurfaceMode.MEDIA_ASPECT_BASE
@@ -1029,8 +1029,10 @@ internal class VideoZoomGestures(
                     RenderSurfaceMode.BASE
             }
 
-            // While pinch motion is still using the compact/fast buffer, preserve the same
-            // media-aspect geometry so OSD never jumps back outside the image bounds.
+            // During the fast/compact phase of a pinch, keep the same media-aspect
+            // geometry. Once high quality is requested, fall through to the original
+            // target build's mode selection below; that logic is intentionally kept
+            // unchanged because it contains the quality fix for moving video/stills.
             !zoomHighQualityRequested -> {
                 if (normalCompactSurfacePrepared)
                     RenderSurfaceMode.MEDIA_ASPECT_BASE
@@ -1062,9 +1064,10 @@ internal class VideoZoomGestures(
         if (isPanscanActive())
             return RenderSurfaceMode.VIEW_ASPECT_ORIGINAL
 
-        // Match the reference build: the high-quality zoom buffer keeps the effective media
-        // aspect too. This keeps mpv's OSD coordinate space tied to the image at all times.
-        return RenderSurfaceMode.MEDIA_ASPECT_ORIGINAL
+        return if (shouldKeepViewAspectWhileZooming())
+            RenderSurfaceMode.VIEW_ASPECT_ORIGINAL
+        else
+            RenderSurfaceMode.MEDIA_ASPECT_ORIGINAL
     }
 
     private fun shouldKeepViewAspectWhileZooming(): Boolean {
@@ -1176,9 +1179,10 @@ internal class VideoZoomGestures(
             return
         }
 
-        // Render only the on-screen video rectangle at normal zoom. Because the SurfaceTexture
-        // itself now has the video's effective aspect ratio, mpv's OSD canvas has exactly the
-        // same bounds as the displayed image and cannot extend into the surrounding black bars.
+        // BASE renders the video itself at c.w x c.h inside a larger view-shaped
+        // buffer. Use exactly those video dimensions as the compact surface: mpv's
+        // OSD coordinate space is now the image rectangle, while visible video
+        // resolution remains the same as the unmodified BASE path.
         val bufferWidth = ceilToIntAtLeastOne(c.w.toDouble())
         val bufferHeight = ceilToIntAtLeastOne(c.h.toDouble())
         player.setRenderSurfaceSize(bufferWidth, bufferHeight)
