@@ -262,230 +262,66 @@ diff --git a/player/command.c b/player/command.c
 PATCH
 fi
 
-# Keep Android's real render surface at the resolution requested by mpv-android,
-# while giving gpu-next a separate logical viewport for OSD layout.
+# mpv-android: confine gpu-next OSD to the video crop without resizing the Android buffer.
 #
-# android-surface-size also controls the Android native-window buffer geometry.
-# Shrinking it to the video rectangle confines OSD, but also lowers render
-# resolution. Instead, keep the real surface untouched and make only the OSD
-# canvas match the visible video rectangle.
-python3 - <<'PY'
+# The compact-surface implementation achieves this by setting android-surface-size
+# to the fitted video rectangle. On Android that also changes ANativeWindow buffer
+# geometry and can lower render resolution. Keep the real surface untouched; only
+# render gpu-next's OSD against the already-computed destination crop.
+python3 - <<'PY_OSD_VIEWPORT'
 from pathlib import Path
 
 path = Path("video/out/vo_gpu_next.c")
 src = path.read_text()
-
-if "osd_viewport_res" in src:
+marker = "mpv-android OSD video-crop viewport"
+if marker in src:
     raise SystemExit(0)
 
-def replace_once(old, new, label):
-    global src
-    if old not in src:
-        raise SystemExit(f"mpv gpu-next OSD viewport patch failed at: {label}")
-    src = src.replace(old, new, 1)
+needle = "update_overlays(vo, p->osd_res,"
+start = src.find(needle)
+if start < 0:
+    raise SystemExit("mpv gpu-next OSD viewport patch failed: main OSD call not found")
 
-replace_once(
-'''    struct mp_rect src, dst;
-    struct mp_osd_res osd_res;
-    struct osd_state osd_state;
-''',
-'''    struct mp_rect src, dst;
-    struct mp_osd_res osd_res;
-    struct mp_osd_res osd_viewport_res;
-    int osd_viewport_x;
-    int osd_viewport_y;
-    struct osd_state osd_state;
-''',
-"struct priv",
-)
+line_start = src.rfind("\n", 0, start) + 1
+end_marker = "get_ref_luma(p));"
+end = src.find(end_marker, start)
+if end < 0:
+    raise SystemExit("mpv gpu-next OSD viewport patch failed: main OSD call end not found")
+end += len(end_marker)
 
-replace_once(
-'''static void update_overlays(struct vo *vo, struct mp_osd_res res,
-                            int flags, enum pl_overlay_coords coords,
-                            struct osd_state *state, struct pl_frame *frame,
-                            struct mp_image *src, int stereo_mode, float ref_luma)
-''',
-'''static void update_overlays(struct vo *vo, struct mp_osd_res res,
-                            int flags, enum pl_overlay_coords coords,
-                            int viewport_x, int viewport_y,
-                            struct osd_state *state, struct pl_frame *frame,
-                            struct mp_image *src, int stereo_mode, float ref_luma)
-''',
-"update_overlays signature",
-)
+old = src[line_start:end]
+required = ("OSD_DRAW_OSD_ONLY", "PL_OVERLAY_COORDS_DST_FRAME",
+            "&p->osd_state", "&target", "frame->current")
+if not all(token in old for token in required):
+    raise SystemExit("mpv gpu-next OSD viewport patch failed: unexpected main OSD call")
 
-replace_once(
-'''                .src = { b->src_x, b->src_y, b->src_x + b->w, b->src_y + b->h },
-                .dst = { b->x, b->y, b->x + b->dw, b->y + b->dh },
-                .color = {
-''',
-'''                .src = { b->src_x, b->src_y, b->src_x + b->w, b->src_y + b->h },
-                .dst = { b->x + viewport_x,
-                         b->y + viewport_y,
-                         b->x + b->dw + viewport_x,
-                         b->y + b->dh + viewport_y },
-                .color = {
-''',
-"overlay translation",
-)
-
-replace_once(
-'''    update_overlays(vo, p->osd_res,
-                    (frame->current && opts->blend_subs) ? OSD_DRAW_OSD_ONLY : 0,
-                    PL_OVERLAY_COORDS_DST_FRAME, &p->osd_state, &target, frame->current,
-                    frame->current ? frame->current->params.stereo3d : 0, get_ref_luma(p));
-''',
-'''    update_overlays(vo, p->osd_viewport_res,
-                    (frame->current && opts->blend_subs) ? OSD_DRAW_OSD_ONLY : 0,
-                    PL_OVERLAY_COORDS_DST_FRAME,
-                    p->osd_viewport_x, p->osd_viewport_y,
-                    &p->osd_state, &target, frame->current,
-                    frame->current ? frame->current->params.stereo3d : 0, get_ref_luma(p));
-''',
-"main OSD call",
-)
-
-replace_once(
-'''                    update_overlays(vo, res, OSD_DRAW_SUB_ONLY,
-                                    rel, &fp->subs, image, mpi,
-                                    mpi->params.stereo3d, get_ref_luma(p));
-''',
-'''                    update_overlays(vo, res, OSD_DRAW_SUB_ONLY,
-                                    rel, 0, 0, &fp->subs, image, mpi,
-                                    mpi->params.stereo3d, get_ref_luma(p));
-''',
-"blended subtitle call",
-)
-
-replace_once(
-'''static void resize(struct vo *vo)
-{
-    struct priv *p = vo->priv;
-    struct mp_rect src, dst;
-    struct mp_osd_res osd;
-    vo_get_src_dst_rects(vo, &src, &dst, &osd);
-    if (vo->dwidth && vo->dheight) {
-        gpu_ctx_resize(p->context, vo->dwidth, vo->dheight);
-        vo->want_redraw = true;
-    }
-
-    if (mp_rect_equals(&p->src, &src) &&
-        mp_rect_equals(&p->dst, &dst) &&
-        osd_res_equals(p->osd_res, osd))
-        return;
-    p->osd_sync++;
-    p->osd_res = osd;
-    p->src = src;
-    p->dst = dst;
-}
-''',
-'''static void resize(struct vo *vo)
-{
-    struct priv *p = vo->priv;
-    struct mp_rect src, dst;
-    struct mp_osd_res osd;
-    vo_get_src_dst_rects(vo, &src, &dst, &osd);
-
-    // Keep the physical render surface at vo->dwidth/vo->dheight so Android
-    // retains the high-resolution buffer requested by mpv-android. OSD gets a
-    // separate logical canvas matching only the visible video rectangle.
-    struct mp_osd_res osd_viewport = osd;
-    int osd_viewport_x = 0;
-    int osd_viewport_y = 0;
-    if (vo->dwidth > 0 && vo->dheight > 0) {
-        struct mp_rect visible = {
-            .x0 = MPMAX(0, MPMIN(dst.x0, vo->dwidth)),
-            .y0 = MPMAX(0, MPMIN(dst.y0, vo->dheight)),
-            .x1 = MPMAX(0, MPMIN(dst.x1, vo->dwidth)),
-            .y1 = MPMAX(0, MPMIN(dst.y1, vo->dheight)),
-        };
-        if (visible.x1 > visible.x0 && visible.y1 > visible.y0) {
-            osd_viewport_x = visible.x0;
-            osd_viewport_y = visible.y0;
-            osd_viewport.w = mp_rect_w(visible);
-            osd_viewport.h = mp_rect_h(visible);
-            osd_viewport.ml = 0;
-            osd_viewport.mr = 0;
-            osd_viewport.mt = 0;
-            osd_viewport.mb = 0;
-        }
-    }
-
-    if (vo->dwidth && vo->dheight) {
-        gpu_ctx_resize(p->context, vo->dwidth, vo->dheight);
-        vo->want_redraw = true;
-    }
-
-    if (mp_rect_equals(&p->src, &src) &&
-        mp_rect_equals(&p->dst, &dst) &&
-        osd_res_equals(p->osd_res, osd) &&
-        osd_res_equals(p->osd_viewport_res, osd_viewport) &&
-        p->osd_viewport_x == osd_viewport_x &&
-        p->osd_viewport_y == osd_viewport_y)
-        return;
-    p->osd_sync++;
-    p->osd_res = osd;
-    p->osd_viewport_res = osd_viewport;
-    p->osd_viewport_x = osd_viewport_x;
-    p->osd_viewport_y = osd_viewport_y;
-    p->src = src;
-    p->dst = dst;
-}
-''',
-"resize",
-)
-
-replace_once(
-'''        osd = (struct mp_osd_res) {
-            .display_par = 1.0,
-            .w = mp_rect_w(dst),
-            .h = mp_rect_h(dst),
-        };
-    }
-    // Create target FBO, try high bit depth first
-''',
-'''        osd = (struct mp_osd_res) {
-            .display_par = 1.0,
-            .w = mp_rect_w(dst),
-            .h = mp_rect_h(dst),
-        };
-    }
-    struct mp_osd_res overlay_osd = args->scaled ? p->osd_viewport_res : osd;
-    int overlay_viewport_x = args->scaled ? p->osd_viewport_x : 0;
-    int overlay_viewport_y = args->scaled ? p->osd_viewport_y : 0;
-
-    // Create target FBO, try high bit depth first
-''',
-"screenshot OSD viewport",
-)
-
-replace_once(
-'''        update_overlays(vo, res, osd_flags,
-                        rel, &fp->subs, &image, mpi,
-                        mpi->params.stereo3d, 0);
-''',
-'''        update_overlays(vo, res, osd_flags,
-                        rel, 0, 0, &fp->subs, &image, mpi,
-                        mpi->params.stereo3d, 0);
-''',
-"screenshot blended subtitle call",
-)
-
-replace_once(
-'''        update_overlays(vo, osd, osd_flags, PL_OVERLAY_COORDS_DST_FRAME,
-                        &p->osd_state, &target, mpi,
-                        mpi->params.stereo3d, 0);
-''',
-'''        update_overlays(vo, overlay_osd, osd_flags, PL_OVERLAY_COORDS_DST_FRAME,
-                        overlay_viewport_x, overlay_viewport_y,
-                        &p->osd_state, &target, mpi,
-                        mpi->params.stereo3d, 0);
-''',
-"screenshot OSD call",
-)
-
+indent = old[:len(old) - len(old.lstrip())]
+lines = [
+    f"{indent}// {marker}",
+    f"{indent}struct mp_osd_res osd_viewport = p->osd_res;",
+    f"{indent}enum pl_overlay_coords osd_coords = PL_OVERLAY_COORDS_DST_FRAME;",
+    f"{indent}int osd_w = mp_rect_w(p->dst);",
+    f"{indent}int osd_h = mp_rect_h(p->dst);",
+    f"{indent}if (osd_w > 0 && osd_h > 0) {{",
+    f"{indent}    // Match the OSD canvas of a compact media-aspect surface, but keep",
+    f"{indent}    // vo->dwidth/vo->dheight (and therefore Android's real buffer) intact.",
+    f"{indent}    osd_viewport.w = osd_w;",
+    f"{indent}    osd_viewport.h = osd_h;",
+    f"{indent}    osd_viewport.ml = 0;",
+    f"{indent}    osd_viewport.mr = 0;",
+    f"{indent}    osd_viewport.mt = 0;",
+    f"{indent}    osd_viewport.mb = 0;",
+    f"{indent}    osd_coords = PL_OVERLAY_COORDS_DST_CROP;",
+    f"{indent}}}",
+    f"{indent}update_overlays(vo, osd_viewport,",
+    f"{indent}                (frame->current && opts->blend_subs) ? OSD_DRAW_OSD_ONLY : 0,",
+    f"{indent}                osd_coords, &p->osd_state, &target, frame->current,",
+    f"{indent}                frame->current ? frame->current->params.stereo3d : 0, get_ref_luma(p));",
+]
+new = "\n".join(lines)
+src = src[:line_start] + new + src[end:]
 path.write_text(src)
-PY
+PY_OSD_VIEWPORT
 
 unset CC CXX # meson wants these unset
 
