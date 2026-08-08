@@ -14,7 +14,6 @@ extern "C" {
     jni_func(void, setPropertyInt, jstring property, jint value);
     jni_func(jobject, getPropertyDouble, jstring property);
     jni_func(void, setPropertyDouble, jstring property, jdouble value);
-    jni_func(void, setVideoTransform, jdouble zoom, jdouble pan_x, jdouble pan_y);
     jni_func(jobject, getPropertyBoolean, jstring property);
     jni_func(void, setPropertyBoolean, jstring property, jboolean value);
     jni_func(jstring, getPropertyString, jstring jproperty);
@@ -103,22 +102,6 @@ jni_func(void, setPropertyInt, jstring jproperty, jint jvalue) {
 jni_func(void, setPropertyDouble, jstring jproperty, jdouble jvalue) {
     double value = static_cast<double>(jvalue);
     common_set_property(env, jproperty, MPV_FORMAT_DOUBLE, &value);
-}
-
-jni_func(void, setVideoTransform, jdouble jzoom, jdouble jpan_x, jdouble jpan_y) {
-    // Gesture callbacks are tied to Android's display clock and can legally race Activity
-    // teardown by one callback. A late transform is harmless; terminating the process is not.
-    if (!g_mpv)
-        return;
-
-    // This is a small mpv-android extension patched into libmpv by mpv.sh. It sends one
-    // atomic transform to gpu-next and requests exactly one retained-frame redraw, instead
-    // of changing video-zoom/video-pan-x/video-pan-y as three independent properties.
-    mpv_android_set_video_transform(
-        g_mpv,
-        static_cast<double>(jzoom),
-        static_cast<double>(jpan_x),
-        static_cast<double>(jpan_y));
 }
 
 jni_func(void, setPropertyBoolean, jstring jproperty, jboolean jvalue) {
