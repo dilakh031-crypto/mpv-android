@@ -52,6 +52,16 @@ internal class VideoZoomGestures(
     private var videoPixelHeight = 0
     private var panscan = 0.0
 
+    // Keep mpv's render surface untouched at normal zoom. Instead, constrain mpv's
+    // own OSD layout to the visible video rectangle by adding the letterbox/pillarbox
+    // offsets to the user's configured OSD margins. This preserves the BASE surface
+    // path that avoids the pre-zoom quality regression on media larger than the display.
+    private var osdMarginManagementEnabled = false
+    private var baseOsdMarginX: Double? = null
+    private var baseOsdMarginY: Double? = null
+    private var lastAppliedOsdMarginX = Double.NaN
+    private var lastAppliedOsdMarginY = Double.NaN
+
     private val viewConfiguration = ViewConfiguration.get(target.context)
     private val touchSlop = viewConfiguration.scaledTouchSlop.toFloat()
     private val panStartSlop = max(1f, min(2.5f, touchSlop * 0.22f))
@@ -336,6 +346,11 @@ internal class VideoZoomGestures(
         videoPixelHeight = pixelSize?.second ?: 0
         panscan = panscanValue ?: 0.0
         zoomRenderSurfaceMode = null
+
+        // Video geometry is supplied only after libmpv has been initialized, so it is
+        // safe from this point on to read/write OSD option properties. setMetrics() can
+        // run earlier during layout and therefore must not enable this by itself.
+        osdMarginManagementEnabled = true
 
         if (prepareNormalSurface)
             normalCompactSurfacePrepared = true
@@ -906,6 +921,56 @@ internal class VideoZoomGestures(
     }
 
     /** Compute the content/video rect within the view at base scale. */
+    private fun updateOsdMarginsForVideoContent() {
+        if (!osdMarginManagementEnabled || viewWidth <= 1f || viewHeight <= 1f)
+            return
+
+        if (baseOsdMarginX == null || baseOsdMarginY == null) {
+            try {
+                baseOsdMarginX = MPVLib.getPropertyDouble("options/osd-margin-x") ?: DEFAULT_OSD_MARGIN
+                baseOsdMarginY = MPVLib.getPropertyDouble("options/osd-margin-y") ?: DEFAULT_OSD_MARGIN
+            } catch (_: Throwable) {
+                return
+            }
+        }
+
+        val baseX = baseOsdMarginX ?: return
+        val baseY = baseOsdMarginY ?: return
+
+        // A media-aspect render surface already has the same bounds as the image, so
+        // only the user's original margins are needed there. BASE / view-aspect surfaces
+        // include black bars; add those bar widths/heights to the OSD margins instead of
+        // resizing the SurfaceTexture itself.
+        val c = contentRect()
+        val hasImageSizedOsdCanvas = requestedRenderSurfaceMode.usesMediaAspectFit
+        val insetXPx = if (hasImageSizedOsdCanvas) 0.0 else c.ox.toDouble().coerceAtLeast(0.0)
+        val insetYPx = if (hasImageSizedOsdCanvas) 0.0 else c.oy.toDouble().coerceAtLeast(0.0)
+
+        val scaleByWindow = try {
+            MPVLib.getPropertyBoolean("options/osd-scale-by-window") ?: true
+        } catch (_: Throwable) {
+            true
+        }
+        val osdUnitsPerViewPixel = if (scaleByWindow) OSD_REFERENCE_HEIGHT / viewHeight.toDouble() else 1.0
+
+        val desiredX = baseX + insetXPx * osdUnitsPerViewPixel
+        val desiredY = baseY + insetYPx * osdUnitsPerViewPixel
+
+        try {
+            if (!lastAppliedOsdMarginX.isFinite() || abs(desiredX - lastAppliedOsdMarginX) > OSD_MARGIN_EPS) {
+                MPVLib.setPropertyDouble("options/osd-margin-x", desiredX)
+                lastAppliedOsdMarginX = desiredX
+            }
+            if (!lastAppliedOsdMarginY.isFinite() || abs(desiredY - lastAppliedOsdMarginY) > OSD_MARGIN_EPS) {
+                MPVLib.setPropertyDouble("options/osd-margin-y", desiredY)
+                lastAppliedOsdMarginY = desiredY
+            }
+        } catch (_: Throwable) {
+            // Keep video rendering unaffected even if a particular mpv build does not
+            // expose these option-backed properties at runtime.
+        }
+    }
+
     private fun contentRect(): ContentRect {
         val w = viewWidth
         val h = viewHeight
@@ -1008,39 +1073,10 @@ internal class VideoZoomGestures(
 
     private fun updateRenderSurfaceForCurrentState(force: Boolean) {
         val zooming = isZoomed() || scaleDetector.isInProgress
-        val desiredMode = when {
-            // Panscan needs the full view-shaped output window; changing its surface
-            // aspect would change the intended crop behavior.
-            isPanscanActive() -> {
-                if (zooming && zoomHighQualityRequested)
-                    RenderSurfaceMode.VIEW_ASPECT_ORIGINAL
-                else
-                    RenderSurfaceMode.BASE
-            }
-
-            // At normal size keep mpv's OSD canvas on the actual video rectangle,
-            // so stats/property messages cannot extend into the letterbox bars.
-            // This compact mode has the same on-screen video pixel dimensions as
-            // BASE and therefore does not reduce normal playback detail.
-            !zooming -> {
-                if (normalCompactSurfacePrepared)
-                    RenderSurfaceMode.MEDIA_ASPECT_BASE
-                else
-                    RenderSurfaceMode.BASE
-            }
-
-            // During the fast/compact phase of a pinch, keep the same media-aspect
-            // geometry. Once high quality is requested, fall through to the original
-            // target build's mode selection below; that logic is intentionally kept
-            // unchanged because it contains the quality fix for moving video/stills.
-            !zoomHighQualityRequested -> {
-                if (normalCompactSurfacePrepared)
-                    RenderSurfaceMode.MEDIA_ASPECT_BASE
-                else
-                    RenderSurfaceMode.BASE
-            }
-
-            else -> zoomRenderSurfaceMode ?: selectZoomRenderSurfaceMode().also {
+        val desiredMode = if (!zooming || !zoomHighQualityRequested) {
+            RenderSurfaceMode.BASE
+        } else {
+            zoomRenderSurfaceMode ?: selectZoomRenderSurfaceMode().also {
                 zoomRenderSurfaceMode = it
             }
         }
@@ -1055,9 +1091,10 @@ internal class VideoZoomGestures(
         when (desiredMode) {
             RenderSurfaceMode.BASE -> requestBaseRenderSurfaceSize(force)
             RenderSurfaceMode.VIEW_ASPECT_ORIGINAL -> requestViewAspectOriginalRenderSurfaceSize(force)
-            RenderSurfaceMode.MEDIA_ASPECT_BASE -> requestMediaAspectBaseRenderSurfaceSize(force)
             RenderSurfaceMode.MEDIA_ASPECT_ORIGINAL -> requestMediaAspectOriginalRenderSurfaceSize(force)
         }
+
+        updateOsdMarginsForVideoContent()
     }
 
     private fun selectZoomRenderSurfaceMode(): RenderSurfaceMode {
@@ -1159,34 +1196,6 @@ internal class VideoZoomGestures(
         val bufferHeight = ceilToIntAtLeastOne(c.h.toDouble() * bufferScale)
         player.setRenderSurfaceSize(bufferWidth, bufferHeight)
         markRenderSurfaceModeRequested(RenderSurfaceMode.MEDIA_ASPECT_ORIGINAL)
-    }
-
-    private fun requestMediaAspectBaseRenderSurfaceSize(force: Boolean) {
-        val player = renderTarget ?: return
-        refreshMetricsFromTarget()
-
-        if (!force && requestedRenderSurfaceMode == RenderSurfaceMode.MEDIA_ASPECT_BASE)
-            return
-
-        if (viewWidth <= 1f || viewHeight <= 1f || videoAspect <= 0.001) {
-            requestBaseRenderSurfaceSize(force = true)
-            return
-        }
-
-        val c = contentRect()
-        if (c.w <= 1f || c.h <= 1f) {
-            requestBaseRenderSurfaceSize(force = true)
-            return
-        }
-
-        // BASE renders the video itself at c.w x c.h inside a larger view-shaped
-        // buffer. Use exactly those video dimensions as the compact surface: mpv's
-        // OSD coordinate space is now the image rectangle, while visible video
-        // resolution remains the same as the unmodified BASE path.
-        val bufferWidth = ceilToIntAtLeastOne(c.w.toDouble())
-        val bufferHeight = ceilToIntAtLeastOne(c.h.toDouble())
-        player.setRenderSurfaceSize(bufferWidth, bufferHeight)
-        markRenderSurfaceModeRequested(RenderSurfaceMode.MEDIA_ASPECT_BASE)
     }
 
     private fun markRenderSurfaceModeRequested(mode: RenderSurfaceMode) {
@@ -1376,7 +1385,6 @@ internal class VideoZoomGestures(
     private enum class RenderSurfaceMode(val usesMediaAspectFit: Boolean) {
         BASE(false),
         VIEW_ASPECT_ORIGINAL(false),
-        MEDIA_ASPECT_BASE(true),
         MEDIA_ASPECT_ORIGINAL(true),
     }
 
@@ -1454,6 +1462,10 @@ internal class VideoZoomGestures(
     }
 
     companion object {
+        private const val DEFAULT_OSD_MARGIN = 16.0
+        private const val OSD_REFERENCE_HEIGHT = 720.0
+        private const val OSD_MARGIN_EPS = 0.01
+
         private const val EPS = 0.001f
         private const val MIN_SCALE = 1f
         private const val MAX_SCALE = 20f
