@@ -164,9 +164,9 @@ internal class VideoZoomGestures(
         }
     }
 
-    // The compact normal surface is prepared once reliable media geometry is available, so zoom
-    // can start and stop without a render-surface tear. No startup/exit cover view is required.
-    private var normalCompactSurfacePrepared = false
+    // At 1x we deliberately keep the view-sized BASE surface. The old compact media-aspect
+    // normal surface caused an extra TextureView composition/resample step and is the source of
+    // the visible pre-zoom softness confirmed by the ADB surface-size trace.
 
     // When a pinch returns close enough to normal size, finish it through the
     // same delayed reset path as double-tap. Calling reset() directly from
@@ -203,10 +203,8 @@ internal class VideoZoomGestures(
                     lockedPinchFocusY = detector.focusY
                 }
 
-                // Switch to the original-detail buffer before the first visible zoom step.
-                // If first-frame geometry preparation was unavailable (for example, a remote
-                // stream), arm the compact normal geometry now as a fallback.
-                normalCompactSurfacePrepared = true
+                // Keep the view-sized BASE buffer while the pinch is moving; the quality monitor
+                // upgrades to original detail once the zoom motion slows or settles.
                 val now = SystemClock.uptimeMillis()
                 if (!isZoomed()) {
                     zoomHighQualityRequested = false
@@ -337,8 +335,10 @@ internal class VideoZoomGestures(
         panscan = panscanValue ?: 0.0
         zoomRenderSurfaceMode = null
 
-        if (prepareNormalSurface)
-            normalCompactSurfacePrepared = true
+        // prepareNormalSurface is retained for call-site compatibility. Reliable media geometry
+        // is still captured here, but normal playback intentionally remains on BASE.
+        if (prepareNormalSurface && !isZoomed() && !scaleDetector.isInProgress)
+            zoomHighQualityRequested = false
 
         if (isZoomed() || scaleDetector.isInProgress)
             clampTranslationToVideoContent()
@@ -403,10 +403,8 @@ internal class VideoZoomGestures(
     fun reset() {
         resetTransformState()
 
-        // Critical for scan quality: after returning to normal size, do not keep
-        // the original-resolution texture and let Android minify it. Return to
-        // the prepared compact normal surface so the next zoom starts from the
-        // same geometry, without a start/end tear.
+        // At 1x, return to the full view-sized BASE buffer. mpv performs the source-to-display
+        // downscale directly, so Android does not resample a compact intermediate texture.
         updateRenderSurfaceForCurrentState(force = true)
         applyToView()
     }
@@ -417,7 +415,6 @@ internal class VideoZoomGestures(
         videoPixelWidth = 0
         videoPixelHeight = 0
         panscan = 0.0
-        normalCompactSurfacePrepared = false
         previousSurfaceFrameUptimeMs = Long.MIN_VALUE
         lastSurfaceFrameUptimeMs = Long.MIN_VALUE
         zoomRenderSurfaceMode = null
@@ -428,10 +425,8 @@ internal class VideoZoomGestures(
     }
 
     fun prepareForVisibleMedia() {
-        if (normalCompactSurfacePrepared)
-            return
-
-        normalCompactSurfacePrepared = true
+        // Geometry is ready, but do not compact the 1x SurfaceTexture. Keeping BASE here removes
+        // the extra resampling stage while the zoom-time quality policy remains unchanged.
         updateRenderSurfaceForCurrentState(force = true)
         applyToView()
     }
