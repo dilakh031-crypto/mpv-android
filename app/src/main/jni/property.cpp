@@ -14,6 +14,7 @@ extern "C" {
     jni_func(void, setPropertyInt, jstring property, jint value);
     jni_func(jobject, getPropertyDouble, jstring property);
     jni_func(void, setPropertyDouble, jstring property, jdouble value);
+    jni_func(void, setVideoTransform, jdouble zoom, jdouble pan_x, jdouble pan_y);
     jni_func(jobject, getPropertyBoolean, jstring property);
     jni_func(void, setPropertyBoolean, jstring property, jboolean value);
     jni_func(jstring, getPropertyString, jstring jproperty);
@@ -102,6 +103,24 @@ jni_func(void, setPropertyInt, jstring jproperty, jint jvalue) {
 jni_func(void, setPropertyDouble, jstring jproperty, jdouble jvalue) {
     double value = static_cast<double>(jvalue);
     common_set_property(env, jproperty, MPV_FORMAT_DOUBLE, &value);
+}
+
+static void set_double_property_direct(const char *property, double value)
+{
+    int result = mpv_set_property(g_mpv, property, MPV_FORMAT_DOUBLE, &value);
+    if (result < 0)
+        ALOGE("mpv_set_property(%s) returned error %s", property, mpv_error_string(result));
+}
+
+jni_func(void, setVideoTransform, jdouble jzoom, jdouble jpan_x, jdouble jpan_y) {
+    CHECK_MPV_INIT();
+
+    // Keep all three geometry updates inside one Java->native transition. mpv still owns
+    // the transform and rasterization; this only avoids three independent JNI crossings
+    // per display frame and minimizes the interval between the related property writes.
+    set_double_property_direct("video-zoom", static_cast<double>(jzoom));
+    set_double_property_direct("video-pan-x", static_cast<double>(jpan_x));
+    set_double_property_direct("video-pan-y", static_cast<double>(jpan_y));
 }
 
 jni_func(void, setPropertyBoolean, jstring jproperty, jboolean jvalue) {
