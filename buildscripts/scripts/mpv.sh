@@ -375,13 +375,24 @@ if 'mpv_android_set_video_transform' not in text:
 path = Path('video/out/vo.c')
 text = path.read_text()
 if 'android_transform_pending' not in text:
-    def insert_after_regex(src, pattern, addition, where):
-        m = re.search(pattern, src, flags=re.S | re.M)
-        if not m:
-            fail(where, 'anchor not found')
-        return src[:m.end()] + addition + src[m.end():]
+    needle = '    bool request_redraw;            // redraw request from player to VO\n    bool want_redraw;               // redraw request from VO to player\n'
+    repl = needle + r'''    bool android_transform_pending;
+    struct voctrl_android_video_transform android_transform;
+'''
+    text = replace_once(text, needle, repl, 'vo.c state')
 
-    addition = r'''
+if 'apply_android_video_transform' not in text:
+    needle = r'''static void wakeup_locked(struct vo *vo)
+{
+    struct vo_internal *in = vo->in;
+
+    mp_cond_broadcast(&in->wakeup);
+    if (vo->driver->wakeup)
+        vo->driver->wakeup(vo);
+    in->need_wakeup = true;
+}
+'''
+    addition = needle + r'''
 
 void vo_set_android_video_transform(
     struct vo *vo, const struct voctrl_android_video_transform *transform)
@@ -418,40 +429,48 @@ static void apply_android_video_transform(struct vo *vo)
         vo->driver->control(vo, VOCTRL_ANDROID_VIDEO_TRANSFORM, &transform);
 }
 '''
-    text = insert_after_regex(
-        text,
-        r'static void wakeup_locked\s*\(\s*struct vo \*vo\s*\)\s*\{.*?\n\}',
-        addition,
-        'vo.c transform producer',
-    )
+    text = replace_once(text, needle, addition, 'vo.c transform producer')
 
-normal_token = 'stats_time_start(in->stats, "video-draw");'
+normal_draw = r'''        stats_time_start(in->stats, "video-draw");
+
+        in->visible = vo->driver->draw_frame(vo, frame);
+'''
 if 'apply_android_video_transform(vo);\n\n        stats_time_start(in->stats, "video-draw");' not in text:
-    idx = text.find(normal_token)
-    if idx < 0:
-        fail('vo.c normal draw', 'video-draw anchor not found')
-    line_start = text.rfind('\n', 0, idx) + 1
-    text = text[:line_start] + '        apply_android_video_transform(vo);\n\n' + text[line_start:]
+    normal_draw_new = r'''        apply_android_video_transform(vo);
 
-redraw_anchor = '    mp_mutex_unlock(&in->lock);\n\n    vo->driver->draw_frame(vo, frame);\n    vo->driver->flip_page(vo);\n'
+        stats_time_start(in->stats, "video-draw");
+
+        in->visible = vo->driver->draw_frame(vo, frame);
+'''
+    text = replace_once(text, normal_draw, normal_draw_new, 'vo.c normal draw')
+
+redraw = r'''    mp_mutex_unlock(&in->lock);
+
+    vo->driver->draw_frame(vo, frame);
+    vo->driver->flip_page(vo);
+'''
 if 'apply_android_video_transform(vo);\n\n    vo->driver->draw_frame(vo, frame);' not in text:
-    idx = text.find(redraw_anchor)
-    if idx < 0:
-        fail('vo.c retained redraw', 'retained redraw anchor not found')
-    text = text[:idx] + '    mp_mutex_unlock(&in->lock);\n\n    apply_android_video_transform(vo);\n\n    vo->driver->draw_frame(vo, frame);\n    vo->driver->flip_page(vo);\n' + text[idx + len(redraw_anchor):]
+    redraw_new = r'''    mp_mutex_unlock(&in->lock);
 
+    apply_android_video_transform(vo);
+
+    vo->driver->draw_frame(vo, frame);
+    vo->driver->flip_page(vo);
+'''
+    text = replace_once(text, redraw, redraw_new, 'vo.c retained redraw')
 path.write_text(text)
 
 path = Path('video/out/vo_gpu_next.c')
 text = path.read_text()
 if 'android_transform_active' not in text:
-    needle = '    bool frame_pending;\n    bool paused;\n    pl_options pars;\n'
+    needle = '    bool frame_pending;\n    bool paused;\n\n    pl_options pars;\n'
     repl = r'''    bool frame_pending;
     bool paused;
     bool android_transform_active;
     double android_zoom;
     double android_pan_x;
     double android_pan_y;
+
     pl_options pars;
 '''
     text = replace_once(text, needle, repl, 'gpu-next state')
@@ -472,6 +491,7 @@ if 'static void update_android_zoom_geometry' not in text:
         mp_rect_equals(&p->dst, &dst) &&
         osd_res_equals(p->osd_res, osd))
         return;
+
     p->osd_sync++;
     p->osd_res = osd;
     p->src = src;
