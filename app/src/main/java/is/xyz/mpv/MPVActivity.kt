@@ -57,6 +57,7 @@ import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.TimeoutException
 import kotlin.math.abs
+import kotlin.math.ceil
 import kotlin.math.floor
 import kotlin.math.roundToInt
 
@@ -147,8 +148,8 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
     private val scrubHardTimeoutRunnable = Runnable { finishScrubSeekAfterHardTimeout() }
 
     private var gestureScrubActive = false
-    // Kept as a fractional second (not rounded) so the exact seek target preserves whatever
-    // sub-second offset the playback position had when the gesture started.
+    // These retain the sub-second fraction of the drag target (e.g. 2.234, not just 2) so an
+    // exact scrub seek lands precisely instead of snapping to the nearest whole second.
     private var pendingGestureSeekSec: Double? = null
     private var lastIssuedGestureSeekSec: Double? = null
 
@@ -3998,7 +3999,8 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
 
         val runnable = Runnable {
             gestureStableSeekRunnable = null
-            if (!gestureScrubActive || pendingGestureSeekSec != target)
+            val currentTarget = pendingGestureSeekSec
+            if (!gestureScrubActive || currentTarget == null || !sameSeekTarget(currentTarget, target))
                 return@Runnable
             performGestureIdleSeek()
         }
@@ -4439,21 +4441,23 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
                     beginScrubPlaybackHold()
                 }
 
-                // Quantize to 1 second steps. When the gesture reaches the
-                // start/end of the video, absorb any extra drag into an offset.
-                // This prevents "overscroll debt": moving 1 second back from
-                // the edge should require the same small reverse movement as it
-                // does anywhere else in the video.
+                // Quantize to 1 second steps, same as before. Unlike before, the step is applied
+                // on top of the gesture's exact starting position instead of a whole-second
+                // rounding of it: starting at 1.234 and stepping +1 lands on 2.234, not 2.000.
+                // The seek still only ever moves in fixed 1-second increments, it just no longer
+                // throws away the sub-second fraction it started from.
                 //
-                // The step size stays a whole second either way; what changed is that the
-                // starting position is no longer rounded first. minDeltaSec/maxDeltaSec still
-                // work in whole seconds (the smallest/largest whole-second step that keeps the
-                // fractional target within [0, duration]), but the target itself
-                // (initialSeek + deltaSec) keeps initialSeek's original fractional part instead
-                // of snapping to the nearest whole second.
+                // When the gesture reaches the start/end of the video, absorb any extra drag into
+                // an offset. This prevents "overscroll debt": moving 1 second back from the edge
+                // should require the same small reverse movement as it does anywhere else in the
+                // video. Once a step would carry the target at or past either edge, the target
+                // snaps exactly to that edge (0.000 or the full duration) instead of leaving a
+                // sub-second remainder sitting just inside it.
+                val basePos = initialSeek.toDouble()
+                val fullDuration = duration.toDouble()
                 val rawDeltaSec = quantizeGestureSeekDelta(diff)
-                val minDeltaSec = -floor(initialSeek).toInt()
-                val maxDeltaSec = floor(duration - initialSeek).toInt()
+                val minDeltaSec = floor(-basePos).toInt()
+                val maxDeltaSec = ceil(fullDuration - basePos).toInt()
                 var deltaSec = rawDeltaSec - gestureSeekDeltaOffsetSec
 
                 if (deltaSec > maxDeltaSec) {
@@ -4464,8 +4468,7 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
                     deltaSec = minDeltaSec
                 }
 
-                val newPos = (initialSeek.toDouble() + deltaSec)
-                    .coerceIn(0.0, duration.toDouble())
+                val newPos = (basePos + deltaSec).coerceIn(0.0, fullDuration)
                 val newDiff = deltaSec
 
                 // Stability is defined by the seek value itself, not by whether touch events keep
@@ -4481,7 +4484,9 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
                     scheduleGestureStableTargetSeek()
                 }
 
-                val posText = Utils.prettyTime(newPos.toInt())
+                // The displayed labels stay whole-second, same as before; only the seek target
+                // sent to mpv keeps the sub-second fraction.
+                val posText = Utils.prettyTime(newPos.roundToInt())
                 val diffText = Utils.prettyTime(newDiff, true)
                 gestureTextView.text = getString(R.string.ui_seek_distance, posText, diffText)
             }
