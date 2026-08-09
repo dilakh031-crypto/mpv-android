@@ -57,6 +57,7 @@ import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.TimeoutException
 import kotlin.math.abs
+import kotlin.math.floor
 import kotlin.math.roundToInt
 
 typealias ActivityResultCallback = (Int, Intent?) -> Unit
@@ -146,8 +147,10 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
     private val scrubHardTimeoutRunnable = Runnable { finishScrubSeekAfterHardTimeout() }
 
     private var gestureScrubActive = false
-    private var pendingGestureSeekSec: Int? = null
-    private var lastIssuedGestureSeekSec: Int? = null
+    // Kept as a fractional second (not rounded) so the exact seek target preserves whatever
+    // sub-second offset the playback position had when the gesture started.
+    private var pendingGestureSeekSec: Double? = null
+    private var lastIssuedGestureSeekSec: Double? = null
 
     private var seekbarScrubActive = false
     private var initialSeekbarPosSec = 0
@@ -4035,10 +4038,10 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
         return lastIssuedSeekbarSeekPos?.let { sameSeekTarget(it, targetSec) } == true
     }
 
-    private fun gestureTargetAlreadyResolved(targetSec: Int, exact: Boolean): Boolean {
+    private fun gestureTargetAlreadyResolved(targetSec: Double, exact: Boolean): Boolean {
         if (activeScrubSeek != null)
-            return hasAuthoritativeScrubSeek(targetSec.toDouble(), exact)
-        return lastIssuedGestureSeekSec == targetSec
+            return hasAuthoritativeScrubSeek(targetSec, exact)
+        return lastIssuedGestureSeekSec?.let { sameSeekTarget(it, targetSec) } == true
     }
 
     private fun clearLastIssuedTarget(request: ScrubSeekRequest) {
@@ -4047,7 +4050,7 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
             lastIssuedSeekbarSeekPos = null
 
         val gestureTarget = lastIssuedGestureSeekSec
-        if (gestureTarget != null && sameSeekTarget(gestureTarget.toDouble(), request.targetSec))
+        if (gestureTarget != null && sameSeekTarget(gestureTarget, request.targetSec))
             lastIssuedGestureSeekSec = null
     }
 
@@ -4076,13 +4079,13 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
         return queueScrubSeek(targetSec, exact, targetSec, mode)
     }
 
-    private fun sendGestureScrubSeek(targetSec: Int): Boolean {
+    private fun sendGestureScrubSeek(targetSec: Double): Boolean {
         if (smoothSeekGesture)
-            return sendScrubSeek(targetSec.toDouble(), exact = true)
+            return sendScrubSeek(targetSec, exact = true)
 
-        val direction = targetSec.compareTo(initialSeek.roundToInt())
+        val direction = targetSec.compareTo(initialSeek.toDouble())
         if (direction == 0)
-            return sendScrubSeek(targetSec.toDouble(), exact = false)
+            return sendScrubSeek(targetSec, exact = false)
 
         // An absolute keyframe seek always rounds backwards. First align playback with the
         // keyframe that owns the gesture's starting position; after that request settles,
@@ -4090,7 +4093,7 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
         // clamping the second stage just past this anchor makes even +1/-1 select the adjacent
         // next/previous keyframe instead of resolving to the same GOP anchor.
         return queueScrubSeek(
-            targetSec = targetSec.toDouble(),
+            targetSec = targetSec,
             exact = false,
             commandValueSec = initialSeek.toDouble(),
             commandMode = "absolute+keyframes",
@@ -4441,11 +4444,16 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
                 // This prevents "overscroll debt": moving 1 second back from
                 // the edge should require the same small reverse movement as it
                 // does anywhere else in the video.
-                val startPos = initialSeek.roundToInt()
-                val durationSec = duration.roundToInt()
+                //
+                // The step size stays a whole second either way; what changed is that the
+                // starting position is no longer rounded first. minDeltaSec/maxDeltaSec still
+                // work in whole seconds (the smallest/largest whole-second step that keeps the
+                // fractional target within [0, duration]), but the target itself
+                // (initialSeek + deltaSec) keeps initialSeek's original fractional part instead
+                // of snapping to the nearest whole second.
                 val rawDeltaSec = quantizeGestureSeekDelta(diff)
-                val minDeltaSec = -startPos
-                val maxDeltaSec = durationSec - startPos
+                val minDeltaSec = -floor(initialSeek).toInt()
+                val maxDeltaSec = floor(duration - initialSeek).toInt()
                 var deltaSec = rawDeltaSec - gestureSeekDeltaOffsetSec
 
                 if (deltaSec > maxDeltaSec) {
@@ -4456,7 +4464,8 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
                     deltaSec = minDeltaSec
                 }
 
-                val newPos = startPos + deltaSec
+                val newPos = (initialSeek.toDouble() + deltaSec)
+                    .coerceIn(0.0, duration.toDouble())
                 val newDiff = deltaSec
 
                 // Stability is defined by the seek value itself, not by whether touch events keep
@@ -4464,15 +4473,15 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
                 // the seek; only an actual increase/decrease invalidates the current observation.
                 val previousTarget = pendingGestureSeekSec
                 pendingGestureSeekSec = newPos
-                if (previousTarget != newPos) {
+                if (previousTarget == null || !sameSeekTarget(previousTarget, newPos)) {
                     supersedeActiveScrubSeekIfTargetChanged(
-                        newPos.toDouble(),
+                        newPos,
                         exact = smoothSeekGesture
                     )
                     scheduleGestureStableTargetSeek()
                 }
 
-                val posText = Utils.prettyTime(newPos)
+                val posText = Utils.prettyTime(newPos.toInt())
                 val diffText = Utils.prettyTime(newDiff, true)
                 gestureTextView.text = getString(R.string.ui_seek_distance, posText, diffText)
             }
