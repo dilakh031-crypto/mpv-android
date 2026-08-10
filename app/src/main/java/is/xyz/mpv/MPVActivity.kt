@@ -1996,11 +1996,6 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
             .getBoolean("save_position", false)
     }
 
-    // During FILE_LOADED we briefly restore subtitle slots and then reconcile persistence.
-    // Keep that reconciliation from clobbering an external subtitle with mpv's transient
-    // embedded default while the file is still settling.
-    private var restoringSubtitleSelections = false
-
     private fun clearPerFileSelections(path: String) {
         val prefs = getDefaultSharedPreferences(applicationContext)
         with (prefs.edit()) {
@@ -2048,19 +2043,6 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
             ?: MPVLib.getPropertyString(sidProp)?.toIntOrNull()
             ?: -1
         val ext = findExternalSubFilenameForSid(sid)
-
-        // If we are reconciling right after FILE_LOADED, mpv can still report the embedded
-        // default as the active subtitle even though the saved external subtitle is being
-        // restored. In that window, preserve an already-known external subtitle instead of
-        // overwriting it with the transient embedded one.
-        if (selectedSid == null &&
-            restoringSubtitleSelections &&
-            sid >= 0 &&
-            ext == null &&
-            prefs.getString(perFileKey(kindKey, mediaPath), null) == PREF_SUB_KIND_EXTERNAL
-        ) {
-            return
-        }
 
         with (prefs.edit()) {
             if (!ext.isNullOrEmpty()) {
@@ -3866,13 +3848,8 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
                 // Track IDs and the external track list are authoritative only after FILE_LOADED.
                 // Restore both subtitle slots now so a previous file or mpv's automatic selection
                 // cannot swap primary and secondary while the new file is still being initialized.
-                restoringSubtitleSelections = true
-                try {
-                    try { restoreSubtitleSelectionForCurrentFile() } catch (_: Throwable) {}
-                    try { rememberActiveTrackSelectionsForCurrentFile() } catch (_: Throwable) {}
-                } finally {
-                    restoringSubtitleSelections = false
-                }
+                try { restoreSubtitleSelectionForCurrentFile() } catch (_: Throwable) {}
+                try { rememberActiveTrackSelectionsForCurrentFile() } catch (_: Throwable) {}
             } else {
                 // resume-playback was disabled before loading, so this removes any old state
                 // without first applying it to the current session.

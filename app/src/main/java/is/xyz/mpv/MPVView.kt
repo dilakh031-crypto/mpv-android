@@ -157,9 +157,24 @@ internal class MPVView(context: Context, attrs: AttributeSet) : BaseMPVView(cont
 
             // Saving is all-or-nothing for this app: position and every app-controlled per-file
             // option are stored together while the preference is enabled.
+            //
+            // aid/sid/secondary-sid are deliberately excluded here (unlike the full
+            // PER_FILE_PLAYBACK_OPTIONS list used for reset-on-next-file above). Those three are
+            // restored by MPVActivity instead, because external tracks need their filename
+            // resolved, not just a raw numeric id. If mpv's own watch-later mechanism also
+            // restores them natively, it does so earlier and blind to filenames: at that point
+            // an external track from a previous session doesn't exist yet, so mpv falls back to
+            // selecting the track list's default (typically an embedded track) and commits to it.
+            // MPVActivity's own restore then re-adds the external file and sets sid/secondary-sid
+            // to the same numeric id mpv's option already silently holds from that native
+            // restore, so mpv sees no value change and never re-applies the selection - leaving
+            // the embedded default active even though the external track is still listed. Letting
+            // MPVActivity own this exclusively (as it already does for SharedPreferences-based
+            // persistence via APP_PERSISTED_PLAYBACK_OPTIONS) avoids the conflict entirely.
             mergeStringListProperty(
                 "watch-later-options",
-                PER_FILE_PLAYBACK_OPTIONS + "start"
+                APP_PERSISTED_PLAYBACK_OPTIONS + "start",
+                remove = setOf("aid", "sid", "secondary-sid")
             )
         } else {
             if (!watchLaterOptionsSuppressed) {
