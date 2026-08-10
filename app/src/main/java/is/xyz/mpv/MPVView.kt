@@ -155,12 +155,26 @@ internal class MPVView(context: Context, attrs: AttributeSet) : BaseMPVView(cont
                 watchLaterOptionsSuppressed = false
             }
 
-            // Keep mpv's native watch-later file limited to the resume position.
-            // Per-file playback state (including subtitle/audio track choices) is managed
-            // separately by MPVActivity and restored after FILE_LOADED.
-            MPVLib.setPropertyString(
+            // Saving is all-or-nothing for this app: position and every app-controlled per-file
+            // option are stored together while the preference is enabled.
+            //
+            // aid/sid/secondary-sid are deliberately excluded here (unlike the full
+            // PER_FILE_PLAYBACK_OPTIONS list used for reset-on-next-file above). Those three are
+            // restored by MPVActivity instead, because external tracks need their filename
+            // resolved, not just a raw numeric id. If mpv's own watch-later mechanism also
+            // restores them natively, it does so earlier and blind to filenames: at that point
+            // an external track from a previous session doesn't exist yet, so mpv falls back to
+            // selecting the track list's default (typically an embedded track) and commits to it.
+            // MPVActivity's own restore then re-adds the external file and sets sid/secondary-sid
+            // to the same numeric id mpv's option already silently holds from that native
+            // restore, so mpv sees no value change and never re-applies the selection - leaving
+            // the embedded default active even though the external track is still listed. Letting
+            // MPVActivity own this exclusively (as it already does for SharedPreferences-based
+            // persistence via APP_PERSISTED_PLAYBACK_OPTIONS) avoids the conflict entirely.
+            mergeStringListProperty(
                 "watch-later-options",
-                sanitizeWatchLaterOptions(MPVLib.getPropertyString("watch-later-options"))
+                APP_PERSISTED_PLAYBACK_OPTIONS + "start",
+                remove = setOf("aid", "sid", "secondary-sid")
             )
         } else {
             if (!watchLaterOptionsSuppressed) {
@@ -195,25 +209,6 @@ internal class MPVView(context: Context, attrs: AttributeSet) : BaseMPVView(cont
             }
         }
         MPVLib.setPropertyString(property, current.joinToString(","))
-    }
-
-    private fun sanitizeWatchLaterOptions(raw: String?): String {
-        val disallowed = setOf("aid", "sid", "secondary-sid")
-        val current = raw
-            ?.split(',')
-            ?.map { it.trim() }
-            ?.filter { it.isNotEmpty() }
-            ?.toMutableList()
-            ?: mutableListOf()
-
-        if (current.contains("all")) {
-            return (PER_FILE_PLAYBACK_OPTIONS - disallowed + "start").joinToString(",")
-        }
-
-        current.removeAll(disallowed)
-        if (!current.contains("start"))
-            current.add("start")
-        return current.joinToString(",")
     }
 
     /**
