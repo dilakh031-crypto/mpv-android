@@ -2074,6 +2074,40 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
         }
     }
 
+    /**
+     * Apply the persisted subtitle choice at START_FILE, before mpv can auto-select an
+     * embedded subtitle. External subtitles are added with the `select` flag so mpv owns
+     * their selection as soon as the track becomes available; no polling or sleep is used.
+     */
+    private fun preparePersistedSubtitleSelectionForStartFile() {
+        if (!fileStatePersistenceEnabled())
+            return
+        val mediaPath = MPVLib.getPropertyString("path") ?: return
+        val prefs = getDefaultSharedPreferences(applicationContext)
+        val kind = prefs.getString(perFileKey(PREF_SUB_KIND, mediaPath), null)
+        val ext = prefs.getString(perFileKey(PREF_SUB_EXTERNAL, mediaPath), null)
+        val hasSid = prefs.contains(perFileKey(PREF_SUB_SID, mediaPath))
+        val sid = if (hasSid) prefs.getInt(perFileKey(PREF_SUB_SID, mediaPath), -1) else null
+
+        when (kind) {
+            PREF_SUB_KIND_EXTERNAL -> {
+                // Stop the embedded/default subtitle from becoming visible while the external
+                // file is being attached. `sub-add ... select` will select the external track
+                // without any polling loop.
+                player.setFileLocalString("sid", "no")
+                if (!ext.isNullOrEmpty())
+                    MPVLib.command(arrayOf("sub-add", ext, "select"))
+            }
+            PREF_SUB_KIND_SID -> {
+                when (sid) {
+                    null -> player.setFileLocalString("sid", "no")
+                    -1 -> player.setFileLocalString("sid", "no")
+                    else -> player.setFileLocalInt("sid", sid)
+                }
+            }
+        }
+    }
+
     private fun restoreSubtitleSelectionForCurrentFile() {
         if (!fileStatePersistenceEnabled())
             return
@@ -2093,16 +2127,11 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
                     if (external.isNullOrEmpty()) {
                         null
                     } else {
-                        var id = findExternalSubSidForFilename(external)
-                        if (id == null) {
-                            // START_FILE already queued this persisted external subtitle before
-                            // mpv could auto-select an embedded track. In case the track was not
-                            // present yet, add it without blocking and let the normal event flow
-                            // resolve it on the next pass.
-                            MPVLib.command(arrayOf("sub-add", external, "auto"))
-                            id = findExternalSubSidForFilename(external)
-                        }
-                        id
+                        // START_FILE queues the external subtitle with `select` before mpv can
+                        // display an embedded/default subtitle. At FILE_LOADED we only reconcile
+                        // the already-created track; we never add it here, because doing so would
+                        // reintroduce the visible embedded -> external switch.
+                        findExternalSubSidForFilename(external)
                     }
                 }
                 PREF_SUB_KIND_SID -> sid
@@ -3887,6 +3916,8 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
             } catch (_: Throwable) {
                 // ignore
             }
+
+            try { preparePersistedSubtitleSelectionForStartFile() } catch (_: Throwable) {}
 
             val cmds = onloadCommands.toTypedArray()
             onloadCommands.clear()
