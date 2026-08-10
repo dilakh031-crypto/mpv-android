@@ -2081,14 +2081,6 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
         val prefs = getDefaultSharedPreferences(applicationContext)
 
         fun setSubProp(prop: String, id: Int) {
-            val current = MPVLib.getPropertyString(prop)?.toIntOrNull() ?: -1
-
-            // mpv can be sticky when switching directly from an embedded subtitle to an
-            // external one (or between two already-loaded subtitle tracks). Clearing first
-            // mirrors the manual "off -> choose track" path that reliably works in the UI.
-            if (id != -1 && current != -1 && current != id)
-                player.setFileLocalString(prop, "no")
-
             if (id == -1)
                 player.setFileLocalString(prop, "no")
             else
