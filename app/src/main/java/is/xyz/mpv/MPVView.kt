@@ -157,27 +157,9 @@ internal class MPVView(context: Context, attrs: AttributeSet) : BaseMPVView(cont
 
             // Saving is all-or-nothing for this app: position and every app-controlled per-file
             // option are stored together while the preference is enabled.
-            //
-            // `aid`/`sid`/`secondary-sid` are deliberately excluded (and actively stripped via
-            // `remove`, in case an older version of this app or the user's mpv.conf left them in
-            // the stored list). MPVActivity is the sole owner of track-selection persistence, see
-            // APP_PERSISTED_PLAYBACK_OPTIONS below, because restoring a track also has to know
-            // its external filename, not just its numeric id.
-            //
-            // Letting mpv's own watch-later mechanism additionally apply a raw `sid`/
-            // `secondary-sid` value is actively harmful, not just redundant: it happens as soon
-            // as the file starts loading, before MPVActivity gets a chance to re-add any external
-            // subtitle, so a saved id that pointed at an external track doesn't exist yet and
-            // can't be selected. mpv then falls back to an embedded track while still recording
-            // the unreachable id as the file-local `sid` value. When MPVActivity later re-adds the
-            // external subtitle and tries to select that very same id, it looks like a no-op
-            // change to mpv and is silently ignored - the embedded track stays selected, and even
-            // manually tapping the external track in the UI does nothing until the user switches
-            // subtitles off first (which is a real change) and reselects it (also a real change).
             mergeStringListProperty(
                 "watch-later-options",
-                APP_PERSISTED_PLAYBACK_OPTIONS + "start",
-                remove = setOf("aid", "sid", "secondary-sid")
+                PER_FILE_PLAYBACK_OPTIONS + "start"
             )
         } else {
             if (!watchLaterOptionsSuppressed) {
@@ -689,10 +671,7 @@ internal class MPVView(context: Context, attrs: AttributeSet) : BaseMPVView(cont
             "vid",
         )
 
-        // Audio/subtitle IDs are restored together with external filenames by MPVActivity, so
-        // they're deliberately left out here. Used both for the manual gamma/speed/etc. snapshot
-        // and to keep them out of mpv's own native watch-later-options (see
-        // configureFileStatePersistence).
+        // Audio/subtitle IDs are restored together with external filenames by MPVActivity.
         private val APP_PERSISTED_PLAYBACK_OPTIONS =
             PER_FILE_PLAYBACK_OPTIONS - setOf("aid", "sid", "secondary-sid")
 
