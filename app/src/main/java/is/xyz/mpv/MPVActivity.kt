@@ -2074,50 +2074,6 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
         }
     }
 
-    /**
-     * Prevent mpv from auto-selecting an embedded subtitle while a persisted subtitle choice
-     * is being restored. START_FILE happens before mpv selects the first embedded subtitle.
-     * For external selections we also queue the saved subtitle here, so it exists before the
-     * first frame is rendered; FILE_LOADED then resolves the final numeric ids deterministically.
-     */
-    private fun preparePersistedSubtitleSelectionAtFileStart() {
-        if (!fileStatePersistenceEnabled())
-            return
-
-        val mediaPath = MPVLib.getPropertyString("path") ?: return
-        val prefs = getDefaultSharedPreferences(applicationContext)
-
-        fun prepare(secondary: Boolean) {
-            val kindKey = if (secondary) PREF_SUB2_KIND else PREF_SUB_KIND
-            val extKey = if (secondary) PREF_SUB2_EXTERNAL else PREF_SUB_EXTERNAL
-            val prop = if (secondary) "secondary-sid" else "sid"
-            val kind = prefs.getString(perFileKey(kindKey, mediaPath), null)
-
-            // No persisted choice means normal mpv auto-selection should remain untouched.
-            if (kind == null)
-                return
-
-            // Always suppress mpv's automatic/default subtitle for this file first. This is
-            // what removes the one-frame flash of the first embedded subtitle.
-            player.setFileLocalString(prop, "no")
-
-            if (kind == PREF_SUB_KIND_EXTERNAL) {
-                val external = prefs.getString(perFileKey(extKey, mediaPath), null)
-                if (!external.isNullOrEmpty()) {
-                    try {
-                        // Add without selecting: both persisted slots are resolved together later.
-                        MPVLib.command(arrayOf("sub-add", external, "auto"))
-                    } catch (_: Throwable) {
-                        // FILE_LOADED will retry the external add if necessary.
-                    }
-                }
-            }
-        }
-
-        prepare(secondary = false)
-        prepare(secondary = true)
-    }
-
     private fun restoreSubtitleSelectionForCurrentFile() {
         if (!fileStatePersistenceEnabled())
             return
@@ -2139,10 +2095,12 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
                     } else {
                         var id = findExternalSubSidForFilename(external)
                         if (id == null) {
-                            // `auto` loads the track without making it primary. Resolve both
-                            // tracks first, then assign primary and secondary deterministically.
+                            // START_FILE already queued this persisted external subtitle before
+                            // mpv could auto-select an embedded track. In case the track was not
+                            // present yet, add it without blocking and let the normal event flow
+                            // resolve it on the next pass.
                             MPVLib.command(arrayOf("sub-add", external, "auto"))
-                            id = waitForExternalSubSid(external)
+                            id = findExternalSubSidForFilename(external)
                         }
                         id
                     }
@@ -2186,21 +2144,6 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
             return MPVLib.getPropertyInt("track-list/$i/id")
         }
         return null
-    }
-
-    private fun waitForExternalSubSid(filename: String, timeoutMs: Long = 350L): Int? {
-        val deadline = SystemClock.uptimeMillis() + timeoutMs
-        while (SystemClock.uptimeMillis() < deadline) {
-            val sid = findExternalSubSidForFilename(filename)
-            if (sid != null) return sid
-            try {
-                Thread.sleep(10)
-            } catch (_: InterruptedException) {
-                break
-            }
-        }
-        // One last attempt.
-        return findExternalSubSidForFilename(filename)
     }
 
     private fun findExternalSubFilenameForSid(sid: Int): String? {
@@ -3943,12 +3886,6 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
                 MPVLib.setPropertyDouble("video-pan-y", 0.0)
             } catch (_: Throwable) {
                 // ignore
-            }
-
-            try {
-                preparePersistedSubtitleSelectionAtFileStart()
-            } catch (_: Throwable) {
-                // Subtitle restoration is best-effort; normal mpv track selection must continue.
             }
 
             val cmds = onloadCommands.toTypedArray()
