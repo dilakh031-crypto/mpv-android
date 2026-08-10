@@ -526,7 +526,7 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
 
         player.addObserver(this)
         player.initialize(filesDir.path, cacheDir.path)
-        player.playFile(filepath, buildInitialSubtitleLoadOptions(filepath))
+        player.playFile(filepath)
 
         mediaSession = initMediaSession()
         updateMediaSession()
@@ -707,18 +707,10 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
 
         if (!activityIsForeground && didResumeBackgroundPlayback) {
             if (this.newIntentReplace) {
-                val opts = buildInitialSubtitleLoadOptions(filepath)
-                if (opts != null)
-                    MPVLib.command(arrayOf("loadfile", filepath, "replace", opts))
-                else
-                    MPVLib.command(arrayOf("loadfile", filepath, "replace"))
+                MPVLib.command(arrayOf("loadfile", filepath, "replace"))
                 showToast(getString(R.string.notice_file_play))
             } else {
-                val opts = buildInitialSubtitleLoadOptions(filepath)
-                if (opts != null)
-                    MPVLib.command(arrayOf("loadfile", filepath, "append", opts))
-                else
-                    MPVLib.command(arrayOf("loadfile", filepath, "append"))
+                MPVLib.command(arrayOf("loadfile", filepath, "append"))
                 showToast(getString(R.string.notice_file_appended))
             }
             moveTaskToBack(true)
@@ -726,11 +718,7 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
             // Keep the current file visible while local metadata is probed. The orientation
             // request and loadfile command are then issued in the same UI-thread turn.
             runWithMediaOrientation(filepath) {
-                val opts = buildInitialSubtitleLoadOptions(filepath)
-                if (opts != null)
-                    MPVLib.command(arrayOf("loadfile", filepath, "replace", opts))
-                else
-                    MPVLib.command(arrayOf("loadfile", filepath))
+                MPVLib.command(arrayOf("loadfile", filepath))
             }
         }
     }
@@ -2087,75 +2075,47 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
     }
 
     /**
-     * Build extra per-file mpv options (for the `loadfile` command) that stop mpv from ever
-     * showing its own default subtitle track when a subtitle choice was already saved for this
-     * file.
-     *
-     * Without this, mpv resolves "sid=auto" (usually the first/embedded track marked
-     * [default]) as soon as the file is opened and starts rendering it immediately. Our own
-     * restoration only runs afterwards, from MPV_EVENT_FILE_LOADED: for a saved external
-     * subtitle that still needs to be (re)matched against the newly opened file, this can take
-     * a moment (directory scan for auto-loadable subtitles, `sub-add` + waiting for the new
-     * track to appear). In that window the wrong subtitle - or, when the saved choice is "off",
-     * a subtitle that should not be showing at all - is visibly rendered before we switch it.
-     *
-     * Passing the saved track id (or "no") as a `loadfile` option, and pre-loading any saved
-     * external subtitle file the same way via `sub-file`, means mpv resolves the correct state
-     * while it opens the file - before a single frame is decoded - so no such flash can occur.
-     * [restoreSubtitleSelectionForCurrentFile] still runs as before and remains the source of
-     * truth once the file is loaded; this only removes the visible transition leading up to it.
+     * Prevent mpv from auto-selecting an embedded subtitle while a persisted subtitle choice
+     * is being restored. START_FILE happens before mpv selects the first embedded subtitle.
+     * For external selections we also queue the saved subtitle here, so it exists before the
+     * first frame is rendered; FILE_LOADED then resolves the final numeric ids deterministically.
      */
-    private fun buildInitialSubtitleLoadOptions(mediaPath: String): String? {
+    private fun preparePersistedSubtitleSelectionAtFileStart() {
         if (!fileStatePersistenceEnabled())
-            return null
+            return
+
+        val mediaPath = MPVLib.getPropertyString("path") ?: return
         val prefs = getDefaultSharedPreferences(applicationContext)
 
-        val kind1 = prefs.getString(perFileKey(PREF_SUB_KIND, mediaPath), null)
-        val ext1 = prefs.getString(perFileKey(PREF_SUB_EXTERNAL, mediaPath), null)
-        val sid1 = if (prefs.contains(perFileKey(PREF_SUB_SID, mediaPath)))
-            prefs.getInt(perFileKey(PREF_SUB_SID, mediaPath), -1)
-        else null
+        fun prepare(secondary: Boolean) {
+            val kindKey = if (secondary) PREF_SUB2_KIND else PREF_SUB_KIND
+            val extKey = if (secondary) PREF_SUB2_EXTERNAL else PREF_SUB_EXTERNAL
+            val prop = if (secondary) "secondary-sid" else "sid"
+            val kind = prefs.getString(perFileKey(kindKey, mediaPath), null)
 
-        val kind2 = prefs.getString(perFileKey(PREF_SUB2_KIND, mediaPath), null)
-        val ext2 = prefs.getString(perFileKey(PREF_SUB2_EXTERNAL, mediaPath), null)
-        val sid2 = if (prefs.contains(perFileKey(PREF_SUB2_SID, mediaPath)))
-            prefs.getInt(perFileKey(PREF_SUB2_SID, mediaPath), -1)
-        else null
+            // No persisted choice means normal mpv auto-selection should remain untouched.
+            if (kind == null)
+                return
 
-        // Nothing was ever chosen for this file: let mpv pick its usual default, there is no
-        // saved state to race against.
-        if (kind1 == null && kind2 == null)
-            return null
+            // Always suppress mpv's automatic/default subtitle for this file first. This is
+            // what removes the one-frame flash of the first embedded subtitle.
+            player.setFileLocalString(prop, "no")
 
-        val options = LinkedHashMap<String, String>()
-        val subFiles = LinkedHashSet<String>()
-
-        fun stage(prop: String, kind: String?, ext: String?, sid: Int?) {
-            when (kind) {
-                PREF_SUB_KIND_SID ->
-                    options[prop] = if (sid == null || sid == -1) "no" else sid.toString()
-                PREF_SUB_KIND_EXTERNAL -> if (!ext.isNullOrEmpty()) {
-                    // Left off until the file is loaded and the real track id is known; kept
-                    // that way instead of guessing so nothing else shows in its place meanwhile.
-                    options[prop] = "no"
-                    subFiles.add(ext)
+            if (kind == PREF_SUB_KIND_EXTERNAL) {
+                val external = prefs.getString(perFileKey(extKey, mediaPath), null)
+                if (!external.isNullOrEmpty()) {
+                    try {
+                        // Add without selecting: both persisted slots are resolved together later.
+                        MPVLib.command(arrayOf("sub-add", external, "auto"))
+                    } catch (_: Throwable) {
+                        // FILE_LOADED will retry the external add if necessary.
+                    }
                 }
             }
         }
 
-        stage("sid", kind1, ext1, sid1)
-        stage("secondary-sid", kind2, ext2, sid2)
-
-        if (subFiles.isNotEmpty()) {
-            // Loaded synchronously together with the main file, so the track already exists by
-            // MPV_EVENT_FILE_LOADED instead of appearing later via an async directory scan or a
-            // separate sub-add command.
-            options["sub-file"] = subFiles.joinToString(":")
-        }
-
-        if (options.isEmpty())
-            return null
-        return options.entries.joinToString(",") { (k, v) -> "$k=$v" }
+        prepare(secondary = false)
+        prepare(secondary = true)
     }
 
     private fun restoreSubtitleSelectionForCurrentFile() {
@@ -3983,6 +3943,12 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
                 MPVLib.setPropertyDouble("video-pan-y", 0.0)
             } catch (_: Throwable) {
                 // ignore
+            }
+
+            try {
+                preparePersistedSubtitleSelectionAtFileStart()
+            } catch (_: Throwable) {
+                // Subtitle restoration is best-effort; normal mpv track selection must continue.
             }
 
             val cmds = onloadCommands.toTypedArray()
