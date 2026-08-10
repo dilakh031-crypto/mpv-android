@@ -155,23 +155,12 @@ internal class MPVView(context: Context, attrs: AttributeSet) : BaseMPVView(cont
                 watchLaterOptionsSuppressed = false
             }
 
-            // Saving is all-or-nothing for this app: position and every app-controlled per-file
-            // option are stored together while the preference is enabled.
-            //
-            // aid/sid/secondary-sid are deliberately excluded (and actively stripped below).
-            // Those three are fully owned by MPVActivity's own per-file selection system, which
-            // restores external audio/subtitle tracks by filename (see
-            // restoreAudioSelectionForCurrentFile/restoreSubtitleSelectionForCurrentFile). mpv's
-            // native watch-later resume applies its stored ids very early - before that
-            // by-filename restoration has re-added the external track - so a leftover numeric id
-            // from a previous session (or mpv's own default watch-later-options list) can win the
-            // race and pin playback on an embedded track, even though the correct external track
-            // was re-added moments later. Keeping mpv's native resume out of track selection
-            // entirely removes that conflict instead of papering over it.
-            mergeStringListProperty(
+            // Keep mpv's native watch-later file limited to the resume position.
+            // Per-file playback state (including subtitle/audio track choices) is managed
+            // separately by MPVActivity and restored after FILE_LOADED.
+            MPVLib.setPropertyString(
                 "watch-later-options",
-                APP_PERSISTED_PLAYBACK_OPTIONS + "start",
-                remove = setOf("aid", "sid", "secondary-sid")
+                sanitizeWatchLaterOptions(MPVLib.getPropertyString("watch-later-options"))
             )
         } else {
             if (!watchLaterOptionsSuppressed) {
@@ -206,6 +195,25 @@ internal class MPVView(context: Context, attrs: AttributeSet) : BaseMPVView(cont
             }
         }
         MPVLib.setPropertyString(property, current.joinToString(","))
+    }
+
+    private fun sanitizeWatchLaterOptions(raw: String?): String {
+        val disallowed = setOf("aid", "sid", "secondary-sid")
+        val current = raw
+            ?.split(',')
+            ?.map { it.trim() }
+            ?.filter { it.isNotEmpty() }
+            ?.toMutableList()
+            ?: mutableListOf()
+
+        if (current.contains("all")) {
+            return (PER_FILE_PLAYBACK_OPTIONS - disallowed + "start").joinToString(",")
+        }
+
+        current.removeAll(disallowed)
+        if (!current.contains("start"))
+            current.add("start")
+        return current.joinToString(",")
     }
 
     /**
