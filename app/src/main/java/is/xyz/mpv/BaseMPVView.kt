@@ -68,17 +68,31 @@ abstract class BaseMPVView(context: Context, attrs: AttributeSet) : TextureView(
     protected abstract fun observeProperties()
 
     private var filePath: String? = null
+    private var filePathOptions: String? = null
 
     /**
      * Set the first file to be played once the player is ready.
+     *
+     * @param options optional comma-separated `key=value` per-file mpv options, applied the
+     *   same way as the `loadfile` command's own `options` argument (see its use in MPVActivity
+     *   for why this matters for restoring a previously chosen subtitle track).
      */
-    fun playFile(filePath: String) {
+    fun playFile(filePath: String, options: String? = null) {
         if (attachedSurface != null) {
-            MPVLib.command(arrayOf("loadfile", filePath))
+            issueLoadfile(filePath, options)
             this.filePath = null
+            this.filePathOptions = null
         } else {
             this.filePath = filePath
+            this.filePathOptions = options
         }
+    }
+
+    private fun issueLoadfile(filePath: String, options: String?) {
+        if (options != null)
+            MPVLib.command(arrayOf("loadfile", filePath, "replace", options))
+        else
+            MPVLib.command(arrayOf("loadfile", filePath))
     }
 
     private var voInUse: String = "gpu"
@@ -170,8 +184,9 @@ abstract class BaseMPVView(context: Context, attrs: AttributeSet) : TextureView(
         MPVLib.setOptionString("force-window", "yes")
 
         if (filePath != null) {
-            MPVLib.command(arrayOf("loadfile", filePath as String))
+            issueLoadfile(filePath as String, filePathOptions)
             filePath = null
+            filePathOptions = null
         } else {
             // We disable video output when the context disappears, enable it back
             MPVLib.setPropertyString("vo", voInUse)
