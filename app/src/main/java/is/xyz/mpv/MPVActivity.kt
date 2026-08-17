@@ -18,8 +18,10 @@ import android.content.pm.PackageManager
 import android.content.res.ColorStateList
 import android.content.res.Configuration
 import android.graphics.drawable.Icon
+import android.graphics.Color
 import android.util.Log
 import android.media.AudioManager
+import android.media.MediaMetadataRetriever
 import android.net.Uri
 import android.os.*
 import android.preference.PreferenceManager.getDefaultSharedPreferences
@@ -52,13 +54,7 @@ import androidx.media.AudioFocusRequestCompat
 import androidx.media.AudioManagerCompat
 import java.io.File
 import java.lang.IllegalArgumentException
-import java.util.LinkedHashMap
-import java.util.concurrent.Executors
-import java.util.concurrent.TimeUnit
-import java.util.concurrent.TimeoutException
 import kotlin.math.abs
-import kotlin.math.ceil
-import kotlin.math.floor
 import kotlin.math.roundToInt
 
 typealias ActivityResultCallback = (Int, Intent?) -> Unit
@@ -71,7 +67,6 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
     private val fadeHandler = Handler(Looper.getMainLooper())
     // for use with stopServiceRunnable
     private val stopServiceHandler = Handler(Looper.getMainLooper())
-    private val orientationHandler = Handler(Looper.getMainLooper())
     // Delayed single-tap toggling (we wait a bit so a faster double-tap can be recognized
     // without flashing the control UI).
     private val tapToggleHandler = Handler(Looper.getMainLooper())
@@ -106,63 +101,26 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
 
 
     // Scrub seeking (freeze frame while moving; seek only on idle/release).
-    // Exact seeks are expensive on long-GOP video, so this controller deliberately keeps only
-    // the newest target authoritative. Older native seeks may finish, but their callbacks can no
-    // longer resume playback or complete a newer request.
+    // This keeps exact seeking while avoiding the massive slowdown caused by spamming seeks.
     private val scrubSeekHandler = Handler(Looper.getMainLooper())
-
-    private class ScrubSeekRequest(
-        val userdata: Long,
-        val generation: Long,
-        val targetSec: Double,
-        val exact: Boolean,
-        val commandValueSec: Double,
-        val directionalKeyframeDirection: Int,
-        val issuedAtMs: Long,
-        val frameFloor: Long
-    ) {
-        var superseded = false
-        var commandReplyReceived = false
-        var commandError = 0
-        var seekEventSeen = false
-        var playbackRestartSeen = false
-        var targetPositionSeen = !exact
-        var targetPositionNear = !exact
-        var frameSeen = false
-        var frameGraceScheduled = false
-    }
-
     private var scrubSeekInFlight = false
-    private var activeScrubSeek: ScrubSeekRequest? = null
-    private var scrubSeekGeneration = 0L
-    private var scrubAsyncCounter = 1L
-    private var mpvSeeking = false
-    private var latestPlaybackTimeSec = Double.NaN
-
     // The playback state requested by the user while scrub seeking temporarily pauses mpv.
     // Keeping it separate from mpv's real "pause" property makes play/pause controls symmetric:
     // the user can change their mind while a slow exact seek is still completing.
     private var scrubPlaybackPaused: Boolean? = null
-
-    private val scrubFrameGraceRunnable = Runnable { finishScrubSeekAfterFrameGrace() }
-    private val scrubHardTimeoutRunnable = Runnable { finishScrubSeekAfterHardTimeout() }
+    private var scrubAsyncCounter = 1L
+    private var lastScrubAsyncUserdata = 0L
 
     private var gestureScrubActive = false
-    // These retain the sub-second fraction of the drag target (e.g. 2.234, not just 2) so an
-    // exact scrub seek lands precisely instead of snapping to the nearest whole second.
-    private var pendingGestureSeekSec: Double? = null
-    private var lastIssuedGestureSeekSec: Double? = null
+    private var pendingGestureSeekSec: Int? = null
+    private var lastIssuedGestureSeekSec: Int? = null
 
     private var seekbarScrubActive = false
-    private var initialSeekbarPosSec = 0
     private var pendingSeekbarSeekPos: Double? = null
     private var lastIssuedSeekbarSeekPos: Double? = null
 
-    // A target is considered stationary only after its numeric seek value has remained
-    // unchanged for a short interval. Repeated touch samples at the same value do not restart
-    // the interval; only a real increase/decrease replaces the pending target.
-    private var gestureStableSeekRunnable: Runnable? = null
-    private var seekbarStableSeekRunnable: Runnable? = null
+    private val gestureIdleSeekRunnable = Runnable { performGestureIdleSeek() }
+    private val seekbarIdleSeekRunnable = Runnable { performSeekbarIdleSeek() }
 
     private var toast: Toast? = null
     private val toastHandler = Handler(Looper.getMainLooper())
@@ -172,30 +130,51 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
     private var audioFocusRequest: AudioFocusRequestCompat? = null
     private var audioFocusRestore: () -> Unit = {}
 
-    // Orientation is resolved before the player window is attached. The probe runs off the UI
-    // thread, while android:windowDisablePreview keeps the calling screen visible instead of
-    // showing a temporary black starting window.
-    private val mediaOrientationExecutor = Executors.newFixedThreadPool(2)
-    private var mediaSwitchProbeGeneration = 0
+    
+    // Orientation smoothing / fast rotation
     private var entryConfigOrientation: Int = Configuration.ORIENTATION_UNDEFINED
-    private var finishTransitionStarted = false
-    private var orientationOwnedByPlayer = false
-    private var mediaGeometryReadyForOrientation = false
-    private val orientationProbesInFlight = mutableSetOf<String>()
-    private val orientationProbeCache = object : LinkedHashMap<String, MediaOrientationResolver.Orientation>(
-        ORIENTATION_CACHE_SIZE,
-        0.75f,
-        true,
-    ) {
-        override fun removeEldestEntry(
-            eldest: MutableMap.MutableEntry<String, MediaOrientationResolver.Orientation>?,
-        ): Boolean = size > ORIENTATION_CACHE_SIZE
+    private var finishPending: Boolean = false
+    private var pendingFinishAfterRotate: Boolean = false
+    private var exitRequestedOrientation: Int = ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
+    private var lastOrientationProbePath: String? = null
+
+    // When auto-rotation is enabled, mpv can briefly report an unknown/square aspect ratio
+    // (especially during startup / demuxer init). If we immediately react to that by setting
+    // SCREEN_ORIENTATION_UNSPECIFIED, Android may rotate back to portrait and "stick" there.
+    //
+    // We therefore keep a short "stability lock" where we *refuse* to change orientation
+    // away from a known desired orientation until we have a reliable aspect ratio.
+    private var orientationStabilityLockUntilMs: Long = 0L
+    private var orientationStabilityLockValue: Int = ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
+
+    private fun lockOrientationStability(desired: Int, durationMs: Long = 1600L) {
+        if (autoRotationMode != "auto")
+            return
+        if (desired != ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE &&
+            desired != ActivityInfo.SCREEN_ORIENTATION_SENSOR_PORTRAIT
+        ) return
+
+        orientationStabilityLockValue = desired
+        orientationStabilityLockUntilMs = SystemClock.uptimeMillis() + durationMs
     }
+
+    private fun isWithinOrientationStabilityLock(): Boolean {
+        return SystemClock.uptimeMillis() < orientationStabilityLockUntilMs
+    }
+
+    // Startup orientation pre-probe / deferred player init
+    private var startupFilePath: String? = null
+    private var startupDesiredConfigOrientation: Int = Configuration.ORIENTATION_UNDEFINED
+    private var deferPlayerInit: Boolean = false
     private var uiInitialized: Boolean = false
 
-    @Volatile
-    private var playerSurfaceFrameSerial = 0L
-
+    // One owner for hiding the mpv texture while a new file/reconfig is waiting
+    // for reliable video geometry. Aspect changes from the in-app menu bypass this
+    // blackout and use predictive geometry instead.
+    private var videoGeometryBlackoutActive = true
+    private var videoGeometryBlackoutGeneration = 0
+    private var videoGeometryBlackoutRevealArmed = false
+    private var videoGeometryBlackoutFileLoadedSeen = false
     private var suppressAspectMenuGeometrySyncUntilMs = 0L
 
     private val psc = Utils.PlaybackStateCache()
@@ -212,36 +191,32 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
         override fun onProgressChanged(seekBar: SeekBar, progress: Int, fromUser: Boolean) {
             if (!fromUser) return
 
-            // SeekBar progress is the authoritative whole-second target. The same value is
-            // displayed to the user and sent to mpv as an absolute exact seek.
-            val targetSec = progress.toDouble()
-            val previousTarget = pendingSeekbarSeekPos
-            val targetChanged = previousTarget == null || !sameSeekTarget(previousTarget, targetSec)
+            // Freeze the current frame while the user is dragging.
+            // We only perform an exact seek when the finger stops moving (idle) or on release.
+            // Quantize to whole seconds (reduces decode pressure and keeps UI stable).
+            val targetSec = (progress / SEEK_BAR_PRECISION).toDouble()
             pendingSeekbarSeekPos = targetSec
-            if (targetChanged) {
-                supersedeActiveScrubSeekIfTargetChanged(targetSec, exact = true)
-                scheduleSeekbarStableTargetSeek()
+            // Cancel any in-flight scrub seek so no new frame appears while moving.
+            if (lastScrubAsyncUserdata != 0L) {
+                abortLastScrubSeek()
             }
 
             val posText = Utils.prettyTime(targetSec.toInt())
-            val diffText = Utils.prettyTime(targetSec.toInt() - initialSeekbarPosSec, true)
             if (binding.gestureTextView.visibility != View.VISIBLE)
                 refreshPlayerOverlay()
             fadeHandler.removeCallbacks(fadeRunnable3)
             binding.gestureTextView.visibility = View.VISIBLE
-            binding.gestureTextView.text =
-                getString(R.string.ui_seek_distance, posText, diffText)
+            binding.gestureTextView.text = posText
 
-            // Repeated touch samples at the same numeric target do not reset stability. Only an
-            // actual increase or decrease starts a new stability interval.
+            // Re-schedule idle exact seek.
+            scrubSeekHandler.removeCallbacks(seekbarIdleSeekRunnable)
+            scrubSeekHandler.postDelayed(seekbarIdleSeekRunnable, SCRUB_IDLE_SEEK_DELAY_MS)
         }
 
         override fun onStartTrackingTouch(seekBar: SeekBar) {
             refreshPlayerOverlay()
             userIsOperatingSeekbar = true
             seekbarScrubActive = true
-            invalidateSeekbarStableTargetCheck()
-            initialSeekbarPosSec = seekBar.progress
             pendingSeekbarSeekPos = null
             lastIssuedSeekbarSeekPos = null
 
@@ -256,13 +231,13 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
             userIsOperatingSeekbar = false
             seekbarScrubActive = false
 
-            invalidateSeekbarStableTargetCheck()
+            scrubSeekHandler.removeCallbacks(seekbarIdleSeekRunnable)
 
             val target = pendingSeekbarSeekPos
 
-            if (target != null && !seekbarTargetAlreadyResolved(target)) {
-                if (sendScrubSeek(target, exact = true))
-                    lastIssuedSeekbarSeekPos = target
+            if (target != null && lastIssuedSeekbarSeekPos != target) {
+                lastIssuedSeekbarSeekPos = target
+                sendScrubSeek(target, exact = true)
             }
 
             finishScrubPlaybackHoldIfReady()
@@ -426,87 +401,132 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
 
     private var playbackHasStarted = false
     private var onloadCommands = mutableListOf<Array<String>>()
-    private var pendingSubtitleRestorePath: String? = null
-    private val externalSubtitleLoadsInFlight = mutableSetOf<String>()
 
     // Activity lifetime
 
-    override fun onCreate(icicle: Bundle?) {
-        super.onCreate(icicle)
+        override fun onCreate(icicle: Bundle?) {
+            super.onCreate(icicle)
 
-        // Capture the caller-facing orientation before this activity requests a media orientation.
-        // The value is used only during the close transition; it never controls playback itself.
-        entryConfigOrientation = icicle?.getInt(STATE_ENTRY_CONFIG_ORIENTATION)
-            ?.takeIf { it != Configuration.ORIENTATION_UNDEFINED }
-            ?: resources.configuration.orientation
+            // Remember the orientation we entered the player in, so we can restore it on exit.
+            entryConfigOrientation = resources.configuration.orientation
+            exitRequestedOrientation = when (entryConfigOrientation) {
+                Configuration.ORIENTATION_LANDSCAPE -> ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
+                Configuration.ORIENTATION_PORTRAIT -> ActivityInfo.SCREEN_ORIENTATION_SENSOR_PORTRAIT
+                else -> ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
+            }
 
-        if (intent.action == Intent.ACTION_VIEW)
-            parseIntentExtras(intent.extras)
+            // Prepare binding/gestures early so onConfigurationChanged is safe even if we change orientation immediately.
+            binding = PlayerBinding.inflate(layoutInflater)
+            gestures = TouchGestures(this)
+            zoomGestures = VideoZoomGestures(binding.player)
+            binding.player.onSurfaceTextureFrameAvailable = { onPlayerSurfaceFrameAvailable() }
 
-        val filepath = parsePathFromIntent(intent)
-        if (filepath == null) {
-            Log.e(TAG, "No file given, exiting")
-            showToast(getString(R.string.error_no_file))
-            finishWithResult(RESULT_CANCELED)
-            return
+            // Do these here and not in MainActivity because mpv can be launched from a file browser.
+            Utils.copyAssets(this)
+            BackgroundPlaybackService.createNotificationChannel(this)
+
+            // Parse intent early so we can force the correct orientation before mpv starts.
+            if (intent.action == Intent.ACTION_VIEW)
+                parseIntentExtras(intent.extras)
+            val filepath = parsePathFromIntent(intent)
+            if (filepath == null) {
+                Log.e(TAG, "No file given, exiting")
+                showToast(getString(R.string.error_no_file))
+                finishWithResult(RESULT_CANCELED)
+                return
+            }
+
+            // Read only the auto-rotation setting early (full settings are read later).
+            run {
+                val prefs = getDefaultSharedPreferences(applicationContext)
+                val defaultMode = resources.getString(R.string.pref_auto_rotation_default)
+                val mode = prefs.getString("auto_rotation", defaultMode) ?: defaultMode
+                if (autoRotationMode != "manual")
+                    autoRotationMode = mode
+            }
+
+            // If we're in auto mode, probe the file's orientation BEFORE starting mpv.
+            // This avoids showing the first video frame in portrait and then rotating to landscape.
+            if (autoRotationMode == "auto" &&
+                packageManager.hasSystemFeature(PackageManager.FEATURE_SCREEN_PORTRAIT)
+            ) {
+                val probed = probeOrientationFromMetadata(filepath)
+                val desired = when (probed) {
+                    ProbedOrientation.LANDSCAPE -> ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
+                    ProbedOrientation.PORTRAIT -> ActivityInfo.SCREEN_ORIENTATION_SENSOR_PORTRAIT
+                    ProbedOrientation.SQUARE -> ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
+                    ProbedOrientation.UNKNOWN -> null
+                }
+
+                if (desired != null) {
+                    // If we're already portrait and the app is not locked, don't force-lock portrait.
+                    val skipPortrait =
+                        desired == ActivityInfo.SCREEN_ORIENTATION_SENSOR_PORTRAIT &&
+                            resources.configuration.orientation == Configuration.ORIENTATION_PORTRAIT &&
+                            requestedOrientation == ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
+
+                    if (!skipPortrait) {
+                        lastOrientationProbePath = filepath
+                        if (requestedOrientation != desired)
+                            requestedOrientation = desired
+
+                        // Hold the chosen orientation briefly so we don't get a late flip back
+                        // to portrait if mpv reports an unknown/square aspect during startup.
+                        lockOrientationStability(desired, 2200L)
+
+                        startupDesiredConfigOrientation = when (desired) {
+                            ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE -> Configuration.ORIENTATION_LANDSCAPE
+                            ActivityInfo.SCREEN_ORIENTATION_SENSOR_PORTRAIT -> Configuration.ORIENTATION_PORTRAIT
+                            else -> Configuration.ORIENTATION_UNDEFINED
+                        }
+
+                        deferPlayerInit =
+                            startupDesiredConfigOrientation != Configuration.ORIENTATION_UNDEFINED &&
+                                resources.configuration.orientation != startupDesiredConfigOrientation
+                    }
+                }
+            }
+
+            if (deferPlayerInit) {
+                startupFilePath = filepath
+
+                // Avoid briefly showing the UI in the wrong orientation (portrait -> landscape flash).
+                // Show a simple black placeholder until Android applies the requested orientation.
+                window.decorView.setBackgroundColor(Color.BLACK)
+                setContentView(View(this).apply { setBackgroundColor(Color.BLACK) })
+                return
+            }
+
+            setupUiAndStart(filepath)
         }
 
-        // Complete non-visual startup work while the caller is still unchanged. The potentially
-        // expensive metadata read also happens before any orientation request, so there is no gap
-        // in which the old interface rotates while the player is still being prepared.
-        Utils.copyAssets(this)
-        BackgroundPlaybackService.createNotificationChannel(this)
-
-        binding = PlayerBinding.inflate(layoutInflater)
-        gestures = TouchGestures(this)
-        zoomGestures = VideoZoomGestures(binding.player)
-        binding.player.onSurfaceTextureFrameAvailable = {
-            playerSurfaceFrameSerial += 1L
-            onScrubSurfaceFrameAvailable(playerSurfaceFrameSerial)
-            zoomGestures.onSurfaceTextureFrameAvailable()
-        }
-
-        readAutoRotationModeForLaunch()
-        val launchOrientation = resolveLaunchRequestedOrientation(filepath)
-        setupUiAndStart(filepath, launchOrientation)
-    }
-
-    override fun onSaveInstanceState(outState: Bundle) {
-        outState.putInt(STATE_ENTRY_CONFIG_ORIENTATION, entryConfigOrientation)
-        super.onSaveInstanceState(outState)
-    }
-
-    private fun setupUiAndStart(filepath: String, launchOrientation: Int?) {
+    private fun setupUiAndStart(filepath: String) {
         if (uiInitialized)
             return
 
-        // This request and the attachment of the real player are consecutive operations in the
-        // same main-thread turn. Android 9 therefore receives one window transition rather than a
-        // visible pre-rotation followed by a separate player launch.
-        launchOrientation?.let(::requestOrientationIfNeeded)
         setContentView(binding.root)
         uiInitialized = true
         refreshPlayerOverlay()
 
-        // Init controls to be hidden and view fullscreen.
+        // Init controls to be hidden and view fullscreen
         hideControls()
 
-        // Initialize listeners for the player view.
+        // Initialize listeners for the player view
         initListeners()
         installGestureMetricsUpdater()
 
-        // Read full settings and update UI.
+        // Read full settings and update UI
         readSettings()
         onConfigurationChanged(resources.configuration)
 
-        // Edge-to-edge / immersive behavior.
+        // Edge-to-edge / immersive behavior
         WindowCompat.setDecorFitsSystemWindows(window, false)
         val insetsController = WindowCompat.getInsetsController(window, window.decorView)
         insetsController.systemBarsBehavior =
             WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
         installImeDismissImmersiveRestore(window, binding.root)
 
-        // Hide PiP / lock buttons on devices that don't support them.
+        // Hide PiP / lock buttons on devices that don't support them
         if (!packageManager.hasSystemFeature(PackageManager.FEATURE_PICTURE_IN_PICTURE))
             binding.topPiPBtn.visibility = View.GONE
         if (!packageManager.hasSystemFeature(PackageManager.FEATURE_TOUCHSCREEN))
@@ -516,8 +536,12 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
             binding.controlsTitleGroup.visibility = View.VISIBLE
 
         updateOrientation(true)
+
+        setVideoGeometryBlackout(true)
+
         startPlayback(filepath)
     }
+
 
     private var playbackInitialized: Boolean = false
 
@@ -528,7 +552,7 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
 
         player.addObserver(this)
         player.initialize(filesDir.path, cacheDir.path)
-        player.playFile(filepath, persistedSubtitleLoadOptions(filepath))
+        player.playFile(filepath)
 
         mediaSession = initMediaSession()
         updateMediaSession()
@@ -544,6 +568,79 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
         volumeControlStream = STREAM_TYPE
     }
 
+    private fun maybeStartDeferredPlayback() {
+        if (!deferPlayerInit)
+            return
+
+        val desired = startupDesiredConfigOrientation
+        if (desired == Configuration.ORIENTATION_UNDEFINED || resources.configuration.orientation == desired) {
+            // Clear the deferred state FIRST to avoid re-entrancy if we call onConfigurationChanged() manually.
+            val fp = startupFilePath
+            startupFilePath = null
+            deferPlayerInit = false
+
+            if (fp != null) {
+                if (!uiInitialized)
+                    setupUiAndStart(fp)
+                else
+                    startPlayback(fp)
+            }
+        }
+    }
+
+    private fun setVideoGeometryBlackout(visible: Boolean) {
+        if (visible) {
+            videoGeometryBlackoutGeneration += 1
+            videoGeometryBlackoutRevealArmed = false
+            videoGeometryBlackoutFileLoadedSeen = false
+        }
+        videoGeometryBlackoutActive = visible
+        if (!::binding.isInitialized || !uiInitialized)
+            return
+
+        binding.videoBlackoutOverlay.visibility = if (visible) View.VISIBLE else View.GONE
+    }
+
+    private fun beginVideoGeometryBlackout() {
+        setVideoGeometryBlackout(true)
+        if (::zoomGestures.isInitialized) {
+            try { zoomGestures.resetForNewFile() } catch (_: Throwable) {}
+        }
+    }
+
+    private fun armVideoGeometryBlackoutReveal() {
+        if (!videoGeometryBlackoutActive || videoGeometryBlackoutRevealArmed)
+            return
+        videoGeometryBlackoutRevealArmed = true
+    }
+
+    private fun onPlayerSurfaceFrameAvailable() {
+        if (Looper.myLooper() != Looper.getMainLooper()) {
+            eventUiHandler.post { onPlayerSurfaceFrameAvailable() }
+            return
+        }
+
+        if (!videoGeometryBlackoutActive || !videoGeometryBlackoutRevealArmed)
+            return
+        if (videoGeometryBlackoutActive && !videoGeometryBlackoutFileLoadedSeen)
+            return
+        if (!hasDisplayableVideoGeometry())
+            return
+
+        val generation = videoGeometryBlackoutGeneration
+        ViewCompat.postOnAnimation(binding.player) {
+            if (videoGeometryBlackoutActive &&
+                videoGeometryBlackoutRevealArmed &&
+                generation == videoGeometryBlackoutGeneration &&
+                videoGeometryBlackoutFileLoadedSeen &&
+                hasDisplayableVideoGeometry()
+            ) {
+                videoGeometryBlackoutRevealArmed = false
+                setVideoGeometryBlackout(false)
+            }
+        }
+    }
+
     private fun hasDisplayableVideoGeometry(): Boolean {
         val aspect = try { player.getEffectiveVideoAspect() ?: 0.0 } catch (_: Throwable) { 0.0 }
         val size = try { player.getVideoPixelSize() } catch (_: Throwable) { null }
@@ -551,7 +648,8 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
     }
 
     private fun isAspectMenuGeometrySyncSuppressed(): Boolean {
-        return SystemClock.uptimeMillis() < suppressAspectMenuGeometrySyncUntilMs
+        return !videoGeometryBlackoutActive &&
+            SystemClock.uptimeMillis() < suppressAspectMenuGeometrySyncUntilMs
     }
 
     private fun syncZoomVideoGeometry(
@@ -573,31 +671,25 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
                 prepareNormalSurface = prepareNormalSurface,
                 immediate = immediate,
             )
-        } catch (_: Throwable) {
-            // A transient mpv geometry read must not affect playback.
-        }
+        } catch (_: Throwable) {}
     }
 
-    private fun prepareZoomSurfaceWhenReady() {
-        if (!::zoomGestures.isInitialized || !hasDisplayableVideoGeometry())
-            return
-
-        syncZoomVideoGeometry(prepareNormalSurface = true, immediate = true)
-        try {
-            zoomGestures.prepareForVisibleMedia()
-        } catch (_: Throwable) {
-            // Zoom is optional; playback must continue.
-        }
-    }
-
-    private fun resetZoomForNewFile() {
+    private fun prepareZoomSurfaceAndRevealWhenReady() {
         if (!::zoomGestures.isInitialized)
             return
-        try {
-            zoomGestures.resetForNewFile()
-        } catch (_: Throwable) {
-            // Zoom is optional; playback must continue.
-        }
+
+        if (videoGeometryBlackoutActive && !videoGeometryBlackoutFileLoadedSeen)
+            return
+        if (!hasDisplayableVideoGeometry())
+            return
+
+        // Pull all geometry at once while the blackout is still covering mpv.
+        // The blackout is removed only after TextureView reports a real frame
+        // update with this geometry, which avoids revealing a stale fullscreen
+        // or old-aspect buffer on heavy images/videos.
+        syncZoomVideoGeometry(prepareNormalSurface = true, immediate = true)
+        try { zoomGestures.prepareForVisibleMedia() } catch (_: Throwable) {}
+        armVideoGeometryBlackoutReveal()
     }
 
     private fun prepareZoomSurfaceForWindowExit() {
@@ -607,61 +699,62 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
         try {
             zoomGestures.prepareForWindowExit()
         } catch (_: Throwable) {
-            // Finish must continue even if a vendor TextureView rejects a final transform update.
+            // ignore; finish must continue
         }
     }
 
     private fun finishWithResult(code: Int, includeTimePos: Boolean = false) {
-        // mpv may emit SHUTDOWN from its event thread. All window/orientation work must be queued
-        // onto Android's main thread so the close request is committed as one UI transaction.
-        if (Looper.myLooper() != Looper.getMainLooper()) {
-            orientationHandler.post { finishWithResult(code, includeTimePos) }
-            return
-        }
-
         // Refer to http://mpv-android.github.io/mpv-android/intent.html
         // FIXME: should track end-file events to accurately report OK vs CANCELED
-        if (isFinishing || finishTransitionStarted)
+        if (isFinishing || finishPending) // only count first call
             return
-        finishTransitionStarted = true
+        finishPending = true
 
         val result = Intent(RESULT_INTENT)
         result.data = if (intent.data?.scheme == "file") null else intent.data
-        if (includeTimePos && playbackInitialized) {
+        if (includeTimePos) {
             result.putExtra("position", psc.position.toInt())
             result.putExtra("duration", psc.duration.toInt())
         }
         setResult(code, result)
 
-        // Return a zoomed TextureView to its normal transform without hiding or resizing it.
+        // Avoid letting Android's activity/window transition animate a transformed
+        // TextureView. The player is about to close, so return it to the plain
+        // mpv surface before finish/rotation starts.
         prepareZoomSurfaceForWindowExit()
 
-        // SCREEN_ORIENTATION_BEHIND is Android's native way to adopt the activity underneath while
-        // this window is still participating in the close transition. A task-root player instead
-        // uses its captured entry orientation only when it had imposed a media orientation lock.
-        requestExitOrientationForTransition()
+        // Restore the orientation we entered with. This also bypasses the system auto-rotate lock,
+        // so the next activity does not briefly appear in the wrong orientation.
+        val needRestore = packageManager.hasSystemFeature(PackageManager.FEATURE_SCREEN_PORTRAIT) &&
+                exitRequestedOrientation != ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED &&
+                resources.configuration.orientation != entryConfigOrientation
 
-        // The orientation request and finish are issued during the same main-thread turn. There is
-        // no timer, no wait-for-configuration callback and no hidden/black intermediate surface.
+        if (needRestore) {
+            pendingFinishAfterRotate = true
+            // Hide the player UI so the user doesn't see the intermediate rotation.
+            try {
+                binding.root.alpha = 0f
+            } catch (_: Throwable) { /* ignore */ }
+            requestedOrientation = exitRequestedOrientation
+            // Fallback in case we don't receive a configuration callback.
+            eventUiHandler.postDelayed({
+                if (pendingFinishAfterRotate) {
+                    pendingFinishAfterRotate = false
+                    finish()
+                }
+            }, 600)
+            return
+        }
+
         finish()
     }
 
     override fun onDestroy() {
         Log.v(TAG, "Exiting.")
 
-        mediaOrientationExecutor.shutdownNow()
-        orientationHandler.removeCallbacksAndMessages(null)
-
         // Suppress any further callbacks
         activityIsForeground = false
         immersiveHandler.removeCallbacksAndMessages(null)
-        scrubSeekHandler.removeCallbacksAndMessages(null)
-        invalidateGestureStableTargetCheck()
-        invalidateSeekbarStableTargetCheck()
-        gestureScrubActive = false
-        seekbarScrubActive = false
-        activeScrubSeek = null
-        scrubSeekInFlight = false
 
         if (becomingNoisyReceiverRegistered) {
             unregisterReceiver(becomingNoisyReceiver)
@@ -683,22 +776,14 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
         // take the background service with us
         stopServiceRunnable.run()
 
-        if (playbackInitialized && ::binding.isInitialized) {
-            player.removeObserver(this)
-            player.destroy()
-        }
+        player.removeObserver(this)
+        player.destroy()
         super.onDestroy()
     }
 
     override fun onNewIntent(intent: Intent?) {
         Log.v(TAG, "onNewIntent($intent)")
         super.onNewIntent(intent)
-
-        // A singleTask player can be brought forward again by a later external VIEW intent. When
-        // it is the root of its task, refresh the fallback orientation from the display state that
-        // is active at this new entry rather than retaining a value from the very first launch.
-        if (!activityIsForeground && isTaskRoot)
-            entryConfigOrientation = resources.configuration.orientation
 
         // Happens when mpv is still running (not necessarily playing) and the user selects a new
         // file to be played from another app
@@ -709,19 +794,15 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
 
         if (!activityIsForeground && didResumeBackgroundPlayback) {
             if (this.newIntentReplace) {
-                loadFileWithPersistedSubtitles(filepath, "replace")
+                MPVLib.command(arrayOf("loadfile", filepath, "replace"))
                 showToast(getString(R.string.notice_file_play))
             } else {
-                loadFileWithPersistedSubtitles(filepath, "append")
+                MPVLib.command(arrayOf("loadfile", filepath, "append"))
                 showToast(getString(R.string.notice_file_appended))
             }
             moveTaskToBack(true)
         } else {
-            // Keep the current file visible while local metadata is probed. The orientation
-            // request and loadfile command are then issued in the same UI-thread turn.
-            runWithMediaOrientation(filepath) {
-                loadFileWithPersistedSubtitles(filepath)
-            }
+            MPVLib.command(arrayOf("loadfile", filepath))
         }
     }
 
@@ -753,11 +834,6 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
     }
 
     override fun onPause() {
-        if (!playbackInitialized) {
-            super.onPause()
-            return
-        }
-
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
             if (isInMultiWindowMode || isInPictureInPictureMode) {
                 Log.v(TAG, "Going into multi-window mode")
@@ -873,23 +949,18 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
 
         // Extra safety: persist state when the UI is gone, even if the process is killed.
         // Skip configuration changes (rotation) to avoid needless writes.
-        if (playbackInitialized && !isFinishing && !isChangingConfigurations)
+        if (!isFinishing && !isChangingConfigurations)
             try { savePosition() } catch (_: Throwable) {}
     }
 
     override fun onTrimMemory(level: Int) {
         super.onTrimMemory(level)
         // Last chance before the system reclaims memory / kills background processes.
-        if (playbackInitialized && level >= TRIM_MEMORY_UI_HIDDEN && !isFinishing)
+        if (level >= TRIM_MEMORY_UI_HIDDEN && !isFinishing)
             try { savePosition() } catch (_: Throwable) {}
     }
 
     override fun onResume() {
-        if (!playbackInitialized) {
-            super.onResume()
-            return
-        }
-
         // If we weren't actually in the background (e.g. multi window mode), don't reinitialize stuff
         if (activityIsForeground) {
             super.onResume()
@@ -928,8 +999,6 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
 
     override fun onWindowFocusChanged(hasFocus: Boolean) {
         super.onWindowFocusChanged(hasFocus)
-        if (!uiInitialized)
-            return
         if (!hasFocus) {
             playerWindowLostFocus = true
 
@@ -1102,26 +1171,12 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
     private var lockedUI = false
 
     private fun pauseForDialog(): StateRestoreCallback {
-        val useKeepOpen = when (noUIPauseMode) {
-            "always" -> true
-            "audio-only" -> isPlayingAudioOnly()
-            else -> false // "never"
-        }
-        if (useKeepOpen) {
-            // don't pause but set keep-open so mpv doesn't exit while the user is doing stuff
-            val oldValue = MPVLib.getPropertyString("keep-open")
-            MPVLib.setPropertyBoolean("keep-open", true)
-            return {
-                oldValue?.also { MPVLib.setPropertyString("keep-open", it) }
-            }
-        }
-
-        // Pause playback during UI dialogs
-        val wasPlayerPaused = player.paused ?: true
-        player.paused = true
+        // Keep playback running while UI dialogs/menus are open.
+        // We still set keep-open so mpv doesn't exit at EOF while the user is interacting with UI.
+        val oldValue = MPVLib.getPropertyString("keep-open")
+        MPVLib.setPropertyBoolean("keep-open", true)
         return {
-            if (!wasPlayerPaused)
-                player.paused = false
+            oldValue?.also { MPVLib.setPropertyString("keep-open", it) }
         }
     }
 
@@ -1462,18 +1517,12 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
         // actually confirms and handles a double-tap (see onPropertyChange for PlayPause/SeekFixed/Custom).
         when (ev.actionMasked) {
             MotionEvent.ACTION_DOWN -> {
-                // Read this before the event reaches VideoZoomGestures, because its ACTION_DOWN
-                // handler immediately stops the fling. The touch that interrupts a coasting image
-                // is consumed only for stopping that motion; it must not also toggle controls on UP.
-                val stoppingZoomFling = ::zoomGestures.isInitialized &&
-                    zoomGestures.isFlingInProgress()
-
                 // Zoom mode uses double-tap to reset zoom (handled by VideoZoomGestures), not TouchGestures.
                 // Cancel any pending single-tap toggle from the previous tap so the UI won't flash/appear.
                 if (::zoomGestures.isInitialized && zoomGestures.shouldBlockOtherGestures(ev)) {
                     cancelPendingTapToggle()
                 }
-                mightWantToToggleControls = !stoppingZoomFling
+                mightWantToToggleControls = true
                 tapDownX = ev.x
                 tapDownY = ev.y
 
@@ -1746,6 +1795,14 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
     override fun onConfigurationChanged(newConfig: Configuration) {
         super.onConfigurationChanged(newConfig)
 
+        // If we're exiting and requested an orientation restore, wait until Android applies it
+        // so the caller doesn't flash in the wrong orientation.
+        if (pendingFinishAfterRotate && newConfig.orientation == entryConfigOrientation) {
+            pendingFinishAfterRotate = false
+            finish()
+            return
+        }
+
         val isLandscape = newConfig.orientation == Configuration.ORIENTATION_LANDSCAPE
 
         updateGestureMetricsFromView()
@@ -1766,6 +1823,9 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
                 rightMargin = leftMargin
             }
         }
+
+        // If we deferred startup playback until the forced orientation is applied, start now.
+        maybeStartDeferredPlayback()
     }
 
     private fun onPiPModeChangedImpl(state: Boolean) {
@@ -1812,74 +1872,19 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
 
     private fun playlistPrev() {
         persistBeforePlaylistJump()
-        runPlaylistJumpWithOrientation(-1) {
-            MPVLib.command(arrayOf("playlist-prev"))
-        }
+        MPVLib.command(arrayOf("playlist-prev"))
     }
 
     private fun playlistNext() {
         persistBeforePlaylistJump()
-        runPlaylistJumpWithOrientation(1) {
-            MPVLib.command(arrayOf("playlist-next"))
-        }
+        MPVLib.command(arrayOf("playlist-next"))
     }
 
     private fun playPlaylistItem(index: Int) {
         if (MPVLib.getPropertyInt("playlist-pos") == index)
             return
         persistBeforePlaylistJump()
-        val path = playlistPathAt(index)
-        if (path == null) {
-            MPVLib.setPropertyInt("playlist-pos", index)
-        } else {
-            runWithMediaOrientation(path) {
-                MPVLib.setPropertyInt("playlist-pos", index)
-            }
-        }
-    }
-
-    private fun runPlaylistJumpWithOrientation(offset: Int, action: () -> Unit) {
-        // Shuffle decides the target inside mpv, so there is no reliable filename to probe.
-        if (MPVLib.getPropertyBoolean("shuffle") == true) {
-            action()
-            return
-        }
-
-        val position = MPVLib.getPropertyInt("playlist-pos") ?: run {
-            action()
-            return
-        }
-        val count = MPVLib.getPropertyInt("playlist-count") ?: run {
-            action()
-            return
-        }
-        if (count <= 0) {
-            action()
-            return
-        }
-
-        var target = position + offset
-        if (target !in 0 until count) {
-            val loops = MPVLib.getPropertyString("loop-playlist")
-            if (loops == null || loops == "no" || loops == "0") {
-                action()
-                return
-            }
-            target = if (target < 0) count - 1 else 0
-        }
-
-        val path = playlistPathAt(target)
-        if (path == null)
-            action()
-        else
-            runWithMediaOrientation(path, action)
-    }
-
-    private fun playlistPathAt(index: Int): String? {
-        if (index < 0)
-            return null
-        return MPVLib.getPropertyString("playlist/$index/filename")
-            ?: MPVLib.getPropertyString("playlist/$index/current-filename")
+        MPVLib.setPropertyInt("playlist-pos", index)
     }
 
     private fun showToast(msg: String, cancel: Boolean = false, durationMs: Long? = null) {
@@ -2007,110 +2012,6 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
 
     private fun perFileKey(suffix: String, path: String): String = "perfile_${suffix}_${sha1Hex(path)}"
 
-    /**
-     * Attach saved external subtitles to the playlist entry before mpv starts opening it. This
-     * makes the tracks available during mpv's initial stream selection, rather than adding them
-     * from FILE_LOADED after the first embedded-subtitle frame may already have been rendered.
-     * The saved primary/secondary choices must be part of the same loadfile options as well:
-     * setting secondary-sid from FILE_LOADED is asynchronous and can otherwise happen one frame
-     * after an explicitly loaded external subtitle was auto-selected as the primary subtitle.
-     */
-    private fun persistedSubtitleLoadOptions(mediaPath: String): String? {
-        if (!fileStatePersistenceEnabled())
-            return null
-
-        val prefs = getDefaultSharedPreferences(applicationContext)
-        class SavedSubtitle(
-            val kind: String?,
-            val external: String?,
-            val sid: Int?
-        )
-
-        fun readSavedSubtitle(kindKey: String, externalKey: String, sidKey: String): SavedSubtitle {
-            val sidPreference = perFileKey(sidKey, mediaPath)
-            return SavedSubtitle(
-                kind = prefs.getString(perFileKey(kindKey, mediaPath), null),
-                external = prefs.getString(perFileKey(externalKey, mediaPath), null)
-                    ?.takeIf { it.isNotEmpty() },
-                sid = if (prefs.contains(sidPreference))
-                    prefs.getInt(sidPreference, -1)
-                else
-                    null
-            )
-        }
-
-        val primary = readSavedSubtitle(PREF_SUB_KIND, PREF_SUB_EXTERNAL, PREF_SUB_SID)
-        val secondary = readSavedSubtitle(PREF_SUB2_KIND, PREF_SUB2_EXTERNAL, PREF_SUB2_SID)
-        val externalFiles = linkedSetOf<String>()
-        for (selection in listOf(primary, secondary)) {
-            if (selection.kind == PREF_SUB_KIND_EXTERNAL)
-                selection.external?.let(externalFiles::add)
-        }
-
-        val options = mutableListOf<String>()
-
-        // loadfile's fourth argument is a comma-separated key/value list. Fixed-length quoting
-        // keeps commas, colons and non-ASCII characters in Android paths unambiguous to mpv.
-        fun quoteOptionValue(value: String): String {
-            val utf8Length = value.toByteArray(Charsets.UTF_8).size
-            return "%${utf8Length}%$value"
-        }
-
-        if (externalFiles.size == 1) {
-            // -append takes one literal path, so only loadfile's outer key/value parser needs
-            // quoting. In particular, content:// and commas remain part of the filename.
-            options += "sub-files-append=${quoteOptionValue(externalFiles.first())}"
-        } else if (externalFiles.size > 1) {
-            // -add parses a Unix ':'-separated path list after loadfile has parsed its own
-            // comma-separated option list. Escape the inner list first, then quote that complete
-            // value so the backslashes survive the outer parser.
-            fun escapePathListItem(path: String): String = buildString(path.length) {
-                for (char in path) {
-                    if (char == '\\' || char == ':')
-                        append('\\')
-                    append(char)
-                }
-            }
-
-            val pathList = externalFiles.joinToString(":") { escapePathListItem(it) }
-            options += "sub-files-add=${quoteOptionValue(pathList)}"
-        }
-
-        fun initialTrackOption(selection: SavedSubtitle): String? {
-            return when (selection.kind) {
-                // Explicitly loaded subtitle files win mpv's automatic subtitle ranking. With
-                // both slots set to auto, mpv picks them in the primary/secondary load order.
-                PREF_SUB_KIND_EXTERNAL -> selection.external?.let { "auto" }
-                PREF_SUB_KIND_SID -> selection.sid?.let { if (it < 0) "no" else it.toString() }
-                else -> null
-            }
-        }
-
-        var primaryOption = initialTrackOption(primary)
-        val secondaryOption = initialTrackOption(secondary)
-        if (primaryOption == null && secondary.kind == PREF_SUB_KIND_EXTERNAL) {
-            // A legacy/incomplete snapshot may only contain the secondary external filename.
-            // Prevent mpv from auto-selecting that file into the primary slot before it chooses
-            // the same explicitly loaded track for secondary-sid=auto.
-            primaryOption = "no"
-        }
-        primaryOption?.let { options += "sid=$it" }
-        secondaryOption?.let { options += "secondary-sid=$it" }
-
-        return options.takeIf { it.isNotEmpty() }?.joinToString(",")
-    }
-
-    private fun loadFileWithPersistedSubtitles(path: String, flags: String = "replace") {
-        val options = persistedSubtitleLoadOptions(path)
-        val command = if (options == null) {
-            arrayOf("loadfile", path, flags)
-        } else {
-            // Since mpv 0.38, -1 occupies loadfile's insertion-index argument.
-            arrayOf("loadfile", path, flags, "-1", options)
-        }
-        MPVLib.command(command)
-    }
-
     private fun fileStatePersistenceEnabled(): Boolean {
         return getDefaultSharedPreferences(applicationContext)
             .getBoolean("save_position", false)
@@ -2138,15 +2039,8 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
     private fun rememberActiveTrackSelectionsForCurrentFile() {
         if (!fileStatePersistenceEnabled())
             return
-
-        // If a fallback sub-add is still in flight, keep the stored external filenames intact.
-        // The track-list callback will take the authoritative snapshot after restoration finishes.
-        val mediaPath = MPVLib.getPropertyString("path")
-        val subtitleRestorePending = pendingSubtitleRestorePath?.let { it == mediaPath } == true
-        if (!subtitleRestorePending) {
-            rememberSubtitleSelectionForCurrentFile()
-            rememberSubtitleSelectionForCurrentFile(secondary = true)
-        }
+        rememberSubtitleSelectionForCurrentFile()
+        rememberSubtitleSelectionForCurrentFile(secondary = true)
         rememberAudioSelectionForCurrentFile()
     }
 
@@ -2201,22 +2095,17 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
         }
     }
 
-    private fun clearPendingSubtitleRestore() {
-        pendingSubtitleRestorePath = null
-        externalSubtitleLoadsInFlight.clear()
-    }
-
-    private fun restoreSubtitleSelectionForCurrentFile(): Boolean {
-        if (!fileStatePersistenceEnabled()) {
-            clearPendingSubtitleRestore()
-            return true
-        }
-        val mediaPath = MPVLib.getPropertyString("path") ?: return false
+    private fun restoreSubtitleSelectionForCurrentFile() {
+        if (!fileStatePersistenceEnabled())
+            return
+        val mediaPath = MPVLib.getPropertyString("path") ?: return
         val prefs = getDefaultSharedPreferences(applicationContext)
-        var waitingForExternalTrack = false
 
         fun setSubProp(prop: String, id: Int) {
-            player.setFileLocalTrack(prop, id)
+            if (id == -1)
+                player.setFileLocalString(prop, "no")
+            else
+                player.setFileLocalInt(prop, id)
         }
 
         fun resolveSelection(kind: String?, external: String?, sid: Int?): Int? {
@@ -2225,13 +2114,12 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
                     if (external.isNullOrEmpty()) {
                         null
                     } else {
-                        val id = findExternalSubSidForFilename(external)
+                        var id = findExternalSubSidForFilename(external)
                         if (id == null) {
-                            waitingForExternalTrack = true
-                            // Never block mpv's event thread waiting for sub-add. A subsequent
-                            // track-list update retries resolution once the new track has an ID.
-                            if (externalSubtitleLoadsInFlight.add(external))
-                                MPVLib.command(arrayOf("sub-add", external, "auto"))
+                            // `auto` loads the track without making it primary. Resolve both
+                            // tracks first, then assign primary and secondary deterministically.
+                            MPVLib.command(arrayOf("sub-add", external, "auto"))
+                            id = waitForExternalSubSid(external)
                         }
                         id
                     }
@@ -2259,32 +2147,8 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
         // stored file first, then set the two slots explicitly so their order cannot be swapped.
         val resolvedPrimary = resolveSelection(kind1, ext1, sid1)
         val resolvedSecondary = resolveSelection(kind2, ext2, sid2)
-        if (waitingForExternalTrack) {
-            pendingSubtitleRestorePath = mediaPath
-            return false
-        }
-
-        clearPendingSubtitleRestore()
         resolvedPrimary?.let { setSubProp("sid", it) }
         resolvedSecondary?.let { setSubProp("secondary-sid", it) }
-        return true
-    }
-
-    private fun retryPendingSubtitleRestore() {
-        val expectedPath = pendingSubtitleRestorePath ?: return
-        if (MPVLib.getPropertyString("path") != expectedPath) {
-            clearPendingSubtitleRestore()
-            return
-        }
-
-        val restored = try {
-            restoreSubtitleSelectionForCurrentFile()
-        } catch (_: Throwable) {
-            false
-        }
-        if (restored) {
-            try { rememberActiveTrackSelectionsForCurrentFile() } catch (_: Throwable) {}
-        }
     }
 
     private fun findExternalSubSidForFilename(filename: String): Int? {
@@ -2299,6 +2163,21 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
             return MPVLib.getPropertyInt("track-list/$i/id")
         }
         return null
+    }
+
+    private fun waitForExternalSubSid(filename: String, timeoutMs: Long = 350L): Int? {
+        val deadline = SystemClock.uptimeMillis() + timeoutMs
+        while (SystemClock.uptimeMillis() < deadline) {
+            val sid = findExternalSubSidForFilename(filename)
+            if (sid != null) return sid
+            try {
+                Thread.sleep(10)
+            } catch (_: InterruptedException) {
+                break
+            }
+        }
+        // One last attempt.
+        return findExternalSubSidForFilename(filename)
     }
 
     private fun findExternalSubFilenameForSid(sid: Int): String? {
@@ -2374,7 +2253,8 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
             }
             PREF_AUD_KIND_SID -> {
                 if (aid != null) {
-                    player.setFileLocalTrack("aid", aid)
+                    if (aid == -1) player.setFileLocalString("aid", "no")
+                    else player.setFileLocalInt("aid", aid)
                 }
             }
         }
@@ -2561,7 +2441,7 @@ private fun openPlaylistMenu(restore: StateRestoreCallback, onBack: (() -> Unit)
             openFilePickerFor(RCODE_LOAD_FILE, "", skip) { result, data ->
                 if (result == RESULT_OK) {
                     val path = data!!.getStringExtra("path")!!
-                    loadFileWithPersistedSubtitles(path, "append")
+                    MPVLib.command(arrayOf("loadfile", path, "append"))
                     impl.refresh()
                 }
             }
@@ -2581,7 +2461,7 @@ private fun openPlaylistMenu(restore: StateRestoreCallback, onBack: (() -> Unit)
                 urlDialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener {
                     val url = helper.text
                     if (url.isNotBlank()) {
-                        loadFileWithPersistedSubtitles(url, "append")
+                        MPVLib.command(arrayOf("loadfile", url, "append"))
                         impl.refresh()
                     }
                     // Keep dialog open.
@@ -2692,6 +2572,7 @@ private fun cycleSpeed() {
     private fun unlockUI() {
         binding.unlockBtn.visibility = View.GONE
         lockedUI = false
+        showControls()
     }
 
     data class MenuItem(
@@ -3127,10 +3008,7 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
         }
 
         picker.delay1 = player.subDelay ?: 0.0
-        picker.delay2 = if (player.sid != -1 || player.secondarySid != -1)
-            (player.secondarySubDelay ?: 0.0)
-        else
-            null
+        picker.delay2 = if (player.secondarySid != -1) (player.secondarySubDelay ?: 0.0) else null
 
         dialog.setOnShowListener {
 
@@ -3150,10 +3028,10 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
     val hiddenButtons = mutableSetOf<Int>()
     val buttons: MutableList<MenuItem> = mutableListOf(
         MenuItem(R.id.subSeekPrev) {
-            MPVLib.command(arrayOf("sub-seek", "-1", "both"))
+            MPVLib.command(arrayOf("sub-seek", "-1"))
         },
         MenuItem(R.id.subSeekNext) {
-            MPVLib.command(arrayOf("sub-seek", "1", "both"))
+            MPVLib.command(arrayOf("sub-seek", "1"))
         },
         MenuItem(R.id.statsBtn) {
             MPVLib.command(arrayOf("script-binding", "stats/display-stats-toggle"))
@@ -3208,12 +3086,10 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
 }
 
     private fun cycleOrientation() {
-        val desired = if (requestedOrientation == ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE)
+        requestedOrientation = if (requestedOrientation == ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE)
             ActivityInfo.SCREEN_ORIENTATION_SENSOR_PORTRAIT
         else
             ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
-        if (setRequestedOrientationSafely(desired))
-            orientationOwnedByPlayer = true
     }
 
     private var activityResultCallbacks: MutableMap<Int, ActivityResultCallback> = mutableMapOf()
@@ -3321,7 +3197,7 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
                 Utils.prettyTime(-diff, true)
         }
         if (!userIsOperatingSeekbar)
-            binding.playbackSeekbar.progress = position
+            binding.playbackSeekbar.progress = position * SEEK_BAR_PRECISION
 
         // Note: do NOT add other update functions here just because this is called every second.
         // Use property observation instead.
@@ -3332,7 +3208,7 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
         if (!useTimeRemaining)
             binding.playbackDurationTxt.text = Utils.prettyTime(duration)
         if (!userIsOperatingSeekbar)
-            binding.playbackSeekbar.max = duration
+            binding.playbackSeekbar.max = duration * SEEK_BAR_PRECISION
     }
 
     private fun updatePlaybackStatus(paused: Boolean) {
@@ -3381,274 +3257,137 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
         binding.nextBtn.imageTintList = ColorStateList.valueOf(if (plPos == plCount-1) g else w)
     }
 
-    private fun readAutoRotationModeForLaunch() {
-        val prefs = getDefaultSharedPreferences(applicationContext)
-        val defaultMode = resources.getString(R.string.pref_auto_rotation_default)
-        autoRotationMode = prefs.getString("auto_rotation", defaultMode) ?: defaultMode
-    }
-
-    private fun resolveLaunchRequestedOrientation(path: String): Int? {
-        if (!supportsRequestedOrientation())
-            return null
-
-        return when (autoRotationMode) {
-            "landscape" -> ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
-            "portrait" -> ActivityInfo.SCREEN_ORIENTATION_SENSOR_PORTRAIT
-            "auto" -> requestedOrientationForMedia(resolveOrientationWithinLaunchBudget(path))
-            else -> ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
-        }
-    }
-
-    private fun supportsRequestedOrientation(): Boolean {
-        if (!packageManager.hasSystemFeature(PackageManager.FEATURE_SCREEN_PORTRAIT))
-            return false
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N && isInMultiWindowMode)
-            return false
-        return true
-    }
-
-    private fun resolveOrientationWithinLaunchBudget(path: String): MediaOrientationResolver.Orientation {
-        cachedOrientation(path)?.let { return it }
-        if (!MediaOrientationResolver.canResolve(path))
-            return MediaOrientationResolver.Orientation.UNKNOWN
-
-        val future = mediaOrientationExecutor.submit<MediaOrientationResolver.Orientation> {
-            MediaOrientationResolver.resolve(applicationContext, path)
-        }
-        val result = try {
-            future.get(ORIENTATION_PROBE_BUDGET_MS, TimeUnit.MILLISECONDS)
-        } catch (_: TimeoutException) {
-            future.cancel(true)
-            return MediaOrientationResolver.Orientation.UNKNOWN
-        } catch (_: InterruptedException) {
-            Thread.currentThread().interrupt()
-            return MediaOrientationResolver.Orientation.UNKNOWN
-        } catch (e: Throwable) {
-            Log.d(TAG, "Media orientation probe failed for $path", e)
-            MediaOrientationResolver.Orientation.UNKNOWN
-        }
-
-        cacheOrientation(path, result)
-        return result
-    }
-
-    private fun cachedOrientation(path: String): MediaOrientationResolver.Orientation? {
-        return synchronized(orientationProbeCache) { orientationProbeCache[path] }
-    }
-
-    private fun cacheOrientation(path: String, result: MediaOrientationResolver.Orientation) {
-        // UNKNOWN can be transient for a document provider or an unfinished download. Caching it
-        // would prevent a later retry when the same playlist item becomes locally readable.
-        if (result == MediaOrientationResolver.Orientation.UNKNOWN)
-            return
-        synchronized(orientationProbeCache) { orientationProbeCache[path] = result }
-    }
-
-    private fun requestedOrientationForMedia(
-        orientation: MediaOrientationResolver.Orientation,
-    ): Int? {
-        return when (orientation) {
-            MediaOrientationResolver.Orientation.LANDSCAPE ->
-                ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
-
-            MediaOrientationResolver.Orientation.PORTRAIT ->
-                ActivityInfo.SCREEN_ORIENTATION_SENSOR_PORTRAIT
-
-            MediaOrientationResolver.Orientation.SQUARE ->
-                ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
-
-            MediaOrientationResolver.Orientation.UNKNOWN -> null
-        }
-    }
-
-    private fun requestOrientationIfNeeded(desired: Int) {
-        if (!supportsRequestedOrientation())
-            return
-        val ownsOrientation = desired == ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE ||
-            desired == ActivityInfo.SCREEN_ORIENTATION_SENSOR_PORTRAIT
-        if (requestedOrientation == desired) {
-            orientationOwnedByPlayer = ownsOrientation
-        } else if (setRequestedOrientationSafely(desired)) {
-            orientationOwnedByPlayer = ownsOrientation
-        }
-    }
-
-    private fun setRequestedOrientationSafely(desired: Int): Boolean {
-        return try {
-            requestedOrientation = desired
-            true
-        } catch (e: IllegalStateException) {
-            // Some vendor Android 8/9 builds temporarily reject orientation requests while a
-            // window is entering or leaving PiP/multi-window. mpv's normal layout still works.
-            Log.w(TAG, "Orientation request rejected: $desired", e)
-            false
-        }
-    }
-
-    private fun requestExitOrientationForTransition() {
-        if (!packageManager.hasSystemFeature(PackageManager.FEATURE_SCREEN_PORTRAIT))
-            return
-
-        val desired = if (!isTaskRoot) {
-            // Adopt the exact orientation policy of the in-task activity beneath the player. This
-            // is useful even in Device/square mode because the underlying activity may itself be
-            // fixed to portrait or landscape.
-            ActivityInfo.SCREEN_ORIENTATION_BEHIND
-        } else {
-            // External VIEW launches commonly make MPVActivity the root of its own task. With no
-            // in-task activity to inherit from, restore the entry configuration only when the
-            // player actually owned a portrait/landscape lock. Device/square mode must remain free
-            // to follow the current physical orientation.
-            if (!orientationOwnedByPlayer)
-                return
-            when (entryConfigOrientation) {
-                Configuration.ORIENTATION_LANDSCAPE ->
-                    ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
-
-                Configuration.ORIENTATION_PORTRAIT ->
-                    ActivityInfo.SCREEN_ORIENTATION_SENSOR_PORTRAIT
-
-                else -> ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
-            }
-        }
-
-        // Do not gate this through supportsRequestedOrientation(): during a close transition on
-        // Android 9 the activity may already be leaving PiP/multi-window, yet the handoff remains
-        // valid and should occur before the underlying window becomes visible.
-        if (requestedOrientation != desired)
-            setRequestedOrientationSafely(desired)
-    }
-
     private fun updateOrientation(initial: Boolean = false) {
-        if (!supportsRequestedOrientation())
+        // screen orientation is fixed (Android TV)
+        if (!packageManager.hasSystemFeature(PackageManager.FEATURE_SCREEN_PORTRAIT))
             return
 
         if (autoRotationMode != "auto") {
             if (!initial)
-                return // Do not overwrite a fixed/manual choice while playback is running.
-
-            val desired = when (autoRotationMode) {
+                return // don't reset at runtime
+            requestedOrientation = when (autoRotationMode) {
                 "landscape" -> ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
                 "portrait" -> ActivityInfo.SCREEN_ORIENTATION_SENSOR_PORTRAIT
                 else -> ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
             }
-            requestOrientationIfNeeded(desired)
+        }
+        if (initial || player.vid == -1)
+            return
+
+        // Base automatic orientation on the media's native pixel dimensions, not on mpv's
+        // displayed aspect ratio. The latter can change when the user selects an aspect-ratio
+        // override, and that UI-only choice must never rotate the Android screen.
+        val pixelSize = player.getVideoPixelSize() ?: return
+        val ratio = pixelSize.first.toFloat() / pixelSize.second.toFloat()
+
+        // If the dimensions are unavailable/invalid, don't change orientation. In practice this
+        // can happen briefly while mpv is still probing the file (and reacting to it can cause a
+        // portrait "bounce" that sometimes sticks).
+        if (!ratio.isFinite() || ratio == 0f)
+            return
+
+        if (ratio in (1f / ASPECT_RATIO_MIN) .. ASPECT_RATIO_MIN) {
+            // video is square, let Android do what it wants — but don't break an in-progress
+            // startup rotation that we intentionally forced for a landscape/portrait file.
+            if (isWithinOrientationStabilityLock())
+                return
+            requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
             return
         }
 
-        if (initial || !playbackInitialized || !mediaGeometryReadyForOrientation || player.vid == -1)
-            return
+        val desired = if (ratio > 1f)
+            ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
+        else
+            ActivityInfo.SCREEN_ORIENTATION_SENSOR_PORTRAIT
 
-        // getVideoPixelSize() already applies video-params/rotate. Unlike the displayed aspect,
-        // native dimensions are not changed by the user's aspect-ratio override.
-        val size = player.getVideoPixelSize() ?: return
-        val orientation = MediaOrientationResolver.classify(size.first, size.second)
-        val desired = requestedOrientationForMedia(orientation) ?: return
-        requestOrientationIfNeeded(desired)
+        // Once we have a reliable non-square aspect ratio, clear the stability lock so future
+        // files / reconfigs can update normally.
+        if (isWithinOrientationStabilityLock()) {
+            orientationStabilityLockUntilMs = 0L
+            orientationStabilityLockValue = ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
+        }
+
+        requestedOrientation = desired
     }
 
-    private fun runWithMediaOrientation(path: String, action: () -> Unit) {
-        if (autoRotationMode != "auto" ||
-            !supportsRequestedOrientation() ||
-            !MediaOrientationResolver.canResolve(path)
-        ) {
-            action()
-            return
-        }
+    private enum class ProbedOrientation { LANDSCAPE, PORTRAIT, SQUARE, UNKNOWN }
 
-        cachedOrientation(path)?.let { cached ->
-            requestedOrientationForMedia(cached)?.let(::requestOrientationIfNeeded)
-            action()
-            return
-        }
+    private fun probeOrientationFromMetadata(path: String): ProbedOrientation {
+        // Skip unsupported / remote schemes (mpv will update orientation later from video-params).
+        if (path.startsWith("http://") || path.startsWith("https://") ||
+            path.startsWith("rtsp://") || path.startsWith("rtmp://") ||
+            path.startsWith("rtmps://") || path.startsWith("udp://") ||
+            path.startsWith("tcp://") || path.startsWith("memory://") ||
+            path.startsWith("data://") || path.startsWith("lavf://")
+        ) return ProbedOrientation.UNKNOWN
 
-        val generation = ++mediaSwitchProbeGeneration
-        val timeout = Runnable {
-            if (generation != mediaSwitchProbeGeneration || isFinishing || isDestroyed)
-                return@Runnable
-
-            // Inaccessible/cloud-backed content must never make a file switch hang forever.
-            // This is only a failure ceiling; local media normally completes far earlier.
-            mediaSwitchProbeGeneration = generation + 1
-            action()
-        }
-        orientationHandler.postDelayed(timeout, ORIENTATION_ASYNC_PROBE_TIMEOUT_MS)
-
+        val mmr = MediaMetadataRetriever()
         try {
-            mediaOrientationExecutor.execute {
-                val result = try {
-                    MediaOrientationResolver.resolve(applicationContext, path)
-                } catch (_: Throwable) {
-                    MediaOrientationResolver.Orientation.UNKNOWN
-                }
-
-                orientationHandler.post {
-                    if (generation != mediaSwitchProbeGeneration || isFinishing || isDestroyed)
-                        return@post
-
-                    orientationHandler.removeCallbacks(timeout)
-                    mediaSwitchProbeGeneration = generation + 1
-                    cacheOrientation(path, result)
-                    if (autoRotationMode == "auto")
-                        requestedOrientationForMedia(result)?.let(::requestOrientationIfNeeded)
-                    action()
-                }
+            if (path.startsWith("content://")) {
+                mmr.setDataSource(this, Uri.parse(path))
+            } else if (path.startsWith("file://")) {
+                mmr.setDataSource(Uri.parse(path).path)
+            } else {
+                // Assume local filesystem path
+                mmr.setDataSource(path)
             }
+
+            val w0 = mmr.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_WIDTH)?.toIntOrNull()
+            val h0 = mmr.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_HEIGHT)?.toIntOrNull()
+            if (w0 == null || h0 == null || w0 <= 0 || h0 <= 0)
+                return ProbedOrientation.UNKNOWN
+
+            // Apply rotation metadata (common on phone recordings)
+            val rot = mmr.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_ROTATION)?.toIntOrNull() ?: 0
+            val (w, h) = if (rot % 180 != 0) Pair(h0, w0) else Pair(w0, h0)
+
+            val ratio = w.toFloat() / h.toFloat()
+            if (ratio == 0f || ratio in (1f / ASPECT_RATIO_MIN) .. ASPECT_RATIO_MIN)
+                return ProbedOrientation.SQUARE
+            return if (ratio > 1f) ProbedOrientation.LANDSCAPE else ProbedOrientation.PORTRAIT
         } catch (_: Throwable) {
-            orientationHandler.removeCallbacks(timeout)
-            if (generation == mediaSwitchProbeGeneration && !isFinishing && !isDestroyed) {
-                mediaSwitchProbeGeneration = generation + 1
-                action()
-            }
+            return ProbedOrientation.UNKNOWN
+        } finally {
+            try { mmr.release() } catch (_: Throwable) {}
         }
     }
 
-    private fun prefetchAdjacentPlaylistOrientations() {
-        if (autoRotationMode != "auto" || !supportsRequestedOrientation() || isFinishing)
+    private fun applyOrientationFromMetadata(path: String, isStartup: Boolean = false) {
+        // screen orientation is fixed (Android TV)
+        if (!packageManager.hasSystemFeature(PackageManager.FEATURE_SCREEN_PORTRAIT))
             return
 
-        val position = MPVLib.getPropertyInt("playlist-pos") ?: return
-        val count = MPVLib.getPropertyInt("playlist-count") ?: return
-        if (count <= 1)
+        // Avoid probing the same path repeatedly (e.g., playlist refreshes).
+        if (path == lastOrientationProbePath && !isStartup)
             return
+        lastOrientationProbePath = path
 
-        val candidates = linkedSetOf(position - 1, position + 1)
-        for (index in candidates) {
-            if (index !in 0 until count)
-                continue
-            val path = playlistPathAt(index) ?: continue
-            if (!MediaOrientationResolver.canResolve(path) || cachedOrientation(path) != null)
-                continue
-            if (!markOrientationPrefetchStarted(path))
-                continue
-
-            try {
-                mediaOrientationExecutor.execute {
-                    try {
-                        val result = try {
-                            MediaOrientationResolver.resolve(applicationContext, path)
-                        } catch (_: Throwable) {
-                            MediaOrientationResolver.Orientation.UNKNOWN
-                        }
-                        cacheOrientation(path, result)
-                    } finally {
-                        markOrientationPrefetchFinished(path)
-                    }
-                }
-            } catch (_: Throwable) {
-                markOrientationPrefetchFinished(path)
-                // The executor may already be shutting down while the activity exits.
-            }
+        val probed = probeOrientationFromMetadata(path)
+        val desired = when (probed) {
+            ProbedOrientation.LANDSCAPE -> ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
+            ProbedOrientation.PORTRAIT -> ActivityInfo.SCREEN_ORIENTATION_SENSOR_PORTRAIT
+            ProbedOrientation.SQUARE -> ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
+            ProbedOrientation.UNKNOWN -> return
         }
+
+
+        // If we're already in portrait with an unspecified orientation, don't force-lock it.
+        // This avoids unnecessary churn when everything is already portrait.
+        if (desired == ActivityInfo.SCREEN_ORIENTATION_SENSOR_PORTRAIT &&
+            resources.configuration.orientation == Configuration.ORIENTATION_PORTRAIT &&
+            requestedOrientation == ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
+        ) return
+
+        // Only change if needed to prevent redundant config churn.
+        if (requestedOrientation != desired)
+            requestedOrientation = desired
+
+        // Hold the chosen orientation briefly so transient "square/unknown" aspect updates
+        // from mpv won't bounce us back to portrait during startup/reconfig.
+        lockOrientationStability(desired, if (isStartup) 2200L else 1600L)
     }
 
-    private fun markOrientationPrefetchStarted(path: String): Boolean {
-        return synchronized(orientationProbesInFlight) { orientationProbesInFlight.add(path) }
-    }
 
-    private fun markOrientationPrefetchFinished(path: String) {
-        synchronized(orientationProbesInFlight) { orientationProbesInFlight.remove(path) }
-    }
 
     @RequiresApi(26)
     private fun makeRemoteAction(@DrawableRes icon: Int, @StringRes title: Int, intentAction: String): RemoteAction {
@@ -3756,9 +3495,7 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
     private fun eventPropertyUi(property: String, value: Boolean) {
         if (!activityIsForeground) return
         when (property) {
-            // During scrub mpv is intentionally paused, but the controls represent the user's
-            // desired state after the authoritative seek finishes.
-            "pause" -> updatePlaybackStatus(scrubPlaybackPaused ?: value)
+            "pause" -> updatePlaybackStatus(value)
             "mute" -> { // indirectly from updateAudioPresence()
                 updateAudioUI()
             }
@@ -3768,14 +3505,11 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
     private fun eventPropertyUi(property: String, value: Long) {
         if (!activityIsForeground) return
         when (property) {
-            "playlist-pos", "playlist-count" -> {
-                updatePlaylistButtons()
-                prefetchAdjacentPlaylistOrientations()
-            }
+            "time-pos" -> updatePlaybackPos(psc.positionSec)
+            "playlist-pos", "playlist-count" -> updatePlaylistButtons()
             "video-params/w", "video-params/h" -> {
-                updateOrientation()
                 syncZoomVideoGeometry()
-                prepareZoomSurfaceWhenReady()
+                prepareZoomSurfaceAndRevealWhenReady()
             }
         }
     }
@@ -3783,17 +3517,16 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
     private fun eventPropertyUi(property: String, value: Double) {
         if (!activityIsForeground) return
         when (property) {
-            "time-pos" -> updatePlaybackPos(psc.positionSec)
             "duration/full" -> updatePlaybackDuration(psc.durationSec)
             "video-params/aspect", "video-params/rotate" -> {
                 updateOrientation()
                 updatePiPParams()
                 syncZoomVideoGeometry()
-                prepareZoomSurfaceWhenReady()
+                prepareZoomSurfaceAndRevealWhenReady()
             }
             "panscan" -> {
                 syncZoomVideoGeometry()
-                prepareZoomSurfaceWhenReady()
+                prepareZoomSurfaceAndRevealWhenReady()
             }
         }
     }
@@ -3804,7 +3537,7 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
             "speed" -> updateSpeedButton()
             "video-aspect-override" -> {
                 syncZoomVideoGeometry()
-                prepareZoomSurfaceWhenReady()
+                prepareZoomSurfaceAndRevealWhenReady()
             }
         }
         if (metaUpdated)
@@ -3820,8 +3553,6 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
         val metaUpdated = psc.update(property)
         if (metaUpdated)
             updateMediaSession()
-        if (property == "track-list")
-            retryPendingSubtitleRestore()
         if (property == "loop-file" || property == "loop-playlist") {
             mediaSession?.setRepeatMode(when (player.getRepeat()) {
                 2 -> PlaybackStateCompat.REPEAT_MODE_ONE
@@ -3840,13 +3571,6 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
     }
 
     override fun eventProperty(property: String, value: Boolean) {
-        if (property == "seeking") {
-            // Property callbacks arrive on mpv's event thread. Read the final high-resolution
-            // position there so the Android main thread never blocks on mpv_get_property.
-            val playbackTime = if (!value) readScrubPlaybackTimeFromMpv() else null
-            eventUiHandler.post { handleScrubSeeking(value, playbackTime) }
-        }
-
         val metaUpdated = psc.update(property, value)
         if (metaUpdated)
             updateMediaSession()
@@ -3893,22 +3617,10 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
     }
 
     override fun eventProperty(property: String, value: Double) {
-        // A double time-pos preserves the fraction that INT64 used to truncate. Dispatch UI and
-        // media-session work only when its rounded whole-second value changes, retaining
-        // once-per-second downstream updates while keeping displayed time consistent after seeking.
-        val previousPositionSec = if (property == "time-pos") {
-            if (psc.position < 0L) null else psc.positionSec
-        } else {
-            null
-        }
-        val cacheUpdated = psc.update(property, value)
-        val roundedPositionChanged = property != "time-pos" ||
-                (cacheUpdated && (previousPositionSec == null || previousPositionSec != psc.positionSec))
-
-        if (cacheUpdated && roundedPositionChanged)
+        if (psc.update(property, value))
             updateMediaSession()
 
-        if (!activityIsForeground || !roundedPositionChanged) return
+        if (!activityIsForeground) return
         eventUiHandler.post { eventPropertyUi(property, value) }
     }
 
@@ -3943,10 +3655,6 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
         event(MpvEvent.MPV_EVENT_END_FILE)
     }
 
-    override fun eventCommandReply(userdata: Long, error: Int) {
-        eventUiHandler.post { handleScrubCommandReply(userdata, error) }
-    }
-
     override fun event(eventId: Int) {
         if (eventId == MpvEvent.MPV_EVENT_END_FILE) {
             psc.eof()
@@ -3956,16 +3664,13 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
         if (eventId == MpvEvent.MPV_EVENT_SHUTDOWN)
             finishWithResult(if (playbackHasStarted) RESULT_OK else RESULT_CANCELED)
 
-        if (eventId == MpvEvent.MPV_EVENT_SEEK ||
-            eventId == MpvEvent.MPV_EVENT_PLAYBACK_RESTART
-        ) {
-            // EventObserver callbacks run on mpv's event thread. Read playback-time here and
-            // serialize only the lightweight state transition on Android's main thread.
-            val playbackTime = if (eventId == MpvEvent.MPV_EVENT_PLAYBACK_RESTART)
-                readScrubPlaybackTimeFromMpv()
-            else
-                null
-            eventUiHandler.post { handleScrubMpvEvent(eventId, playbackTime) }
+        if (eventId == MpvEvent.MPV_EVENT_PLAYBACK_RESTART) {
+            // A seek completed. If the user has released the finger, apply the latest
+            // play/pause choice they made while the seek was in progress.
+            scrubSeekInFlight = false
+            lastScrubAsyncUserdata = 0L
+            if (!gestureScrubActive && !seekbarScrubActive)
+                eventUiHandler.post { finishScrubPlaybackHoldIfReady() }
         }
 
         if (eventId == MpvEvent.MPV_EVENT_FILE_LOADED) {
@@ -3975,7 +3680,10 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
             player.configureFileStatePersistence(persistFileState)
 
             if (persistFileState) {
-                // Restore the chosen audio before playback options and subtitle selection.
+                // Restore the chosen audio before any subtitle loading or synchronous preference
+                // writes. Resolving two external subtitles can take a few hundred milliseconds;
+                // doing that first lets mpv briefly start the embedded audio before audio-add
+                // selects the saved external track.
                 try { restoreAudioSelectionForCurrentFile() } catch (_: Throwable) {}
 
                 // These app snapshots survive deletion of watch-later at natural EOF, so only
@@ -3988,15 +3696,8 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
                 // Track IDs and the external track list are authoritative only after FILE_LOADED.
                 // Restore both subtitle slots now so a previous file or mpv's automatic selection
                 // cannot swap primary and secondary while the new file is still being initialized.
-                val subtitleRestoreComplete = try {
-                    restoreSubtitleSelectionForCurrentFile()
-                } catch (_: Throwable) {
-                    false
-                }
-                if (subtitleRestoreComplete)
-                    try { rememberActiveTrackSelectionsForCurrentFile() } catch (_: Throwable) {}
-                else
-                    try { rememberAudioSelectionForCurrentFile() } catch (_: Throwable) {}
+                try { restoreSubtitleSelectionForCurrentFile() } catch (_: Throwable) {}
+                try { rememberActiveTrackSelectionsForCurrentFile() } catch (_: Throwable) {}
             } else {
                 // resume-playback was disabled before loading, so this removes any old state
                 // without first applying it to the current session.
@@ -4006,41 +3707,28 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
             }
 
             eventUiHandler.post {
-                mediaGeometryReadyForOrientation = true
-                updateOrientation()
-                prepareZoomSurfaceWhenReady()
-                prefetchAdjacentPlaylistOrientations()
+                videoGeometryBlackoutFileLoadedSeen = true
+                prepareZoomSurfaceAndRevealWhenReady()
             }
         }
 
         if (eventId == MpvEvent.MPV_EVENT_VIDEO_RECONFIG) {
-            eventUiHandler.post {
-                updateOrientation()
-                prepareZoomSurfaceWhenReady()
-            }
+            eventUiHandler.post { prepareZoomSurfaceAndRevealWhenReady() }
         }
 
         if (eventId == MpvEvent.MPV_EVENT_START_FILE) {
             currentWatchLaterPath = null
             completedWatchLaterPath = null
-            clearPendingSubtitleRestore()
+            // Reset any view-level zoom/pan when a new file starts.
 
-            eventUiHandler.postAtFrontOfQueue {
-                mediaGeometryReadyForOrientation = false
-                resetScrubSeekControllerForFileChange()
-                resetZoomForNewFile()
-
-                // For auto-advanced or externally modified playlists, use a prefetched result
-                // when available. Otherwise start a non-blocking probe while mpv's video-params
-                // callbacks remain the final fallback.
-                val path = MPVLib.getPropertyString("path")
-                val cached = path?.let(::cachedOrientation)
-                if (cached != null) {
-                    requestedOrientationForMedia(cached)?.let(::requestOrientationIfNeeded)
-                } else if (path != null) {
-                    runWithMediaOrientation(path) { /* orientation only */ }
-                }
+            // Apply orientation as early as possible for playlist items, so we don't show the wrong orientation first.
+            // Must run on the UI thread.
+            if (autoRotationMode == "auto") {
+                val p = MPVLib.getPropertyString("path")
+                if (p != null) eventUiHandler.post { try { applyOrientationFromMetadata(p) } catch (_: Throwable) {} }
             }
+
+            eventUiHandler.postAtFrontOfQueue { beginVideoGeometryBlackout() }
             try {
                 MPVLib.setPropertyDouble("video-zoom", 0.0)
                 MPVLib.setPropertyDouble("video-pan-x", 0.0)
@@ -4067,32 +3755,7 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
 
 
     // --- Scrub seek helpers ---
-    private fun resetScrubSeekControllerForFileChange() {
-        val desiredPlaybackPaused = scrubPlaybackPaused
-        invalidateGestureStableTargetCheck()
-        invalidateSeekbarStableTargetCheck()
-        scrubSeekHandler.removeCallbacks(scrubFrameGraceRunnable)
-        scrubSeekHandler.removeCallbacks(scrubHardTimeoutRunnable)
-        activeScrubSeek = null
-        scrubSeekInFlight = false
-        scrubPlaybackPaused = null
-        if (desiredPlaybackPaused != null) {
-            player.paused = desiredPlaybackPaused
-            updatePlaybackStatus(desiredPlaybackPaused)
-        }
-        mpvSeeking = false
-        latestPlaybackTimeSec = Double.NaN
-        gestureScrubActive = false
-        pendingGestureSeekSec = null
-        lastIssuedGestureSeekSec = null
-        seekbarScrubActive = false
-        userIsOperatingSeekbar = false
-        pendingSeekbarSeekPos = null
-        lastIssuedSeekbarSeekPos = null
-    }
-
-    // We keep the frame frozen while the finger is moving, then issue a throttled seek on
-    // idle/release. Only the latest request is authoritative; stale native callbacks are ignored.
+    // We keep the frame frozen while the finger is moving, then do a single exact seek on idle/release.
     private fun beginScrubPlaybackHold() {
         if (scrubPlaybackPaused != null)
             return
@@ -4122,395 +3785,46 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
             return
         }
 
-        // Record the user's desired post-seek state, but keep mpv physically paused until the
-        // newest exact seek has produced its frame. Decoding while playback runs makes heavy
-        // long-GOP HEVC seeks slower and can briefly expose an intermediate frame.
         val newPlaybackPaused = !playbackPaused
         scrubPlaybackPaused = newPlaybackPaused
-        player.paused = true
+        player.paused = newPlaybackPaused
+        // Keep the button responsive even when mpv was already temporarily paused.
         updatePlaybackStatus(newPlaybackPaused)
     }
 
-    private fun invalidateGestureStableTargetCheck() {
-        gestureStableSeekRunnable?.let(scrubSeekHandler::removeCallbacks)
-        gestureStableSeekRunnable = null
-    }
-
-    private fun invalidateSeekbarStableTargetCheck() {
-        seekbarStableSeekRunnable?.let(scrubSeekHandler::removeCallbacks)
-        seekbarStableSeekRunnable = null
-    }
-
-    private fun scheduleGestureStableTargetSeek() {
-        val target = pendingGestureSeekSec ?: return
-        invalidateGestureStableTargetCheck()
-
-        val runnable = Runnable {
-            gestureStableSeekRunnable = null
-            val currentTarget = pendingGestureSeekSec
-            if (!gestureScrubActive || currentTarget == null || !sameSeekTarget(currentTarget, target))
-                return@Runnable
-            performGestureIdleSeek()
+    private fun abortLastScrubSeek() {
+        val ud = lastScrubAsyncUserdata
+        if (ud != 0L) {
+            try { MPVLib.abortAsyncCommand(ud) } catch (_: Throwable) {}
+            lastScrubAsyncUserdata = 0L
+            scrubSeekInFlight = false
         }
-        gestureStableSeekRunnable = runnable
-        scrubSeekHandler.postDelayed(runnable, SCRUB_TARGET_STABLE_MS)
     }
 
-    private fun scheduleSeekbarStableTargetSeek() {
-        val target = pendingSeekbarSeekPos ?: return
-        invalidateSeekbarStableTargetCheck()
-
-        val runnable = Runnable {
-            seekbarStableSeekRunnable = null
-            if (!seekbarScrubActive)
-                return@Runnable
-            val currentTarget = pendingSeekbarSeekPos ?: return@Runnable
-            if (!sameSeekTarget(currentTarget, target))
-                return@Runnable
-            performSeekbarIdleSeek()
-        }
-        seekbarStableSeekRunnable = runnable
-        scrubSeekHandler.postDelayed(runnable, SCRUB_TARGET_STABLE_MS)
-    }
-
-    private fun sameSeekTarget(a: Double, b: Double): Boolean =
-        abs(a - b) <= SCRUB_TARGET_COMPARE_EPSILON_SEC
-
-    private fun hasAuthoritativeScrubSeek(targetSec: Double, exact: Boolean): Boolean {
-        val request = activeScrubSeek ?: return false
-        return !request.superseded && request.exact == exact &&
-                sameSeekTarget(request.targetSec, targetSec)
-    }
-
-    private fun seekbarTargetAlreadyResolved(targetSec: Double): Boolean {
-        if (activeScrubSeek != null)
-            return hasAuthoritativeScrubSeek(targetSec, exact = true)
-        return lastIssuedSeekbarSeekPos?.let { sameSeekTarget(it, targetSec) } == true
-    }
-
-    private fun gestureTargetAlreadyResolved(targetSec: Double, exact: Boolean): Boolean {
-        if (activeScrubSeek != null)
-            return hasAuthoritativeScrubSeek(targetSec, exact)
-        return lastIssuedGestureSeekSec?.let { sameSeekTarget(it, targetSec) } == true
-    }
-
-    private fun clearLastIssuedTarget(request: ScrubSeekRequest) {
-        val seekbarTarget = lastIssuedSeekbarSeekPos
-        if (seekbarTarget != null && sameSeekTarget(seekbarTarget, request.targetSec))
-            lastIssuedSeekbarSeekPos = null
-
-        val gestureTarget = lastIssuedGestureSeekSec
-        if (gestureTarget != null && sameSeekTarget(gestureTarget, request.targetSec))
-            lastIssuedGestureSeekSec = null
-    }
-
-    private fun supersedeActiveScrubSeekIfTargetChanged(targetSec: Double, exact: Boolean) {
-        val request = activeScrubSeek ?: return
-        if (request.exact == exact && sameSeekTarget(request.targetSec, targetSec))
-            return
-
-        // mpv already coalesces queued seeks internally. Do not pretend mpv_abort_async_command
-        // stopped decoder work; simply revoke the old request's authority over UI/playback state.
-        request.superseded = true
-        scrubSeekHandler.removeCallbacks(scrubFrameGraceRunnable)
-        request.frameGraceScheduled = false
-    }
-
-    private fun nextScrubUserdata(): Long {
-        var userdata = scrubAsyncCounter++
-        if (userdata == 0L) {
-            userdata = scrubAsyncCounter++
-        }
-        return userdata
-    }
-
-    private fun sendScrubSeek(targetSec: Double, exact: Boolean): Boolean {
+    private fun sendScrubSeek(targetSec: Double, exact: Boolean) {
+        // Cancel the previous async seek so the latest target wins.
+        abortLastScrubSeek()
+        val ud = scrubAsyncCounter++
+        lastScrubAsyncUserdata = ud
         val mode = if (exact) "absolute+exact" else "absolute+keyframes"
-        return queueScrubSeek(targetSec, exact, targetSec, mode)
-    }
-
-    private fun sendGestureScrubSeek(targetSec: Double): Boolean {
-        if (smoothSeekGesture)
-            return sendScrubSeek(targetSec, exact = true)
-
-        val direction = targetSec.compareTo(initialSeek.toDouble())
-        if (direction == 0)
-            return sendScrubSeek(targetSec, exact = false)
-
-        // An absolute keyframe seek always rounds backwards. First align playback with the
-        // keyframe that owns the gesture's starting position; after that request settles,
-        // complete the seek relatively so mpv can honor the requested direction. In particular,
-        // clamping the second stage just past this anchor makes even +1/-1 select the adjacent
-        // next/previous keyframe instead of resolving to the same GOP anchor.
-        return queueScrubSeek(
-            targetSec = targetSec,
-            exact = false,
-            commandValueSec = initialSeek.toDouble(),
-            commandMode = "absolute+keyframes",
-            directionalKeyframeDirection = direction
-        )
-    }
-
-    private fun queueScrubSeek(
-        targetSec: Double,
-        exact: Boolean,
-        commandValueSec: Double,
-        commandMode: String,
-        directionalKeyframeDirection: Int = 0
-    ): Boolean {
-        supersedeActiveScrubSeekIfTargetChanged(targetSec, exact)
-
-        val request = ScrubSeekRequest(
-            userdata = nextScrubUserdata(),
-            generation = ++scrubSeekGeneration,
-            targetSec = targetSec,
-            exact = exact,
-            commandValueSec = commandValueSec,
-            directionalKeyframeDirection = directionalKeyframeDirection,
-            issuedAtMs = SystemClock.uptimeMillis(),
-            frameFloor = playerSurfaceFrameSerial
-        )
-
-        // Install the request before entering JNI. A very fast COMMAND_REPLY is posted back to the
-        // same main looper and will therefore still see this request after commandAsync returns.
-        activeScrubSeek = request
-        latestPlaybackTimeSec = Double.NaN
+        MPVLib.commandAsync(arrayOf("seek", targetSec.toString(), mode), ud)
         scrubSeekInFlight = true
-        scrubSeekHandler.removeCallbacks(scrubFrameGraceRunnable)
-        scrubSeekHandler.removeCallbacks(scrubHardTimeoutRunnable)
-        scrubSeekHandler.postDelayed(scrubHardTimeoutRunnable, SCRUB_SEEK_HARD_TIMEOUT_MS)
-
-        val result = try {
-            MPVLib.commandAsync(
-                arrayOf("seek", commandValueSec.toString(), commandMode),
-                request.userdata
-            )
-        } catch (error: Throwable) {
-            Log.e(TAG, "failed to queue scrub seek generation ${request.generation}", error)
-            failActiveScrubSeek(request, Int.MIN_VALUE)
-            return false
-        }
-
-        if (result < 0) {
-            Log.w(TAG, "mpv rejected scrub seek generation ${request.generation}: $result")
-            failActiveScrubSeek(request, result)
-            return false
-        }
-        return true
-    }
-
-    private fun handleScrubCommandReply(userdata: Long, error: Int) {
-        if (isDestroyed)
-            return
-        val request = activeScrubSeek ?: return
-        if (request.userdata != userdata)
-            return
-
-        request.commandReplyReceived = true
-        request.commandError = error
-        if (error < 0) {
-            Log.w(TAG, "scrub seek generation ${request.generation} failed: $error")
-            failActiveScrubSeek(request, error)
-            return
-        }
-        maybeFinishActiveScrubSeek(request)
-    }
-
-    private fun handleScrubMpvEvent(eventId: Int, playbackTime: Double?) {
-        if (isDestroyed)
-            return
-        val request = activeScrubSeek ?: return
-        when (eventId) {
-            MpvEvent.MPV_EVENT_SEEK -> request.seekEventSeen = true
-            MpvEvent.MPV_EVENT_PLAYBACK_RESTART -> {
-                request.playbackRestartSeen = true
-                applyScrubPlaybackTime(request, playbackTime)
-            }
-        }
-        maybeFinishActiveScrubSeek(request)
-    }
-
-    private fun handleScrubSeeking(value: Boolean, playbackTime: Double?) {
-        if (isDestroyed)
-            return
-        mpvSeeking = value
-        val request = activeScrubSeek ?: return
-        if (!value)
-            applyScrubPlaybackTime(request, playbackTime)
-        maybeFinishActiveScrubSeek(request)
-    }
-
-    private fun readScrubPlaybackTimeFromMpv(): Double? = try {
-        MPVLib.getPropertyDouble("playback-time")
-            ?: MPVLib.getPropertyDouble("time-pos")
-    } catch (_: Throwable) {
-        null
-    }
-
-    private fun applyScrubPlaybackTime(request: ScrubSeekRequest, value: Double?) {
-        if (activeScrubSeek !== request || value == null)
-            return
-
-        latestPlaybackTimeSec = value
-        if (request.exact) {
-            val distance = abs(value - request.targetSec)
-            if (distance <= SCRUB_TARGET_NEAR_TOLERANCE_SEC)
-                request.targetPositionNear = true
-            if (distance <= SCRUB_TARGET_REACHED_TOLERANCE_SEC)
-                request.targetPositionSeen = true
-        }
-    }
-
-    private fun refreshScrubPlaybackTimeFromMpv(request: ScrubSeekRequest) {
-        applyScrubPlaybackTime(request, readScrubPlaybackTimeFromMpv())
-    }
-
-    private fun onScrubSurfaceFrameAvailable(serial: Long) {
-        if (Looper.myLooper() != Looper.getMainLooper()) {
-            eventUiHandler.post { onScrubSurfaceFrameAvailable(serial) }
-            return
-        }
-        if (isDestroyed)
-            return
-
-        val request = activeScrubSeek ?: return
-        if (serial > request.frameFloor)
-            request.frameSeen = true
-        maybeFinishActiveScrubSeek(request)
-    }
-
-    private fun maybeFinishActiveScrubSeek(request: ScrubSeekRequest) {
-        if (activeScrubSeek !== request || request.superseded)
-            return
-        if (request.commandReplyReceived && request.commandError < 0) {
-            failActiveScrubSeek(request, request.commandError)
-            return
-        }
-        if (!request.commandReplyReceived || !request.seekEventSeen ||
-            !request.playbackRestartSeen || mpvSeeking
-        ) return
-
-        // The anchor stage is internal: once mpv has settled on its keyframe, immediately queue
-        // the visible directional stage instead of waiting for the anchor frame to be rendered.
-        if (request.directionalKeyframeDirection != 0) {
-            completeActiveScrubSeek(request, "keyframe-anchor")
-            return
-        }
-
-        if (request.targetPositionSeen && request.frameSeen) {
-            completeActiveScrubSeek(request, "frame")
-            return
-        }
-
-        // Audio-only files, static images and low-frame-rate or timestamp-clamped video may not
-        // satisfy both strict checks immediately. Re-read playback-time after a short grace. The
-        // wider "near" window is accepted only with a real post-request frame and a settled seek.
-        val canUseGrace = request.targetPositionSeen ||
-                (request.targetPositionNear && request.frameSeen)
-        if (canUseGrace && !request.frameGraceScheduled) {
-            request.frameGraceScheduled = true
-            scrubSeekHandler.postDelayed(scrubFrameGraceRunnable, SCRUB_FRAME_GRACE_MS)
-        }
-    }
-
-    private fun finishScrubSeekAfterFrameGrace() {
-        val request = activeScrubSeek ?: return
-        request.frameGraceScheduled = false
-        if (!request.targetPositionSeen)
-            refreshScrubPlaybackTimeFromMpv(request)
-        if (request.superseded || !request.commandReplyReceived || !request.seekEventSeen ||
-            !request.playbackRestartSeen || mpvSeeking
-        ) return
-
-        if (request.targetPositionSeen || (request.targetPositionNear && request.frameSeen))
-            completeActiveScrubSeek(request, "restart-target")
-    }
-
-    private fun finishScrubSeekAfterHardTimeout() {
-        val request = activeScrubSeek ?: return
-        Log.w(
-            TAG,
-            "scrub seek generation ${request.generation} timed out at target " +
-                    "${request.targetSec}; last playback-time=$latestPlaybackTimeSec"
-        )
-        completeActiveScrubSeek(request, "timeout")
-    }
-
-    private fun completeActiveScrubSeek(request: ScrubSeekRequest, reason: String) {
-        if (activeScrubSeek !== request)
-            return
-
-        val continueDirectionalKeyframeSeek = request.directionalKeyframeDirection != 0 &&
-                !request.superseded && reason != "timeout"
-        val keyframeAnchorSec = latestPlaybackTimeSec.takeIf { it.isFinite() }
-            ?: readScrubPlaybackTimeFromMpv()
-            ?: request.commandValueSec
-
-        scrubSeekHandler.removeCallbacks(scrubFrameGraceRunnable)
-        scrubSeekHandler.removeCallbacks(scrubHardTimeoutRunnable)
-        activeScrubSeek = null
-        scrubSeekInFlight = false
-
-        if (request.superseded || reason == "timeout")
-            clearLastIssuedTarget(request)
-
-        if (request.exact && !request.superseded && reason != "timeout") {
-            val elapsed = (SystemClock.uptimeMillis() - request.issuedAtMs).coerceAtLeast(1L)
-            Log.v(
-                TAG,
-                "exact scrub seek generation ${request.generation} completed by $reason in ${elapsed}ms"
-            )
-        }
-
-        if (continueDirectionalKeyframeSeek) {
-            val relativeAmountSec = (request.targetSec - keyframeAnchorSec).let { amount ->
-                if (request.directionalKeyframeDirection > 0)
-                    amount.coerceAtLeast(KEYFRAME_DIRECTION_EPSILON_SEC)
-                else
-                    amount.coerceAtMost(-KEYFRAME_DIRECTION_EPSILON_SEC)
-            }
-            if (queueScrubSeek(
-                    targetSec = request.targetSec,
-                    exact = false,
-                    commandValueSec = relativeAmountSec,
-                    commandMode = "relative+keyframes"
-                )
-            ) return
-        }
-
-        finishScrubPlaybackHoldIfReady()
-    }
-
-    private fun failActiveScrubSeek(request: ScrubSeekRequest, error: Int) {
-        if (activeScrubSeek !== request)
-            return
-
-        scrubSeekHandler.removeCallbacks(scrubFrameGraceRunnable)
-        scrubSeekHandler.removeCallbacks(scrubHardTimeoutRunnable)
-        activeScrubSeek = null
-        scrubSeekInFlight = false
-
-        clearLastIssuedTarget(request)
-
-        Log.w(TAG, "scrub seek generation ${request.generation} ended with error $error")
-        finishScrubPlaybackHoldIfReady()
     }
 
     private fun performGestureIdleSeek() {
         if (!gestureScrubActive) return
         val target = pendingGestureSeekSec ?: return
-        val exact = smoothSeekGesture
-        if (gestureTargetAlreadyResolved(target, exact)) return
-        if (sendGestureScrubSeek(target))
-            lastIssuedGestureSeekSec = target
+        if (lastIssuedGestureSeekSec == target) return
+        lastIssuedGestureSeekSec = target
+        sendScrubSeek(target.toDouble(), exact = smoothSeekGesture)
     }
 
     private fun performSeekbarIdleSeek() {
         if (!seekbarScrubActive) return
         val target = pendingSeekbarSeekPos ?: return
-        if (seekbarTargetAlreadyResolved(target)) return
-        if (sendScrubSeek(target, exact = true))
-            lastIssuedSeekbarSeekPos = target
+        if (lastIssuedSeekbarSeekPos == target) return
+        lastIssuedSeekbarSeekPos = target
+        sendScrubSeek(target, exact = true)
     }
 
     // Gesture handler
@@ -4585,27 +3899,20 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
                     gestureScrubActive = true
                     pendingGestureSeekSec = null
                     lastIssuedGestureSeekSec = null
-                    invalidateGestureStableTargetCheck()
+                    scrubSeekHandler.removeCallbacks(gestureIdleSeekRunnable)
                     beginScrubPlaybackHold()
                 }
 
-                // Quantize to 1 second steps, same as before. Unlike before, the step is applied
-                // on top of the gesture's exact starting position instead of a whole-second
-                // rounding of it: starting at 1.234 and stepping +1 lands on 2.234, not 2.000.
-                // The seek still only ever moves in fixed 1-second increments, it just no longer
-                // throws away the sub-second fraction it started from.
-                //
-                // When the gesture reaches the start/end of the video, absorb any extra drag into
-                // an offset. This prevents "overscroll debt": moving 1 second back from the edge
-                // should require the same small reverse movement as it does anywhere else in the
-                // video. Once a step would carry the target at or past either edge, the target
-                // snaps exactly to that edge (0.000 or the full duration) instead of leaving a
-                // sub-second remainder sitting just inside it.
-                val basePos = initialSeek.toDouble()
-                val fullDuration = duration.toDouble()
+                // Quantize to 1 second steps. When the gesture reaches the
+                // start/end of the video, absorb any extra drag into an offset.
+                // This prevents "overscroll debt": moving 1 second back from
+                // the edge should require the same small reverse movement as it
+                // does anywhere else in the video.
+                val startPos = initialSeek.roundToInt()
+                val durationSec = duration.roundToInt()
                 val rawDeltaSec = quantizeGestureSeekDelta(diff)
-                val minDeltaSec = floor(-basePos).toInt()
-                val maxDeltaSec = ceil(fullDuration - basePos).toInt()
+                val minDeltaSec = -startPos
+                val maxDeltaSec = durationSec - startPos
                 var deltaSec = rawDeltaSec - gestureSeekDeltaOffsetSec
 
                 if (deltaSec > maxDeltaSec) {
@@ -4616,25 +3923,24 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
                     deltaSec = minDeltaSec
                 }
 
-                val newPos = (basePos + deltaSec).coerceIn(0.0, fullDuration)
+                val newPos = startPos + deltaSec
                 val newDiff = deltaSec
 
-                // Stability is defined by the seek value itself, not by whether touch events keep
-                // arriving. Events that remain inside the same quantized second do not postpone
-                // the seek; only an actual increase/decrease invalidates the current observation.
-                val previousTarget = pendingGestureSeekSec
-                pendingGestureSeekSec = newPos
-                if (previousTarget == null || !sameSeekTarget(previousTarget, newPos)) {
-                    supersedeActiveScrubSeekIfTargetChanged(
-                        newPos,
-                        exact = smoothSeekGesture
-                    )
-                    scheduleGestureStableTargetSeek()
+                // IMPORTANT: Do NOT seek while the finger is moving.
+                // We keep the current frame frozen, and only perform an exact seek once the
+                // finger stops moving (idle) or on release.
+                // Cancel any in-flight scrub seek so no new frame appears while moving.
+                if (lastScrubAsyncUserdata != 0L) {
+                    abortLastScrubSeek()
                 }
 
-                // The displayed labels stay whole-second, same as before; only the seek target
-                // sent to mpv keeps the sub-second fraction.
-                val posText = Utils.prettyTime(newPos.roundToInt())
+                pendingGestureSeekSec = newPos
+
+                // Schedule idle exact seek.
+                scrubSeekHandler.removeCallbacks(gestureIdleSeekRunnable)
+                scrubSeekHandler.postDelayed(gestureIdleSeekRunnable, SCRUB_IDLE_SEEK_DELAY_MS)
+
+                val posText = Utils.prettyTime(newPos)
                 val diffText = Utils.prettyTime(newDiff, true)
                 gestureTextView.text = getString(R.string.ui_seek_distance, posText, diffText)
             }
@@ -4658,14 +3964,12 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
             PropertyChange.Finalize -> {
                 // End of scrub gesture.
                 gestureScrubActive = false
-                invalidateGestureStableTargetCheck()
+                scrubSeekHandler.removeCallbacks(gestureIdleSeekRunnable)
 
                 val target = pendingGestureSeekSec
-                if (target != null &&
-                    !gestureTargetAlreadyResolved(target, exact = smoothSeekGesture)
-                ) {
-                    if (sendGestureScrubSeek(target))
-                        lastIssuedGestureSeekSec = target
+                if (target != null && lastIssuedGestureSeekSec != target) {
+                    lastIssuedGestureSeekSec = target
+                    sendScrubSeek(target.toDouble(), exact = smoothSeekGesture)
                 }
 
                 finishScrubPlaybackHoldIfReady()
@@ -4727,13 +4031,6 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
         private const val IMMERSIVE_RESTORE_RETRY_MS = 120L
         private const val MANUAL_SYSTEM_BARS_GESTURE_WINDOW_MS = 2000L
 
-        // The launch probe has no fixed sleep: it returns as soon as local metadata is available.
-        // The budget only prevents a cloud-backed/content provider from blocking Activity.onCreate.
-        private const val ORIENTATION_PROBE_BUDGET_MS = 400L
-        private const val ORIENTATION_ASYNC_PROBE_TIMEOUT_MS = 500L
-        private const val ORIENTATION_CACHE_SIZE = 8
-        private const val STATE_ENTRY_CONFIG_ORIENTATION = "entry_config_orientation"
-
         // Reserve the very top portion of the screen for Android system gestures (notification
         // shade/status bar). We only suppress the tap-to-toggle if the finger *moves down*
         // meaningfully from this region.
@@ -4741,6 +4038,8 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
         private const val STATUS_BAR_SWIPE_CANCEL_DP = 16f
         // resolution (px) of the thumbnail displayed with playback notification
         private const val THUMB_SIZE = 384
+        // smallest aspect ratio that is considered non-square
+        private const val ASPECT_RATIO_MIN = 1.2f // covers 5:4 and up
         // fraction to which audio volume is ducked on loss of audio focus
         private const val AUDIO_FOCUS_DUCKING = 0.5f
         // request codes for invoking other activities
@@ -4751,20 +4050,16 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
         private const val RESULT_INTENT = "is.xyz.mpv.MPVActivity.result"
         // stream type used with AudioManager
         private const val STREAM_TYPE = AudioManager.STREAM_MUSIC
+        // precision used by seekbar (1/s)
+        private const val SEEK_BAR_PRECISION = 2
+
         // Use 100% of the original zero-step width and 250% of the original
         // non-zero whole-second step width.
         private const val GESTURE_SEEK_ZERO_HALF_STEP = 0.5f
         private const val GESTURE_SEEK_NONZERO_STEP_WIDTH = 2.5f
 
-        // Start preview only after the numeric seek target itself has remained unchanged for this
-        // interval. Touch events that still map to the same target do not postpone the seek.
-        private const val SCRUB_TARGET_STABLE_MS = 100L
-        private const val SCRUB_TARGET_COMPARE_EPSILON_SEC = 0.0005
-        private const val SCRUB_TARGET_REACHED_TOLERANCE_SEC = 0.075
-        private const val SCRUB_TARGET_NEAR_TOLERANCE_SEC = 0.75
-        private const val SCRUB_FRAME_GRACE_MS = 350L
-        private const val SCRUB_SEEK_HARD_TIMEOUT_MS = 45_000L
-        private const val KEYFRAME_DIRECTION_EPSILON_SEC = 0.001
+        // When scrubbing, wait briefly for the finger to stop moving before doing an exact seek.
+        private const val SCRUB_IDLE_SEEK_DELAY_MS = 140L
 
         // Per-file subtitle persistence keys
         private const val PREF_SUB_KIND = "sub_kind"
