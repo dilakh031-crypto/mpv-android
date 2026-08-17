@@ -157,24 +157,9 @@ internal class MPVView(context: Context, attrs: AttributeSet) : BaseMPVView(cont
 
             // Saving is all-or-nothing for this app: position and every app-controlled per-file
             // option are stored together while the preference is enabled.
-            //
-            // aid/sid/secondary-sid are deliberately excluded here (unlike the full
-            // PER_FILE_PLAYBACK_OPTIONS list used for reset-on-next-file above). Those three are
-            // restored by MPVActivity instead, because external tracks need their filename
-            // resolved, not just a raw numeric id. If mpv's own watch-later mechanism also
-            // restores them natively, it does so earlier and blind to filenames: at that point
-            // an external track from a previous session doesn't exist yet, so mpv falls back to
-            // selecting the track list's default (typically an embedded track) and commits to it.
-            // MPVActivity's own restore then re-adds the external file and sets sid/secondary-sid
-            // to the same numeric id mpv's option already silently holds from that native
-            // restore, so mpv sees no value change and never re-applies the selection - leaving
-            // the embedded default active even though the external track is still listed. Letting
-            // MPVActivity own this exclusively (as it already does for SharedPreferences-based
-            // persistence via APP_PERSISTED_PLAYBACK_OPTIONS) avoids the conflict entirely.
             mergeStringListProperty(
                 "watch-later-options",
-                APP_PERSISTED_PLAYBACK_OPTIONS + "start",
-                remove = setOf("aid", "sid", "secondary-sid")
+                PER_FILE_PLAYBACK_OPTIONS + "start"
             )
         } else {
             if (!watchLaterOptionsSuppressed) {
@@ -375,11 +360,7 @@ internal class MPVView(context: Context, attrs: AttributeSet) : BaseMPVView(cont
         // This observes all properties needed by MPVView, MPVActivity or other classes
         data class Property(val name: String, val format: Int = MPV_FORMAT_NONE)
         val p = arrayOf(
-            // Preserve sub-second precision so the elapsed-time label and seekbar can use
-            // the same whole-second rounding as scrub targets.
-            Property("time-pos", MPV_FORMAT_DOUBLE),
-            // Seek state changes rarely and is used by the exact-scrub controller.
-            Property("seeking", MPV_FORMAT_FLAG),
+            Property("time-pos", MPV_FORMAT_INT64),
             Property("duration/full", MPV_FORMAT_DOUBLE),
             Property("pause", MPV_FORMAT_FLAG),
             Property("paused-for-cache", MPV_FORMAT_FLAG),
@@ -617,6 +598,8 @@ internal class MPVView(context: Context, attrs: AttributeSet) : BaseMPVView(cont
     }
 
     fun cycleHwdec() {
+        if (!makeCurrentOptionFileLocal("hwdec"))
+            return
         MPVLib.command(arrayOf("cycle-values", "hwdec", HWDECS, "no"))
         persistCurrentFileState()
     }

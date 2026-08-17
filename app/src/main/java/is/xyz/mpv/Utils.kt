@@ -30,7 +30,6 @@ import java.io.*
 import kotlin.math.abs
 import kotlin.math.ceil
 import kotlin.math.roundToInt
-import kotlin.math.roundToLong
 
 internal object Utils {
     private fun copyAssetFile(assetManager: AssetManager, filename: String, outFile: File): Boolean {
@@ -323,8 +322,8 @@ internal object Utils {
         var speed = 1f
             private set
 
-        /** playback position in seconds, rounded to the same whole-second unit used by seeking. */
-        val positionSec get() = (position / 1000.0).roundToInt()
+        /** playback position in seconds */
+        val positionSec get() = (position / 1000).toInt()
         /** duration in seconds */
         val durationSec get() = (duration / 1000f).roundToInt()
 
@@ -357,6 +356,7 @@ internal object Utils {
         /** callback for properties of type <code>MPV_FORMAT_INT64</code> */
         fun update(property: String, value: Long): Boolean {
             when (property) {
+                "time-pos" -> position = value * 1000
                 "playlist-pos" -> playlistPos = value.toInt()
                 "playlist-count" -> playlistCount = value.toInt()
                 else -> return false
@@ -367,11 +367,6 @@ internal object Utils {
         /** callback for properties of type <code>MPV_FORMAT_DOUBLE</code> */
         fun update(property: String, value: Double): Boolean {
             when (property) {
-                "time-pos" -> {
-                    if (!value.isFinite())
-                        return false
-                    position = (value * 1000.0).roundToLong()
-                }
                 "duration/full" -> duration = ceil(value * 1000.0).coerceAtLeast(0.0).toLong()
                 else -> return false
             }
