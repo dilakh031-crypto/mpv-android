@@ -31,7 +31,6 @@ internal class TouchGestures(private val observer: TouchGesturesObserver) {
         Up,
         Down,
         Ignored,
-        SystemGestureReplay,
         ControlSeek,
         ControlVolume,
         ControlBright,
@@ -55,10 +54,6 @@ internal class TouchGestures(private val observer: TouchGesturesObserver) {
     private var maxAbsDy = 0f
     // latest point that still belonged clearly to the active movement axis
     private var directionAnchor = PointF()
-    // When an OEM navigation handler cancels Back/Home/Recents, it replays old events before
-    // handing the still-active finger back to the app. Events generated at or after this time are
-    // live again and may start a new player gesture without requiring ACTION_UP first.
-    private var systemGestureReplayCatchUpTime = 0L
     // Once a horizontal seek is active, a vertical turn pauses seek updates instead of
     // finalizing the gesture. The frozen horizontal delta lets a later horizontal turn
     // continue from the same seek target without counting sideways drift from the vertical leg.
@@ -117,16 +112,6 @@ internal class TouchGestures(private val observer: TouchGesturesObserver) {
         // this is so that user can open android status bar
         private const val DEADZONE = 5
 
-        // Legacy three-button swipe navigation (notably Samsung's NavbarGestureHandler) owns the
-        // outer 300px of the 2220px landscape display in the supplied log. This percentage is
-        // used only to recognize a delayed replayed ACTION_DOWN; it is not a touch deadzone.
-        private const val NAVIGATION_GESTURE_CAPTURE_PERCENT = 15
-
-        // A rejected OEM navigation gesture is replayed with its original event timestamps. A
-        // normal ACTION_DOWN reaches the app almost immediately; a replayed one arrives only
-        // after the system has spent time deciding that Home/Back/Recents was not completed.
-        private const val NAVIGATION_GESTURE_REPLAY_DELAY_MS = 80L
-
         // Seeking should feel like 1s steps on slow drag (Samsung-like).
         // We achieve this by sending seek updates more frequently than volume/brightness.
         private const val SEEK_THROTTLE_DIV = 24
@@ -144,7 +129,6 @@ internal class TouchGestures(private val observer: TouchGesturesObserver) {
         seekVerticalMovement = false
         frozenSeekDx = 0f
         lastTapTime = 0L
-        systemGestureReplayCatchUpTime = 0L
     }
 
     private fun State.isControl(): Boolean {
@@ -155,37 +139,6 @@ internal class TouchGestures(private val observer: TouchGesturesObserver) {
 
     private fun activationThreshold(gesture: State): Float {
         return if (gesture == State.ControlSeek) trigger / 4 else trigger
-    }
-
-    private fun isInNavigationGestureCaptureRegion(p: PointF): Boolean {
-        val horizontalEdge = width * NAVIGATION_GESTURE_CAPTURE_PERCENT / 100f
-        val verticalEdge = height * NAVIGATION_GESTURE_CAPTURE_PERCENT / 100f
-        return p.x <= horizontalEdge || p.x >= width - horizontalEdge ||
-                p.y >= height - verticalEdge
-    }
-
-    private fun isReplayedNavigationGestureDown(e: MotionEvent, p: PointF): Boolean {
-        if (!isInNavigationGestureCaptureRegion(p))
-            return false
-
-        return SystemClock.uptimeMillis() - e.eventTime >= NAVIGATION_GESTURE_REPLAY_DELAY_MS
-    }
-
-    private fun resumeAfterSystemGesture(p: PointF) {
-        // The distance accumulated while Back/Home/Recents owned the finger must not count toward
-        // seek. Rebase at the first live point; the very next MOVE continues as a normal gesture.
-        initialPos.set(p)
-        lastPos.set(p)
-        directionAnchor.set(p)
-        maxAbsDx = 0f
-        maxAbsDy = 0f
-        seekVerticalMovement = false
-        frozenSeekDx = 0f
-        stateDirection = 0
-        lastDownTime = 0L
-        lastTapTime = 0L
-        systemGestureReplayCatchUpTime = 0L
-        state = State.Down
     }
 
     private fun activateGesture(
@@ -334,8 +287,6 @@ internal class TouchGestures(private val observer: TouchGesturesObserver) {
     }
 
     private fun processMovement(p: PointF): Boolean {
-        if (state == State.SystemGestureReplay)
-            return true
         if (state == State.ControlSeek && seekVerticalMovement &&
             processVerticalMovementDuringSeek(p)
         ) return true
@@ -365,7 +316,6 @@ internal class TouchGestures(private val observer: TouchGesturesObserver) {
         when (state) {
             State.Up -> {}
             State.Ignored -> {}
-            State.SystemGestureReplay -> {}
             State.Down -> {
                 // We might enter one of the Control states if the user moves enough.
                 // For seeking we want a shorter activation distance (Samsung-like), so the
@@ -459,31 +409,14 @@ internal class TouchGestures(private val observer: TouchGesturesObserver) {
         val point = PointF(e.x, e.y)
         when (e.actionMasked) {
             MotionEvent.ACTION_UP -> {
-                if (state == State.SystemGestureReplay) {
-                    // The finger was lifted before a live event arrived, so the entire stream
-                    // belonged to the canceled system-button attempt.
-                    gestureHandled = true
-                } else {
-                    gestureHandled = processMovement(e) or processTap(point)
-                    if (state.isControl())
-                        sendPropertyChange(PropertyChange.Finalize, 0f)
-                }
+                gestureHandled = processMovement(e) or processTap(point)
+                if (state.isControl())
+                    sendPropertyChange(PropertyChange.Finalize, 0f)
                 state = State.Up
                 seekVerticalMovement = false
                 frozenSeekDx = 0f
-                systemGestureReplayCatchUpTime = 0L
             }
             MotionEvent.ACTION_DOWN -> {
-                // Samsung's navigation layer restores a canceled button swipe by injecting the
-                // original ACTION_DOWN much later with its old eventTime. Consume only that
-                // replayed phase. Fresh edge touches continue through the normal path below.
-                if (isReplayedNavigationGestureDown(e, point)) {
-                    state = State.SystemGestureReplay
-                    systemGestureReplayCatchUpTime = SystemClock.uptimeMillis()
-                    lastTapTime = 0L
-                    return true
-                }
-
                 // deadzone on top/bottom
                 if (e.y < height * DEADZONE / 100 || e.y > height * (100 - DEADZONE) / 100)
                     return false
@@ -499,16 +432,7 @@ internal class TouchGestures(private val observer: TouchGesturesObserver) {
                 gestureHandled = true
             }
             MotionEvent.ACTION_MOVE -> {
-                if (state == State.SystemGestureReplay) {
-                    // Replayed points were generated before the handler returned control. The
-                    // first point generated after that hand-off becomes the new drag origin, so
-                    // mpv resumes on the same finger without inheriting the system swipe distance.
-                    if (e.eventTime >= systemGestureReplayCatchUpTime)
-                        resumeAfterSystemGesture(point)
-                    gestureHandled = true
-                } else {
-                    gestureHandled = processMovement(e)
-                }
+                gestureHandled = processMovement(e)
             }
             MotionEvent.ACTION_CANCEL, MotionEvent.ACTION_POINTER_DOWN -> {
                 cancel()
